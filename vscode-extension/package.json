@@ -1,0 +1,186 @@
+{
+  "name": "spirit-agent",
+  "displayName": "Spirit Agent",
+  "description": "AI 编程助手 — 统一后端 Agent，支持对话、代码补全、工具调用",
+  "version": "0.1.0",
+  "publisher": "spirit-agent",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Machine Learning",
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "spirit-agent",
+          "title": "Spirit Agent",
+          "icon": "assets/spirit-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "spirit-agent": [
+        {
+          "type": "webview",
+          "id": "spirit.chat",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "spirit.startServer",
+        "title": "Spirit: Start Server"
+      },
+      {
+        "command": "spirit.stopServer",
+        "title": "Spirit: Stop Server"
+      },
+      {
+        "command": "spirit.newSession",
+        "title": "Spirit: New Session"
+      },
+      {
+        "command": "spirit.askSelection",
+        "title": "Spirit: Ask about selection"
+      },
+      {
+        "command": "spirit.explainCode",
+        "title": "Spirit: Explain selection"
+      },
+      {
+        "command": "spirit.fixCode",
+        "title": "Spirit: Fix selection"
+      },
+      {
+        "command": "spirit.refactorCode",
+        "title": "Spirit: Refactor selection"
+      },
+      {
+        "command": "spirit.insertAtCursor",
+        "title": "Spirit: Insert code at cursor"
+      },
+      {
+        "command": "spirit.openFile",
+        "title": "Spirit: Open file"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "spirit.askSelection",
+          "when": "editorHasSelection",
+          "group": "spirit@1"
+        },
+        {
+          "command": "spirit.explainCode",
+          "when": "editorHasSelection",
+          "group": "spirit@2"
+        },
+        {
+          "command": "spirit.fixCode",
+          "when": "editorHasSelection",
+          "group": "spirit@3"
+        },
+        {
+          "command": "spirit.refactorCode",
+          "when": "editorHasSelection",
+          "group": "spirit@4"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "spirit.askSelection",
+        "key": "ctrl+shift+l",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "spirit.insertAtCursor",
+        "key": "ctrl+shift+i",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "spirit.openFile",
+        "key": "ctrl+shift+o",
+        "when": "spirit.chatFocus"
+      }
+    ],
+    "configuration": {
+      "title": "Spirit Agent",
+      "properties": {
+        "spirit.serverUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8765",
+          "description": "Spirit Agent 后端服务地址"
+        },
+        "spirit.wsUrl": {
+          "type": "string",
+          "default": "ws://127.0.0.1:8765/ws/chat",
+          "description": "Spirit Agent WebSocket 地址"
+        },
+        "spirit.autoStartServer": {
+          "type": "boolean",
+          "default": true,
+          "description": "启动 VSCode 时自动启动后端服务"
+        },
+        "spirit.model": {
+          "type": "string",
+          "default": "",
+          "description": "使用的模型（留空使用服务端默认）"
+        },
+        "spirit.enableCompletion": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用代码补全"
+        },
+        "spirit.completionDelay": {
+          "type": "number",
+          "default": 300,
+          "description": "代码补全延迟（ms）"
+        },
+        "spirit.enableCodeIntelligence": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用代码智能（跳转定义、查找引用等，需要 VSCode 语言服务支持）"
+        },
+        "spirit.autoContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "自动发送当前文件上下文（活动文件、选区、光标位置）"
+        },
+        "spirit.terminalIntegration": {
+          "type": "boolean",
+          "default": true,
+          "description": "使用 VSCode 集成终端执行命令（而非后端 subprocess）"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "marked": "^12.0.0",
+    "highlight.js": "^11.9.0"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "@vscode/vsce": "^2.24.0"
+  }
+}

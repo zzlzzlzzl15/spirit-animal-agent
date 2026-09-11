@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spirit Agent — 控制台</title>
+    <link rel="stylesheet" href="/static/css/dashboard.css">
+    <!-- 图标 -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>👻</text></svg>">
+</head>
+<body>
+    <!-- 顶部导航栏 -->
+    <nav class="navbar">
+        <div class="nav-brand">
+            <span class="nav-logo">👻</span>
+            <span class="nav-title">Spirit Agent</span>
+        </div>
+        <div class="nav-links">
+            <a href="#/" class="nav-link active" data-page="chat">
+                <span class="nav-icon">💬</span> 对话
+            </a>
+            <a href="#/knowledge" class="nav-link" data-page="knowledge">
+                <span class="nav-icon">📚</span> 知识库
+            </a>
+            <a href="#/settings" class="nav-link" data-page="settings">
+                <span class="nav-icon">⚙️</span> 设置
+            </a>
+        </div>
+        <div class="nav-status">
+            <span id="connection-status" class="status-badge status-disconnected">
+                ● 未连接
+            </span>
+        </div>
+    </nav>
+
+    <!-- 主内容区 -->
+    <main class="main-content">
+        <!-- 聊天页面 -->
+        <div id="page-chat" class="page active">
+            <div class="chat-layout">
+                <!-- 左侧会话列表 -->
+                <aside class="chat-sidebar">
+                    <div class="sidebar-header">
+                        <h3>会话列表</h3>
+                        <button id="btn-new-session" class="btn btn-sm btn-primary" title="新建会话">
+                            + 新建
+                        </button>
+                    </div>
+                    <div id="session-list" class="session-list">
+                        <!-- 动态生成 -->
+                    </div>
+                </aside>
+
+                <!-- 中间聊天区 -->
+                <div class="chat-main">
+                    <div class="chat-header">
+                        <div class="chat-header-info">
+                            <span id="chat-model" class="model-badge">gpt-4o</span>
+                            <span id="chat-session-id" class="session-id"></span>
+                        </div>
+                        <div class="chat-header-actions">
+                            <select id="model-select" class="model-select">
+                                <option value="gpt-4o">GPT-4o</option>
+                                <option value="gpt-4o-mini">GPT-4o Mini</option>
+                                <option value="gpt-4-turbo">GPT-4 Turbo</option>
+                                <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+                            </select>
+                            <button id="btn-reset-session" class="btn btn-sm" title="重置会话">🔄</button>
+                            <button id="btn-interrupt" class="btn btn-sm btn-danger" title="中断">⏹</button>
+                        </div>
+                    </div>
+                    <div id="chat-messages" class="chat-messages">
+                        <div class="welcome-message">
+                            <h2>👻 Spirit Agent</h2>
+                            <p>你的 AI 编程助手，连接知识库，随时为你服务。</p>
+                            <p class="hint">输入消息开始对话，或从左侧选择已有会话。</p>
+                        </div>
+                    </div>
+                    <div class="chat-input-area">
+                        <div class="chat-input-wrapper">
+                            <textarea id="chat-input" class="chat-input" placeholder="输入消息... (Enter 发送, Shift+Enter 换行)" rows="1"></textarea>
+                            <button id="btn-send" class="btn btn-send" title="发送">
+                                ➤
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 知识库页面 -->
+        <div id="page-knowledge" class="page">
+            <div class="knowledge-layout">
+                <!-- 左侧搜索/列表 -->
+                <aside class="knowledge-sidebar">
+                    <div class="sidebar-header">
+                        <h3>📚 知识库</h3>
+                    </div>
+                    <div class="knowledge-search">
+                        <input id="kb-search-input" type="text" placeholder="搜索知识库..." class="search-input">
+                        <button id="kb-search-btn" class="btn btn-sm btn-primary">搜索</button>
+                    </div>
+                    <div class="kb-status-bar">
+                        <span id="kb-connection-status" class="kb-status">检查连接...</span>
+                    </div>
+                    <div id="kb-doc-list" class="kb-doc-list">
+                        <!-- 动态生成 -->
+                    </div>
+                    <div class="kb-upload-area">
+                        <button id="kb-upload-btn" class="btn btn-outline">📤 上传文件</button>
+                        <input id="kb-file-input" type="file" multiple accept=".pdf,.docx,.txt,.md" style="display:none">
+                    </div>
+                </aside>
+
+                <!-- 右侧内容区 -->
+                <div class="knowledge-main">
+                    <div id="kb-content" class="kb-content">
+                        <div class="welcome-message">
+                            <h2>📚 个人知识库</h2>
+                            <p>连接 Memora 知识库，浏览、搜索和管理你的文档。</p>
+                            <div class="kb-quick-actions">
+                                <button class="btn btn-outline kb-action-btn" data-action="list">📋 浏览文档</button>
+                                <button class="btn btn-outline kb-action-btn" data-action="stats">📊 统计信息</button>
+                                <button class="btn btn-outline kb-action-btn" data-action="open-memora">🔗 打开 Memora</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 设置页面 -->
+        <div id="page-settings" class="page">
+            <div class="settings-container">
+                <h2>⚙️ 设置</h2>
+
+                <div class="settings-section">
+                    <h3>🤖 模型配置</h3>
+                    <div class="settings-form">
+                        <div class="form-group">
+                            <label>默认模型</label>
+                            <select id="settings-model" class="form-control">
+                                <option value="gpt-4o">GPT-4o</option>
+                                <option value="gpt-4o-mini">GPT-4o Mini</option>
+                                <option value="gpt-4-turbo">GPT-4 Turbo</option>
+                                <option value="claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>API Base URL</label>
+                            <input id="settings-api-url" type="text" class="form-control" value="https://api.openai.com/v1">
+                        </div>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>📚 知识库连接</h3>
+                    <div class="settings-form">
+                        <div class="form-group">
+                            <label>Memora API 地址</label>
+                            <input id="settings-memora-url" type="text" class="form-control" value="http://127.0.0.1:8080">
+                        </div>
+                        <div class="form-group">
+                            <label>自动保存</label>
+                            <label class="toggle">
+                                <input id="settings-auto-save" type="checkbox" checked>
+                                <span class="toggle-slider"></span>
+                                <span>文件生成时自动存入知识库</span>
+                            </label>
+                        </div>
+                        <button id="btn-test-memora" class="btn btn-outline">🔗 测试连接</button>
+                        <span id="memora-test-result" class="test-result"></span>
+                    </div>
+                </div>
+
+                <div class="settings-section">
+                    <h3>🔌 服务状态</h3>
+                    <div id="service-status" class="service-status">
+                        <div class="status-row">
+                            <span>Spirit Agent API</span>
+                            <span id="status-spirit" class="status-dot status-ok">●</span>
+                        </div>
+                        <div class="status-row">
+                            <span>Memora 知识库</span>
+                            <span id="status-memora" class="status-dot status-unknown">●</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- 脚本 -->
+    <script src="/static/js/app.js"></script>
+    <script src="/static/js/chat.js"></script>
+    <script src="/static/js/knowledge.js"></script>
+    <script src="/static/js/settings.js"></script>
+</body>
+</html>

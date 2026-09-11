@@ -1,0 +1,8 @@
+{
+  "id": "spirit-fox",
+  "displayName": "小灵狐",
+  "description": "Spirit Agent 的默认宠物 — 一只活泼的小灵狐",
+  "spritesheetPath": "spritesheet.png",
+  "author": "Spirit Team",
+  "version": "1.0.0"
+}

@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>Click Test</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #fff;
+      font-family: sans-serif;
+    }
+    .test-box {
+      width: 200px;
+      height: 200px;
+      background: rgba(245, 166, 35, 0.8);
+      border: 2px solid #fb923c;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      margin: 20px 0;
+      user-select: none;
+    }
+    .test-box:active {
+      background: rgba(245, 166, 35, 1);
+    }
+    #log {
+      background: #000;
+      color: #4ade80;
+      padding: 12px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 13px;
+      min-height: 200px;
+      max-height: 400px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+    canvas {
+      border: 2px solid #fb923c;
+      cursor: pointer;
+      background: transparent;
+    }
+  </style>
+</head>
+<body>
+  <h2>️ 点击测试</h2>
+  
+  <div class="test-box" id="div1">
+    点我 (DIV)
+  </div>
+
+  <canvas id="canvas1" width="144" height="156"></canvas>
+  <p>↑ 点这个 Canvas (144×156)</p>
+
+  <div style="pointer-events: none; margin: 20px 0;">
+    <div class="test-box" id="div2" style="pointer-events: auto;">
+      点我 (pointer-events 嵌套测试)
+    </div>
+  </div>
+
+  <h3> 事件日志：</h3>
+  <div id="log"></div>
+
+  <script>
+    const log = document.getElementById('log');
+    function addLog(msg) {
+      const time = new Date().toLocaleTimeString();
+      log.textContent += `[${time}] ${msg}\n`;
+      log.scrollTop = log.scrollHeight;
+      console.log(msg);
+    }
+
+    // DIV 点击
+    document.getElementById('div1').addEventListener('click', (e) => {
+      addLog('✅ DIV1 clicked!');
+    });
+    document.getElementById('div1').addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      addLog('✅ DIV1 right-clicked!');
+    });
+
+    // Canvas 点击
+    const canvas = document.getElementById('canvas1');
+    const ctx = canvas.getContext('2d');
+    // 画个狐狸占位
+    ctx.fillStyle = '#f5a623';
+    ctx.beginPath();
+    ctx.arc(72, 78, 50, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(55, 65, 12, 0, Math.PI * 2);
+    ctx.arc(89, 65, 12, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(55, 67, 6, 0, Math.PI * 2);
+    ctx.arc(89, 67, 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    canvas.addEventListener('click', (e) => {
+      addLog(`✅ Canvas clicked! (${e.clientX}, ${e.clientY})`);
+    });
+    canvas.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      addLog(`✅ Canvas right-clicked! (${e.clientX}, ${e.clientY})`);
+    });
+    canvas.addEventListener('mousedown', (e) => {
+      addLog(` Canvas mousedown button=${e.button}`);
+    });
+
+    // pointer-events 嵌套测试
+    document.getElementById('div2').addEventListener('click', (e) => {
+      addLog('✅ DIV2 clicked! (pointer-events:auto inside none)');
+    });
+
+    addLog('🚀 测试页面已加载，点击上面的元素测试');
+  </script>
+</body>
+</html>

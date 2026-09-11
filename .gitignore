@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Desktop app
+desktop-app/node_modules/
+desktop-app/dist/
+desktop-app/dist-electron/
+desktop-app/.next/
+
+# Test artifacts
+*.log
+coverage/
+htmlcov/
+.pytest_cache/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Debug scripts (not needed in repo)
+debug_*.py
+fix_*.py
+apply_*.py
+check_*.py
+replace_*.py
+test_comprehensive.py
+test_tool_call_display.py
+
+# Backup files
+*.bak
+*.backup
+
+# Local config (should use example)
+config.yaml
+spirit/config.yaml

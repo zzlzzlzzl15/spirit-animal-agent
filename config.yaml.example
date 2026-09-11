@@ -1,0 +1,213 @@
+# Spirit Agent 配置文件
+# 复制此文件到 ~/.spirit/config.yaml 并按需修改
+# 环境变量（SPIRIT_ 前缀）优先级高于此文件
+
+# =============================================================================
+# LLM 模型配置
+# =============================================================================
+llm:
+  # 模型名称（必填 — 不提供则无法调用 LLM）
+  # 示例: "gpt-4o", "claude-3-5-sonnet", "qwen2.5:7b", "google/gemini-2.0-flash"
+  model: ""
+
+  # 推理 Provider 选择:
+  #   "auto"       - 自动检测（默认）
+  #   "openai"     - OpenAI API（需要 OPENAI_API_KEY）
+  #   "openrouter" - OpenRouter（需要 OPENROUTER_API_KEY）
+  #   "ollama"     - Ollama 本地（默认 http://127.0.0.1:11434/v1）
+  #   "lmstudio"   - LM Studio 本地（默认 http://127.0.0.1:1234/v1）
+  #   "vllm"       - vLLM 本地（默认 http://127.0.0.1:8000/v1）
+  #   "anthropic"  - Anthropic 直连（需要 ANTHROPIC_API_KEY）
+  #   "gemini"     - Google AI Studio（需要 GOOGLE_API_KEY）
+  #   "groq"       - Groq（需要 GROQ_API_KEY）
+  #   "together"   - Together AI（需要 TOGETHER_API_KEY）
+  #   "deepinfra"  - DeepInfra（需要 DEEPINFRA_API_KEY）
+  #   "custom"     - 自定义 OpenAI 兼容端点（需设置 base_url）
+  provider: "auto"
+
+  # API 密钥（留空则从环境变量自动读取）
+  # 也可以在 ~/.spirit/.env 文件中设置
+  # api_key: "sk-..."
+
+  # API 端点（留空则根据 provider 自动解析）
+  # 使用自定义端点时必填:
+  # base_url: "http://localhost:11434/v1"
+
+  # 上下文窗口大小（输入 + 输出 token 总和）
+  context_length: 128000
+
+  # 最大输出 token 数（0 = 使用模型默认值）
+  max_tokens: 0
+
+  # Anthropic Transport 默认 max_tokens
+  anthropic_default_max_tokens: 4096
+
+  # 图片分析 max_tokens
+  image_analysis_max_tokens: 1000
+
+# =============================================================================
+# Agent 行为配置
+# =============================================================================
+agent:
+  # 最大工具调用迭代次数
+  max_iterations: 90
+
+  # API 调用失败最大重试次数
+  max_retries: 3
+
+  # 推理努力程度: "high" | "medium" | "low" | "minimal" | "none"
+  reasoning_effort: "medium"
+
+  # 详细日志
+  verbose: false
+
+  # 跨会话记忆最大条数（LRU 淘汰）
+  max_memories: 1000
+
+  # 凭据池：最大失败次数（超过后自动禁用）
+  credential_max_fail_count: 10
+
+  # 凭据池：冷却时间（秒）
+  credential_cooldown: 300
+
+# =============================================================================
+# 上下文压缩（对话过长时自动摘要）
+# =============================================================================
+compression:
+  enabled: true
+  threshold: 0.75          # 上下文窗口占比触发阈值
+  protect_first_n: 3       # 始终保留的开头消息数
+  protect_last_n: 6        # 始终保留的最近消息数
+  chars_per_token: 3.5     # token 估算比例
+  summary_target_ratio: 0.3  # 压缩到原来的比例
+  summary_max_tokens: 2000   # 摘要 LLM 调用 max_tokens
+  summary_temperature: 0.3   # 摘要 LLM 温度
+  incremental_summary_max_tokens: 2500  # 迭代合并摘要 max_tokens
+
+# =============================================================================
+# 流式输出
+# =============================================================================
+streaming:
+  enabled: false
+
+# =============================================================================
+# 工具循环护栏（防止工具调用死循环）
+# =============================================================================
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: false
+  warn_after:
+    exact_failure: 2
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+  hard_stop_after:
+    exact_failure: 5
+    same_tool_failure: 8
+    idempotent_no_progress: 5
+
+# =============================================================================
+# 超时配置（秒）
+# =============================================================================
+# timeouts:
+#   terminal_default: 120
+#   terminal_max: 600
+#   execute_code_default: 60
+#   execute_code_max: 300
+#   web_default: 30
+#   delegate_default: 300
+#   memora_tool: 60
+#   gateway_confirm: 300
+#   browser_dialog: 300
+#   osv_api: 10
+#   health_check: 5
+
+# =============================================================================
+# 错误恢复退避（秒）
+# =============================================================================
+# backoff:
+#   overloaded_base: 10.0    overloaded_max: 180.0
+#   rate_limit_base: 5.0     rate_limit_max: 120.0
+#   server_error_base: 3.0   server_error_max: 60.0
+#   timeout_base: 5.0        timeout_max: 90.0
+#   auth_base: 2.0           auth_max: 30.0
+#   jitter_ratio: 0.5
+
+# =============================================================================
+# 输出限制
+# =============================================================================
+# limits:
+#   tool_output_max_chars: 100000    # 通用工具输出截断
+#   terminal_output_max_chars: 50000 # 终端输出截断
+#   read_extract_max_chars: 30000    # 文档提取截断
+#   diff_max_chars: 20000            # Git diff 截断
+#   search_max_chars: 20000          # 搜索结果截断
+
+# =============================================================================
+# 平台消息限制
+# =============================================================================
+# platforms:
+#   default_max_message_length: 4096
+#   default_reconnect_backoff: [2, 5, 10, 30, 60]
+#   chunk_delay: 0.5
+#   qq:      { max_message_length: 2000 }
+#   wecom:   { max_message_length: 4000, connect_timeout: 20 }
+#   feishu:  { max_message_length: 30000 }
+#   dingtalk:{ max_message_length: 20000 }
+#   discord: { max_message_length: 2000, max_embed_length: 4096, typing_interval: 5 }
+#   telegram:{ max_message_length: 4096, max_caption_length: 1024, typing_interval: 4 }
+#   slack:   { max_message_length: 40000, typing_interval: 5 }
+
+# =============================================================================
+# Memora 知识库
+# =============================================================================
+# memora:
+#   base_url: "http://127.0.0.1:8080"
+#   min_file_size: 100         # 自动保存最小文件（bytes）
+#   max_file_size: 5242880     # 自动保存最大文件（5MB）
+
+# =============================================================================
+# 浏览器自动化
+# =============================================================================
+# browser:
+#   frame_tree_max_entries: 30
+#   console_history_max: 50
+#   recent_dialogs_max: 20
+#   websocket_max_size: 10485760  # 10MB
+
+# =============================================================================
+# 外部集成 URL
+# =============================================================================
+# integrations:
+#   graph_base_url: "https://graph.microsoft.com/v1.0"
+#   homeassistant_url: "http://homeassistant.local:8123"
+#   osv_api_url: "https://api.osv.dev/v1/query"
+
+# =============================================================================
+# 网关配置
+# =============================================================================
+# gateway:
+#   agent_cache_size: 32
+#   agent_idle_ttl_seconds: 3600
+#   graceful_shutdown_timeout: 10
+#   cleanup_interval: 300      # 定期清理间隔（秒）
+
+# =============================================================================
+# 环境变量速查（SPIRIT_ 前缀）
+# =============================================================================
+#
+# SPIRIT_MODEL=gpt-4o              设置模型
+# SPIRIT_PROVIDER=openai           设置 Provider
+# SPIRIT_API_KEY=sk-...            设置 API 密钥
+# SPIRIT_BASE_URL=http://...       设置自定义端点
+# SPIRIT_CONTEXT_LENGTH=128000     设置上下文窗口
+# SPIRIT_MAX_ITERATIONS=90         设置最大迭代次数
+# SPIRIT_REASONING_EFFORT=high     设置推理努力
+# SPIRIT_VERBOSE=true              启用详细日志
+# SPIRIT_COMPRESSION_ENABLED=true  启用压缩
+# SPIRIT_STREAMING_ENABLED=true    启用流式输出
+#
+# 也可以在 ~/.spirit/.env 中设置 API 密钥:
+# OPENAI_API_KEY=sk-...
+# OPENROUTER_API_KEY=sk-or-...
+# ANTHROPIC_API_KEY=sk-ant-...
+# GOOGLE_API_KEY=...
