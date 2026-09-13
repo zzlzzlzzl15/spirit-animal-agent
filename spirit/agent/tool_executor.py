@@ -128,15 +128,7 @@ def execute_single_tool(
             "status": "cancelled",
         }, ensure_ascii=False), tool_name, None
 
-    # 回调：工具开始
-    on_start = getattr(agent, "on_tool_start", None)
-    if on_start:
-        try:
-            on_start(tool_name, args)
-        except Exception:
-            pass
-
-    # 执行
+    # 执行（on_tool_start/on_complete 回调统一在 invoke_tool 内触发，避免重复推送）
     start_time = time.time()
     try:
         result = agent.invoke_tool(tool_name, args)
@@ -149,14 +141,6 @@ def execute_single_tool(
 
     duration_ms = int((time.time() - start_time) * 1000)
     logger.info("工具 %s 执行完成 (%d ms)", tool_name, duration_ms)
-
-    # 回调：工具完成
-    on_complete = getattr(agent, "on_tool_complete", None)
-    if on_complete:
-        try:
-            on_complete(tool_name, result)
-        except Exception:
-            pass
 
     # 护栏：调用后检查
     guardrail_decision = None

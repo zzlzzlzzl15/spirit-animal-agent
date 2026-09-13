@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Spirit Fox 小灵狐 AI 动画预览</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --bg2: #16213e;
+    --accent: #ff8c5a;
+    --text: #e8e8f0;
+    --muted: #8a8aa3;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: linear-gradient(135deg, var(--bg) 0%, var(--bg2) 100%);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 32px 16px;
+  }
+
+  h1 {
+    font-size: 22px;
+    margin-bottom: 6px;
+    background: linear-gradient(90deg, var(--accent), #ffb088);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .subtitle {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 28px;
+  }
+
+  /* 模拟 192x208 窗口的画框 */
+  .stage {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+    justify-content: center;
+    align-items: flex-start;
+  }
+
+  .window-frame {
+    position: relative;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.02);
+    padding: 14px;
+    backdrop-filter: blur(8px);
+  }
+
+  .window-frame::before {
+    content: attr(data-label);
+    position: absolute;
+    top: -10px;
+    left: 12px;
+    font-size: 11px;
+    background: var(--bg);
+    padding: 0 8px;
+    color: var(--muted);
+  }
+
+  .fox-canvas {
+    width: 192px;
+    height: 208px;
+    background: transparent;
+    overflow: hidden;
+    border-radius: 6px;
+  }
+
+  .fox-canvas.small { width: 144px; height: 156px; }
+  .fox-canvas.large { width: 256px; height: 277px; }
+
+  .info {
+    margin-top: 28px;
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+    max-width: 600px;
+    line-height: 1.6;
+  }
+
+  /* ==================================================================
+     SVG 内部样式 + 动画定义
+     ================================================================== */
+  svg.fox { width: 100%; height: 100%; display: block; }
+
+  /* 1. 整体呼吸浮动 */
+  .fox-body-group {
+    transform-origin: 96px 130px;
+    animation: breathe 3.2s ease-in-out infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { transform: translateY(0) scale(1); }
+    50%      { transform: translateY(-3px) scale(1.015); }
+  }
+
+  /* 2. 尾巴摇摆 */
+  .fox-tail {
+    transform-origin: 60px 140px;
+    animation: tail-wag 2.4s ease-in-out infinite;
+  }
+  @keyframes tail-wag {
+    0%, 100% { transform: rotate(-8deg); }
+    50%      { transform: rotate(12deg); }
+  }
+
+  /* 3. 尾巴尖独立小摆 */
+  .fox-tail-tip {
+    transform-origin: 42px 158px;
+    animation: tail-tip 2.4s ease-in-out infinite;
+  }
+  @keyframes tail-tip {
+    0%, 100% { transform: rotate(0deg); }
+    50%      { transform: rotate(6deg); }
+  }
+
+  /* 4. 眨眼 — 通过 scaleY */
+  .fox-eye {
+    transform-origin: center;
+    transform-box: fill-box;
+    animation: blink 4.5s ease-in-out infinite;
+  }
+  @keyframes blink {
+    0%, 92%, 100% { transform: scaleY(1); }
+    95%           { transform: scaleY(0.1); }
+  }
+
+  /* 5. 腮红脉冲 */
+  .fox-blush {
+    transform-origin: center;
+    transform-box: fill-box;
+    animation: blush-pulse 2.6s ease-in-out infinite;
+  }
+  @keyframes blush-pulse {
+    0%, 100% { opacity: 0.55; transform: scale(1); }
+    50%      { opacity: 0.85; transform: scale(1.08); }
+  }
+
+  /* 6. 耳朵微抖动 — 偶尔抖一下 */
+  .fox-ear-left {
+    transform-origin: 75px 70px;
+    animation: ear-twitch-left 5s ease-in-out infinite;
+  }
+  .fox-ear-right {
+    transform-origin: 117px 70px;
+    animation: ear-twitch-right 5s ease-in-out infinite;
+  }
+  @keyframes ear-twitch-left {
+    0%, 88%, 100% { transform: rotate(0deg); }
+    92%           { transform: rotate(-6deg); }
+  }
+  @keyframes ear-twitch-right {
+    0%, 88%, 100% { transform: rotate(0deg); }
+    92%           { transform: rotate(6deg); }
+  }
+
+  /* 7. 额头灵纹 — Spirit 主题高光 */
+  .fox-mark {
+    transform-origin: center;
+    transform-box: fill-box;
+    animation: mark-glow 2.8s ease-in-out infinite;
+  }
+  @keyframes mark-glow {
+    0%, 100% { opacity: 0.7; transform: scale(1); }
+    50%      { opacity: 1;   transform: scale(1.12); }
+  }
+
+  /* 8. 地面阴影同步呼吸 */
+  .fox-shadow {
+    transform-origin: center;
+    transform-box: fill-box;
+    animation: shadow-pulse 3.2s ease-in-out infinite;
+  }
+  @keyframes shadow-pulse {
+    0%, 100% { opacity: 0.25; transform: scaleX(1); }
+    50%      { opacity: 0.18; transform: scaleX(0.88); }
+  }
+
+  /* 9. 魔法粒子 */
+  .particle {
+    transform-origin: center;
+    transform-box: fill-box;
+    animation: float 4s ease-in-out infinite;
+  }
+  .particle.p1 { animation-delay: 0s;    animation-duration: 4.0s; }
+  .particle.p2 { animation-delay: -1.2s; animation-duration: 5.0s; }
+  .particle.p3 { animation-delay: -2.0s; animation-duration: 4.5s; }
+  .particle.p4 { animation-delay: -0.6s; animation-duration: 5.5s; }
+  .particle.p5 { animation-delay: -1.8s; animation-duration: 4.2s; }
+  .particle.p6 { animation-delay: -2.6s; animation-duration: 5.2s; }
+  @keyframes float {
+    0%   { transform: translate(0, 0)     scale(0.4); opacity: 0; }
+    15%  { opacity: 1; }
+    50%  { transform: translate(var(--dx, 8px), var(--dy, -20px)) scale(1); }
+    85%  { opacity: 0.6; }
+    100% { transform: translate(var(--dx2, 4px), var(--dy2, -45px)) scale(0.3); opacity: 0; }
+  }
+
+  /* 10. 嘴角微笑轻微抖动 */
+  .fox-mouth {
+    transform-origin: center;
+    transform-box: fill-box;
+    animation: mouth-smile 3.5s ease-in-out infinite;
+  }
+  @keyframes mouth-smile {
+    0%, 100% { transform: scaleY(1); }
+    50%      { transform: scaleY(1.15); }
+  }
+
+  /* 控制面板 */
+  .controls {
+    display: flex;
+    gap: 8px;
+    margin-top: 18px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .btn {
+    background: rgba(255, 140, 90, 0.12);
+    border: 1px solid rgba(255, 140, 90, 0.3);
+    color: var(--accent);
+    padding: 6px 14px;
+    border-radius: 16px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn:hover {
+    background: rgba(255, 140, 90, 0.22);
+    border-color: var(--accent);
+  }
+  .btn.active {
+    background: var(--accent);
+    color: #1a1a2e;
+  }
+</style>
+</head>
+<body>
+
+<h1>🦊 小灵狐 · AI 动画预览</h1>
+<p class="subtitle">SVG + CSS 动画 · 192 × 208 原始尺寸 · 可嵌入桌宠窗口</p>
+
+<div class="stage">
+  <!-- 主预览窗口 -->
+  <div class="window-frame" data-label="原始尺寸 192×208">
+    <div class="fox-canvas" id="fox-main"></div>
+  </div>
+
+  <!-- 小尺寸（默认窗口 scale=0.75） -->
+  <div class="window-frame" data-label="默认窗口 144×156">
+    <div class="fox-canvas small" id="fox-small"></div>
+  </div>
+
+  <!-- 大尺寸预览 -->
+  <div class="window-frame" data-label="放大版 256×277">
+    <div class="fox-canvas large" id="fox-large"></div>
+  </div>
+</div>
+
+<!-- 控制按钮 -->
+<div class="controls">
+  <button class="btn active" data-anim="all">全部动画</button>
+  <button class="btn" data-anim="blink">仅眨眼</button>
+  <button class="btn" data-anim="tail">仅摇尾</button>
+  <button class="btn" data-anim="breathe">仅呼吸</button>
+  <button class="btn" data-anim="mark">仅灵纹</button>
+</div>
+
+<p class="info">
+  ✨ 动画构成：呼吸浮动 · 自动眨眼 · 尾巴摇摆 · 耳朵抖动 · 腮红脉冲 · 嘴角微笑 · 灵纹闪烁 · 魔法粒子<br>
+  📦 完全用 SVG + CSS 实现，0 依赖、0 资源请求，可直接嵌入 Electron / Vue 项目
+</p>
+
+<!-- 共享的 SVG 模板（使用 innerHTML 复用） -->
+<template id="fox-svg-template">
+<svg class="fox" viewBox="0 0 192 208" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 渐变：身体 -->
+    <radialGradient id="body-grad" cx="50%" cy="40%" r="60%">
+      <stop offset="0%"  stop-color="#ff9b5e"/>
+      <stop offset="100%" stop-color="#e8723c"/>
+    </radialGradient>
+    <!-- 渐变：白肚皮 -->
+    <radialGradient id="belly-grad" cx="50%" cy="50%" r="55%">
+      <stop offset="0%"  stop-color="#fff8ee"/>
+      <stop offset="100%" stop-color="#ffe4c4"/>
+    </radialGradient>
+    <!-- 渐变：尾巴 -->
+    <radialGradient id="tail-grad" cx="60%" cy="40%" r="65%">
+      <stop offset="0%"  stop-color="#ff9b5e"/>
+      <stop offset="80%" stop-color="#e8723c"/>
+      <stop offset="100%" stop-color="#fff8ee"/>
+    </radialGradient>
+    <!-- 渐变：耳朵内层 -->
+    <radialGradient id="ear-inner" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#ffc8b5"/>
+      <stop offset="100%" stop-color="#ff9b8e"/>
+    </radialGradient>
+    <!-- 灵纹光晕 -->
+    <radialGradient id="mark-glow">
+      <stop offset="0%"  stop-color="#fff6c4" stop-opacity="0.9"/>
+      <stop offset="50%" stop-color="#ffd97a" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#ffd97a" stop-opacity="0"/>
+    </radialGradient>
+    <!-- 粒子光晕 -->
+    <radialGradient id="particle-grad">
+      <stop offset="0%"  stop-color="#fff5b8"/>
+      <stop offset="60%" stop-color="#ffb37a" stop-opacity="0.7"/>
+      <stop offset="100%" stop-color="#ff8c5a" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- 地面阴影 -->
+  <ellipse class="fox-shadow" cx="96" cy="195" rx="42" ry="5" fill="#000" opacity="0.25"/>
+
+  <!-- 可动组：整个身体 -->
+  <g class="fox-body-group">
+
+    <!-- 尾巴（在身体后面） -->
+    <g class="fox-tail">
+      <path d="M 65 145
+               Q 35 130, 28 105
+               Q 22 80, 38 65
+               Q 55 55, 72 70
+               Q 85 85, 78 115
+               Q 72 138, 65 145 Z"
+            fill="url(#tail-grad)" stroke="#c45a2c" stroke-width="2"/>
+      <g class="fox-tail-tip">
+        <ellipse cx="38" cy="78" rx="14" ry="18" fill="#fff8ee"/>
+      </g>
+    </g>
+
+    <!-- 后爪 -->
+    <ellipse cx="78"  cy="178" rx="14" ry="7" fill="#e8723c" stroke="#c45a2c" stroke-width="1.5"/>
+    <ellipse cx="116" cy="178" rx="14" ry="7" fill="#e8723c" stroke="#c45a2c" stroke-width="1.5"/>
+
+    <!-- 身体主体 -->
+    <ellipse cx="96" cy="148" rx="46" ry="38" fill="url(#body-grad)" stroke="#c45a2c" stroke-width="2"/>
+
+    <!-- 白肚皮 -->
+    <ellipse cx="96" cy="155" rx="28" ry="26" fill="url(#belly-grad)"/>
+
+    <!-- 前爪（小爪子） -->
+    <ellipse cx="80"  cy="175" rx="10" ry="6" fill="#fff8ee" stroke="#c45a2c" stroke-width="1.5"/>
+    <ellipse cx="112" cy="175" rx="10" ry="6" fill="#fff8ee" stroke="#c45a2c" stroke-width="1.5"/>
+    <!-- 爪垫 -->
+    <circle cx="80"  cy="175" r="3" fill="#ff9b8e" opacity="0.7"/>
+    <circle cx="112" cy="175" r="3" fill="#ff9b8e" opacity="0.7"/>
+
+    <!-- 头 -->
+    <ellipse cx="96" cy="98" rx="48" ry="42" fill="url(#body-grad)" stroke="#c45a2c" stroke-width="2"/>
+
+    <!-- 脸颊白斑 -->
+    <ellipse cx="72"  cy="110" rx="14" ry="10" fill="#fff8ee" opacity="0.7"/>
+    <ellipse cx="120" cy="110" rx="14" ry="10" fill="#fff8ee" opacity="0.7"/>
+
+    <!-- 腮红 -->
+    <circle class="fox-blush" cx="72"  cy="118" r="6" fill="#ff8c8c" opacity="0.55"/>
+    <circle class="fox-blush" cx="120" cy="118" r="6" fill="#ff8c8c" opacity="0.55"/>
+
+    <!-- 左耳 -->
+    <g class="fox-ear-left">
+      <path d="M 60 78
+               L 75 35
+               L 88 72 Z"
+            fill="#e8723c" stroke="#c45a2c" stroke-width="2"/>
+      <path d="M 68 70
+               L 78 45
+               L 84 68 Z"
+            fill="url(#ear-inner)"/>
+    </g>
+
+    <!-- 右耳 -->
+    <g class="fox-ear-right">
+      <path d="M 132 78
+               L 117 35
+               L 104 72 Z"
+            fill="#e8723c" stroke="#c45a2c" stroke-width="2"/>
+      <path d="M 124 70
+               L 114 45
+               L 108 68 Z"
+            fill="url(#ear-inner)"/>
+    </g>
+
+    <!-- 额头灵纹光晕 -->
+    <circle class="fox-mark" cx="96" cy="78" r="12" fill="url(#mark-glow)"/>
+    <!-- 灵纹本体：菱形 + 中心点 -->
+    <g class="fox-mark">
+      <path d="M 96 70 L 100 78 L 96 86 L 92 78 Z" fill="#fff5b8" stroke="#ffd97a" stroke-width="0.8"/>
+      <circle cx="96" cy="78" r="1.5" fill="#fff"/>
+    </g>
+
+    <!-- 眼睛 -->
+    <g class="fox-eye">
+      <ellipse cx="78"  cy="105" rx="6" ry="8" fill="#1a1a2e"/>
+      <ellipse cx="118" cy="105" rx="6" ry="8" fill="#1a1a2e"/>
+      <!-- 眼睛高光 -->
+      <circle cx="80"  cy="102" r="2" fill="#fff"/>
+      <circle cx="120" cy="102" r="2" fill="#fff"/>
+      <circle cx="77"  cy="108" r="1" fill="#fff" opacity="0.6"/>
+      <circle cx="117" cy="108" r="1" fill="#fff" opacity="0.6"/>
+    </g>
+
+    <!-- 鼻子 -->
+    <ellipse cx="96" cy="120" rx="4" ry="3" fill="#3a1f15"/>
+    <!-- 鼻子高光 -->
+    <circle cx="95" cy="119" r="1" fill="#fff" opacity="0.6"/>
+
+    <!-- 嘴巴（微笑） -->
+    <g class="fox-mouth">
+      <path d="M 96 124 L 96 130"
+            stroke="#3a1f15" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+      <path d="M 88 130 Q 92 136, 96 130 Q 100 136, 104 130"
+            stroke="#3a1f15" stroke-width="1.8" stroke-linecap="round" fill="none"/>
+    </g>
+
+    <!-- 小腮须 -->
+    <line x1="68" y1="124" x2="58" y2="122" stroke="#c45a2c" stroke-width="0.8" opacity="0.6"/>
+    <line x1="68" y1="128" x2="58" y2="130" stroke="#c45a2c" stroke-width="0.8" opacity="0.6"/>
+    <line x1="124" y1="124" x2="134" y2="122" stroke="#c45a2c" stroke-width="0.8" opacity="0.6"/>
+    <line x1="124" y1="128" x2="134" y2="130" stroke="#c45a2c" stroke-width="0.8" opacity="0.6"/>
+  </g>
+
+  <!-- 魔法粒子（独立浮动） -->
+  <g class="fox-particles">
+    <circle class="particle p1" cx="40"  cy="60"  r="2.5" fill="url(#particle-grad)" style="--dx: 6px;  --dy: -25px; --dx2: -4px; --dy2: -50px;"/>
+    <circle class="particle p2" cx="150" cy="50"  r="2"   fill="url(#particle-grad)" style="--dx: -8px; --dy: -20px; --dx2: 6px;  --dy2: -45px;"/>
+    <circle class="particle p3" cx="160" cy="100" r="2.5" fill="url(#particle-grad)" style="--dx: -10px;--dy: -28px; --dx2: 4px;  --dy2: -55px;"/>
+    <circle class="particle p4" cx="30"  cy="120" r="2"   fill="url(#particle-grad)" style="--dx: 8px;  --dy: -22px; --dx2: -6px; --dy2: -48px;"/>
+    <circle class="particle p5" cx="170" cy="150" r="2"   fill="url(#particle-grad)" style="--dx: -6px; --dy: -18px; --dx2: 4px;  --dy2: -42px;"/>
+    <circle class="particle p6" cx="22"  cy="160" r="2.5" fill="url(#particle-grad)" style="--dx: 10px; --dy: -24px; --dx2: -4px; --dy2: -52px;"/>
+  </g>
+</svg>
+</template>
+
+<script>
+  const tmpl = document.getElementById('fox-svg-template');
+
+  ['fox-main', 'fox-small', 'fox-large'].forEach(id => {
+    document.getElementById(id).appendChild(tmpl.content.cloneNode(true));
+  });
+
+  // 动画切换
+  const allAnimations = ['fox-body-group', 'fox-tail', 'fox-tail-tip', 'fox-eye',
+                         'fox-blush', 'fox-ear-left', 'fox-ear-right', 'fox-mark',
+                         'fox-shadow', 'fox-mouth', 'particle'];
+
+  document.querySelectorAll('.btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      const which = btn.dataset.anim;
+
+      allAnimations.forEach(name => {
+        document.querySelectorAll('.' + name).forEach(el => {
+          el.style.animation = 'none';
+          // 强制 reflow
+          void el.offsetWidth;
+        });
+      });
+
+      const restore = els => els.forEach(el => {
+        el.style.animation = '';
+      });
+
+      switch (which) {
+        case 'all':
+          restore(document.querySelectorAll('.fox-body-group, .fox-tail, .fox-tail-tip, .fox-eye, .fox-blush, .fox-ear-left, .fox-ear-right, .fox-mark, .fox-shadow, .fox-mouth, .particle'));
+          break;
+        case 'blink':
+          restore(document.querySelectorAll('.fox-eye'));
+          break;
+        case 'tail':
+          restore(document.querySelectorAll('.fox-tail, .fox-tail-tip'));
+          break;
+        case 'breathe':
+          restore(document.querySelectorAll('.fox-body-group, .fox-shadow'));
+          break;
+        case 'mark':
+          restore(document.querySelectorAll('.fox-mark'));
+          break;
+      }
+    });
+  });
+</script>
+</body>
+</html>

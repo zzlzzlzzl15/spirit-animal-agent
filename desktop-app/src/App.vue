@@ -102,6 +102,9 @@ onMounted(async () => {
     onEvent(event: string, data: any) {
       if (event === 'state_change') {
         petStore.setState(data.new_state)
+      } else if (event === 'pet_switch') {
+        // 服务端广播的宠物切换 → 同步前端精灵图
+        petStore.activeSlug = data.new_slug || ''
       } else if (event === 'init') {
         petStore.syncFromServer(data)
         statusStore.syncFromServer(data)
@@ -118,6 +121,14 @@ onMounted(async () => {
       }
     }
   }, 30000)
+
+  // 托盘“切换宠物”→ 转发给服务端（服务端持久化并广播 pet_switch，
+  // 所有窗口经 onEvent 同步精灵图）
+  if (window.electronAPI?.onSwitchPet) {
+    window.electronAPI.onSwitchPet((d: { slug: string }) => {
+      send('switch_pet', { slug: d.slug }).catch(() => {})
+    })
+  }
 })
 
 onUnmounted(() => {
@@ -218,6 +229,8 @@ function onWheel(e: WheelEvent) {
   const delta = e.deltaY > 0 ? -0.05 : 0.05
   const newScale = Math.max(0.2, Math.min(3.0, petStore.scale + delta))
   petStore.setScale(newScale)
+  // 同步服务端 prefs（重启后的唯一真相源），避免重启后缩放回滚
+  send('set_scale', { scale: newScale }).catch(() => {})
 }
 </script>
 

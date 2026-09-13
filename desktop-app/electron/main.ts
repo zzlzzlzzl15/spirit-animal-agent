@@ -8,8 +8,8 @@
  * - 窗口位置持久化
  */
 
-import { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage } from 'electron'
-import { createPetWindow, getPetWindow, createStatusWindow, closeStatusWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow } from './window'
+import { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, powerMonitor } from 'electron'
+import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow } from './window'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 
@@ -70,6 +70,20 @@ app.whenReady().then(async () => {
 
   // 6. 定期保存窗口位置
   setInterval(saveWindowPosition, 5000)
+
+  // 7. 休眠恢复 / 显示器变化时强制重绘桌宠窗口
+  // （Windows 透明无边框窗口在休眠恢复后合成器可能停止绘制，
+  //   渲染进程活着但狐狸不显示；hide+showInactive 强制重建合成层，
+  //   showInactive 不抢焦点）
+  const refreshPetWindow = (): void => {
+    const win = getPetWindow()
+    if (win && !win.isDestroyed()) {
+      win.hide()
+      win.showInactive()
+    }
+  }
+  powerMonitor.on('resume', refreshPetWindow)
+  screen.on('display-metrics-changed', refreshPetWindow)
 })
 
 app.on('window-all-closed', () => {
@@ -167,6 +181,8 @@ function registerIPC(): void {
   // 保存缩放
   ipcMain.on('save-scale', (_event, { scale }: { scale: number }) => {
     store.set('petScale', scale)
+    // 实时调整桌宠窗口尺寸，匹配新缩放
+    resizePetWindow(scale)
   })
 
   // 获取保存的配置

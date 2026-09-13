@@ -344,66 +344,48 @@ class SpiritAgent:
         
         return turn_ctx
 
-    def chat(self, message: str) -> str:
-        """简化版对话接口 — 返回文本响应。"""
-        result = self.run_conversation(message)
-        return result.response
+    def chat(
+        self,
+        message: str,
+        stream_callback: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """对话接口 — 返回完整响应（含工具调用）。
+
+        Args:
+            message: 用户消息
+            stream_callback: 可选的流式文本增量回调（集成在主循环内）
+
+        Returns:
+            dict: {
+                'response': str - 最终文本响应,
+                'tool_calls': list - 本轮的工具调用列表,
+                'usage': dict - token 使用统计,
+                'iterations': int - 迭代次数
+            }
+        """
+        result = self.run_conversation(message, stream_callback=stream_callback)
+        return {
+            'response': result.response,
+            'tool_calls': result.tool_calls,
+            'usage': result.usage,
+            'iterations': result.iterations,
+        }
 
     def chat_stream(self, message: str, delta_callback: Callable = None):
-        """流式对话接口 — 实时推送文本增量。
+        """流式对话接口 — 委托给统一主循环（chat）。
+
+        历史遗留的独立流式管道已移除：流式增量现在作为传输层
+        集成在 run_conversation 主循环内（带门控），保证工具调用
+        解析、循环处理、总结与非流式路径完全一致。
 
         Args:
             message: 用户消息
             delta_callback: 每个文本增量回调 (text_delta: str) -> None
 
         Returns:
-            完整响应文本
+            dict: 与 chat() 相同的完整响应字典
         """
-        from spirit.agent.streaming import StreamingHandler, StreamDelta
-
-        # 初始化消息
-        if not self.messages:
-            self.add_message("system", self.get_system_prompt())
-        self.add_message("user", message)
-
-        # 构建 API 消息
-        from spirit.agent.tool_executor import prepare_api_messages
-        api_messages = prepare_api_messages(self.messages)
-        tools = self.get_tool_definitions()
-
-        # 流式调用 - 使用延迟回调机制
-        # 只有确认没有工具调用时才发送增量到前端
-        collected_text = []
-        pending_deltas = []  # 暂存待发送的增量
-
-        def _on_delta(delta: StreamDelta):
-            if delta.content:
-                collected_text.append(delta.content)
-                pending_deltas.append(delta.content)  # 先暂存，不立即发送
-
-        handler = StreamingHandler(self, delta_callback=_on_delta)
-        result = handler.stream_chat(api_messages, tools=tools)
-
-        # 如果有工具调用，回退到非流式处理
-        if result.tool_calls:
-            # 移除刚才添加的用户消息（避免 self.chat() 重复添加）
-            if self.messages and self.messages[-1].role == "user":
-                self.messages.pop()
-            
-            # 重新执行非流式对话（会执行工具并返回最终结果）
-            return self.chat(message)
-
-        # 没有工具调用，安全地发送所有累积的增量
-        for text in pending_deltas:
-            if delta_callback:
-                try:
-                    delta_callback(text)
-                except Exception:
-                    pass
-
-        full_text = result.content
-        self.add_message("assistant", full_text)
-        return full_text
+        return self.chat(message, stream_callback=delta_callback)
 
     def interrupt(self):
         """请求中断当前操作。"""

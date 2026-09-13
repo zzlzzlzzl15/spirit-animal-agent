@@ -45,6 +45,11 @@ export const usePetStore = defineStore('pet', () => {
     if (data.preferences) {
       const serverScale = data.preferences.scale || 0.75
       scale.value = Math.max(0.5, Math.min(3.0, serverScale))
+      // 以服务端 prefs 为真相源对齐 electron-store 与窗口尺寸
+      // （save-scale IPC 同时触发主进程 resizePetWindow）
+      if (window.electronAPI) {
+        window.electronAPI.saveScale(scale.value)
+      }
     }
   }
 

@@ -104,19 +104,16 @@ def parse_text_tool_calls(text: str) -> Tuple[List[Dict[str, Any]], str]:
     extracted: List[Dict[str, Any]] = []
     consumed_spans: List[Tuple[int, int]] = []
 
-    def _try_add_tool_call(raw_json: str) -> None:
-        try:
-            obj = json.loads(raw_json)
-        except Exception:
-            return
+    def _try_add_obj(obj: Any) -> bool:
+        """Try to add a single parsed JSON object as a tool call."""
         if not isinstance(obj, dict):
-            return
+            return False
         fn = obj.get("function")
         if not isinstance(fn, dict):
-            return
+            return False
         fn_name = fn.get("name")
         if not isinstance(fn_name, str) or not fn_name.strip():
-            return
+            return False
         fn_args = fn.get("arguments", "{}")
         if not isinstance(fn_args, str):
             fn_args = json.dumps(fn_args, ensure_ascii=False)
@@ -131,12 +128,43 @@ def parse_text_tool_calls(text: str) -> Tuple[List[Dict[str, Any]], str]:
                 arguments=fn_args,
             )
         )
+        return True
+
+    def _try_add_tool_call(raw_json: str) -> None:
+        # 1) 单个 JSON 对象 / JSON 数组
+        try:
+            obj = json.loads(raw_json)
+        except Exception:
+            obj = None
+        if obj is not None:
+            if isinstance(obj, list):
+                for item in obj:
+                    _try_add_obj(item)
+                return
+            if _try_add_obj(obj):
+                return
+        # 2) 块内含多个连续 JSON 对象 — 用 raw_decode 逐个扫描
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(raw_json):
+            start = raw_json.find("{", idx)
+            if start < 0:
+                break
+            try:
+                obj, end = decoder.raw_decode(raw_json[start:])
+            except Exception:
+                break
+            _try_add_obj(obj)
+            idx = start + end
 
     # 1. Try 
     for m in _TOOL_CALL_BLOCK_RE.finditer(text):
         raw = m.group(1)
+        before = len(extracted)
         _try_add_tool_call(raw)
-        consumed_spans.append((m.start(), m.end()))
+        # 块被识别为工具调用块即消费（避免原始 JSON 进入上下文）
+        if len(extracted) > before or raw.strip().startswith("{"):
+            consumed_spans.append((m.start(), m.end()))
 
     # 2. Bare JSON fallback (only when no XML blocks found)
     if not extracted:

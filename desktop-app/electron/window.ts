@@ -48,8 +48,22 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
 
   // 默认位置：屏幕底部居中
   const display = screen.getPrimaryDisplay()
-  const x = options.x ?? Math.floor(display.workAreaSize.width / 2 - contentW / 2)
-  const y = options.y ?? Math.floor(display.workAreaSize.height - contentH - 50)
+  let x = options.x ?? Math.floor(display.workAreaSize.width / 2 - contentW / 2)
+  let y = options.y ?? Math.floor(display.workAreaSize.height - contentH - 50)
+
+  // 恢复位置校验：保存的坐标若已完全落在屏幕外（拔显示器/分辨率变化），
+  // 回退到主屏底部居中，避免桌宠“消失”
+  const onScreen = screen.getAllDisplays().some((d) => {
+    const wa = d.workArea
+    return (
+      x + contentW > wa.x && x < wa.x + wa.width &&
+      y + contentH > wa.y && y < wa.y + wa.height
+    )
+  })
+  if (!onScreen) {
+    x = Math.floor(display.workAreaSize.width / 2 - contentW / 2)
+    y = Math.floor(display.workAreaSize.height - contentH - 50)
+  }
 
   petWindow = new BrowserWindow({
     x,
@@ -80,6 +94,7 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
   petWindow.setTitle('Spirit Pet')
 
   // 禁用默认右键菜单，让 Vue 的 contextmenu 事件正常处理
+  // 注意：这不会影响键盘快捷键（Ctrl+C/Ctrl+V）的复制粘贴功能
   petWindow.webContents.on('context-menu', (e) => {
     e.preventDefault()
   })
@@ -290,6 +305,8 @@ export function createBubbleWindow(
     skipTaskbar: true,
     hasShadow: false,
     movable: false,
+    show: false,       // 创建时不立即显示，改用 showInactive 惰性显示
+    focusable: false,  // 永不接受焦点：避免周期气泡抢夺 CLI 聊天框输入焦点
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -307,6 +324,9 @@ export function createBubbleWindow(
       hash: `speech-bubble?text=${encodedText}`,
     })
   }
+
+  // 以“非激活”方式显示：不夺取系统焦点，不打断用户在任何窗口的输入
+  bubbleWindow.showInactive()
 
   // 4 秒后自动关闭
   bubbleAutoTimer = setTimeout(() => {
@@ -374,7 +394,14 @@ export function createCLITerminalWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
+      // 启用剪贴板访问
+      enableWebSQL: false,
     },
+  })
+
+  // 渲染层 console 管道：前端渲染异常时可在主进程日志直接看到
+  cliTerminalWindow.webContents.on('console-message', (_event, _level, message) => {
+    console.log(`[CLI renderer] ${message}`)
   })
 
   if (process.env.VITE_DEV_SERVER_URL) {

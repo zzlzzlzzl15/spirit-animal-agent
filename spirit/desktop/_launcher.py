@@ -39,6 +39,25 @@ def main():
     engine = PetEngine()
     logger.info("PetEngine 已初始化")
 
+    # 引导安装内置宠物：~/.spirit/pets 为空时注册前端内置的 spirit-fox，
+    # 避免服务端 pet=none 导致状态机/切换链路空转
+    try:
+        if not engine.list_pets():
+            bundled = os.path.join(
+                project_root, "desktop-app", "public", "assets",
+                "pets", "spirit-fox", "spritesheet.png",
+            )
+            if os.path.isfile(bundled):
+                engine.install_pet(
+                    bundled, slug="spirit-fox", display_name="灵狐 (Spirit Fox)"
+                )
+                engine.switch_pet("spirit-fox")
+                logger.info("引导安装内置宠物: spirit-fox")
+            else:
+                logger.warning("内置宠物精灵图缺失: %s", bundled)
+    except Exception:
+        logger.warning("引导安装内置宠物失败", exc_info=True)
+
     # 初始化 Agent（从配置文件加载 LLM 配置）
     agent = None
     try:
@@ -51,6 +70,10 @@ def main():
             provider=llm_cfg.get("provider", "auto"),
             platform="cli",
         )
+        # 流式开关：从配置文件 streaming.enabled 读取（与 CLI 保持一致）
+        streaming_cfg = raw.get("streaming", {})
+        if isinstance(streaming_cfg, dict) and "enabled" in streaming_cfg:
+            config.streaming_enabled = bool(streaming_cfg["enabled"])
         agent = SpiritAgent(config)
         logger.info("SpiritAgent 已初始化: model=%s, provider=%s", config.model, config.provider)
     except Exception as exc:

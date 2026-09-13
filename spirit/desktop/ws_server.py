@@ -425,54 +425,101 @@ class WSServer:
 
                 async def _push_stream_delta(text):
                     try:
-                        await client.send_event("stream_delta", {"text": text})
+                        # 主循环已门控/清理过文本，这里直接转发
+                        if text:  # 只发送非空文本
+                            await client.send_event("stream_delta", {"text": text})
                     except Exception:
                         pass
 
-                # 设置回调
-                self.agent.on_tool_start = lambda n, a: asyncio.ensure_future(
-                    _push_tool_start(n, a), loop=asyncio.get_event_loop()
-                ) if asyncio.get_event_loop().is_running() else None
-                self.agent.on_tool_complete = lambda n, r: asyncio.ensure_future(
-                    _push_tool_complete(n, r), loop=asyncio.get_event_loop()
-                ) if asyncio.get_event_loop().is_running() else None
-
+                # 设置回调（工具在执行器线程中运行，必须用
+                # run_coroutine_threadsafe 线程安全地调度到事件循环）
                 loop = asyncio.get_event_loop()
 
-                # 创建带超时的 future
-                if self.agent.config.streaming_enabled:
-                    # 流式模式：使用 chat_stream + delta 回调
-                    full_response = ""
+                def _push_tool_start_sync(name, args):
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _push_tool_start(name, args), loop
+                        )
+                    except Exception:
+                        pass
 
+                def _push_tool_complete_sync(name, result):
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _push_tool_complete(name, result), loop
+                        )
+                    except Exception:
+                        pass
+
+                self.agent.on_tool_start = _push_tool_start_sync
+                self.agent.on_tool_complete = _push_tool_complete_sync
+
+                # 单一路径：流式作为传输层集成在主循环内（chat + stream_callback）
+                deltas_sent = {"v": False}
+
+                if self.agent.config.streaming_enabled:
                     def _sync_delta_callback(text):
-                        """同步回调 → 调度到事件循环推送。"""
+                        """同步回调 → 线程安全推送，并阻塞等待发送完成。
+
+                        必须 .result() 等待：否则主循环返回后
+                        chat_complete/命令响应可能先于 delta 到达前端，
+                        导致最终文本乱序或丢失。
+                        """
+                        deltas_sent["v"] = True
                         try:
                             asyncio.run_coroutine_threadsafe(
                                 _push_stream_delta(text), loop
-                            )
+                            ).result(timeout=10)
                         except Exception:
                             pass
 
-                    self.agent.on_stream_delta = _sync_delta_callback
-                    
-                    # 在 executor 中运行并设置超时
                     future = loop.run_in_executor(
-                        None, self.agent.chat_stream, message, _sync_delta_callback
+                        None, self.agent.chat, message, _sync_delta_callback
                     )
-                    response = await asyncio.wait_for(future, timeout=chat_timeout)
                 else:
                     # 非流式模式：等待完整响应
                     future = loop.run_in_executor(None, self.agent.chat, message)
-                    response = await asyncio.wait_for(future, timeout=chat_timeout)
+                response = await asyncio.wait_for(future, timeout=chat_timeout)
 
                 # 恢复原始回调
                 self.agent.on_tool_start = original_on_tool_start
                 self.agent.on_tool_complete = original_on_tool_complete
 
-                # 发送完成事件
-                await client.send_event("chat_complete", {})
+                # 清理响应中的 <think> 标签和工具调用格式
+                from spirit.cli.main_enhanced import _clean_think_tags, _format_tool_calls_display
+                
+                # response 现在是 dict: {'response': str, 'tool_calls': list, ...}
+                if isinstance(response, dict):
+                    raw_response = response.get('response', '')
+                    tool_calls = response.get('tool_calls', [])
+                else:
+                    # 兼容旧版本（流式模式可能返回字符串）
+                    raw_response = response
+                    tool_calls = []
+                
+                # 清理文本响应
+                cleaned_response = _clean_think_tags(raw_response) if raw_response else ''
+                
+                # 格式化工具调用（如果有）
+                formatted_tools = _format_tool_calls_display(tool_calls) if tool_calls else ''
+                
+                # 发送完成事件：chat_complete 始终携带清理后的最终文本，
+                # 作为可靠兕底渲染源（前端仅在流式增量未送达时渲染它，防双重输出）
+                logger.info(
+                    "chat 完成: deltas_sent=%s, response_len=%d, tools=%d",
+                    deltas_sent["v"], len(cleaned_response), len(tool_calls),
+                )
+                await client.send_event("chat_complete", {
+                    "response": cleaned_response,
+                    "tool_calls_formatted": formatted_tools,
+                    "deltas_sent": deltas_sent["v"],
+                })
 
-                return {"response": response}
+                return {
+                    "response": cleaned_response,
+                    "tool_calls": tool_calls,
+                    "tool_calls_formatted": formatted_tools,
+                }
             except asyncio.TimeoutError:
                 # 超时处理：中断 Agent 并恢复回调
                 logger.warning("聊天请求超时 (%.1f 秒)，中断 Agent", chat_timeout)
@@ -703,7 +750,7 @@ class WSServer:
             import sys
             import platform
             return {
-                "version": "1.0.0",
+                "version": "0.0.2",
                 "python": platform.python_version(),
                 "platform": platform.system(),
                 "arch": platform.machine(),

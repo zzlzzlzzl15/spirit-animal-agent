@@ -2,8 +2,9 @@
   <div class="cli-terminal-page">
     <div class="terminal-header">
       <span class="terminal-title">Spirit Agent CLI</span>
+      <span class="terminal-hint">使用 Ctrl+C/V 复制粘贴</span>
       <div class="terminal-controls">
-        <button class="ctrl-btn" @click="clearTerminal" title="清屏">⌫</button>
+        <button class="ctrl-btn" @click="clearTerminal" title="清屏"></button>
         <button class="ctrl-btn" @click="closeWindow" title="关闭">✕</button>
       </div>
     </div>
@@ -133,39 +134,65 @@ function handleEvent(msg: any) {
       break
 
     case 'tool_start':
-      // 工具开始执行 — 在终端显示进度
+      // 工具开始执行 — 在终端显示进度（内联标注）
+      toolEventCount++
       if (term && isStreaming) {
-        term.writeln('')
+        flushMarkdown()  // 先flush未完成行，避免标注插进半行中间
+        term.write('\r\x1b[K')  // 清掉当前 spinner 行，避免标注接在 spinner 后面
         term.writeln(`\x1b[93m  🔧 调用工具: ${data.tool}\x1b[0m`)
         if (data.args_preview) {
-          const preview = data.args_preview.substring(0, 80)
-          term.writeln(`\x1b[90m     参数: ${preview}${data.args_preview.length > 80 ? '...' : ''}\x1b[0m`)
+          const rawPreview = String(data.args_preview).replace(/[\r\n]+/g, ' ')
+          const preview = rawPreview.substring(0, 80)
+          term.writeln(`\x1b[90m     参数: ${preview}${rawPreview.length > 80 ? '...' : ''}\x1b[0m`)
         }
       }
       break
 
     case 'tool_complete':
       if (term && isStreaming) {
+        flushMarkdown()
+        term.write('\r\x1b[K')
         term.writeln(`\x1b[92m  ✓ ${data.tool} 完成\x1b[0m`)
       }
       break
 
     case 'stream_delta':
-      // 流式文本增量 — 实时显示
+      // 流式文本增量 — 逐行缓冲 + Markdown 格式化渲染
+      // （不能直接 term.write：裸 \n 在 xterm 中不换列，会导致阶梯状错行）
+      console.log('[cli] stream_delta len=', (data.text || '').length)
       if (term && isStreaming && data.text) {
         streamBuffer += data.text
         // 第一个 delta，停止 spinner 并换行到输出区域
         if (streamBuffer.length === data.text.length) {
           stopSpinner()
         }
-        // 写入文本（不换行）
-        term.write(data.text)
+        feedMarkdown(data.text)
       }
       break
 
     case 'chat_complete':
-      // 对话完成
+      // 对话完成：停 spinner + 工具汇总兜底 + 最终文本兜底渲染。
+      // 最终文本优先由 stream_delta 实时渲染；若增量未送达（乱序/丢失），
+      // 在这里用 chat_complete 携带的 response 兜底，保证结果绝不丢失。
       stopSpinner()
+      console.log('[cli] chat_complete resp_len=', (data.response || '').length, 'streamBuffer=', streamBuffer.length, 'toolEvents=', toolEventCount)
+      flushMarkdown()
+
+      if (data.tool_calls_formatted && toolEventCount === 0) {
+        term!.writeln('')
+        for (const line of String(data.tool_calls_formatted).split('\n')) {
+          term!.writeln(line)
+        }
+      }
+
+      if (!streamBuffer && !finalRendered && data.response) {
+        finalRendered = true
+        term!.writeln('')
+        for (const line of String(data.response).split('\n')) {
+          const formatted = formatMarkdownLine(line)
+          if (formatted !== null) term!.writeln(formatted)
+        }
+      }
       break
 
     case 'state_change':
@@ -630,6 +657,8 @@ let historyIndex = -1
 let isProcessing = false
 let isStreaming = false
 let streamBuffer = ''
+let toolEventCount = 0
+let finalRendered = false
 
 // ── Spinner 动画（参考 Hermes _COMMAND_SPINNER_FRAMES）────────
 
@@ -664,6 +693,79 @@ function stopSpinner() {
   }
 }
 
+// ── Markdown 逐行渲染器 ────────────────────────────────
+// 流式增量先缓冲，凑满整行再格式化为 ANSI 输出。
+// 解决两个问题：
+// 1. 裸 \n 直接 term.write 在 xterm 中不换列 → 阶梯状错行
+// 2. Markdown 符号（** / ## / - ）原样裸奔 → 转为终端样式
+
+let mdBuffer = ''
+
+function formatMarkdownLine(raw: string): string | null {
+  let out = raw.replace(/\s+$/, '')
+  if (!out.trim()) return ''
+
+  // 标题：# / ## / ### → 彩色加粗 + 层级缩进
+  const h = out.match(/^(#{1,6})\s*(.*)$/)
+  if (h) {
+    const level = h[1].length
+    const color = level === 1 ? '1;93' : level === 2 ? '1;96' : '1;95'
+    const prefix = level === 1 ? '■ ' : level === 2 ? '▎' : '  · '
+    const title = h[2].replace(/\*\*([^*]+)\*\*/g, '$1')
+    return `\x1b[${color}m${prefix}${title}\x1b[0m`
+  }
+
+  // 分隔线：--- / *** / ___ → 灰色细线（返回 null 表示跳过该行）
+  if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(out)) return null
+
+  // 引用：> text → 灰色竖栏
+  const q = out.match(/^\s*>\s?(.*)$/)
+  if (q) {
+    return `\x1b[90m  ┃ ${q[1]}\x1b[0m`
+  }
+
+  // 表格：| a | b | → 竖栏对齐；分隔行（|---|）跳过
+  if (/^\s*\|.*\|\s*$/.test(out)) {
+    if (/^\s*\|[\s:|-]+\|\s*$/.test(out)) return null
+    const cells = out.split('|').slice(1, -1).map(c => c.trim())
+    return '  ' + cells.join(' \x1b[90m│\x1b[0m ')
+  }
+
+  // 无序列表：- / * → 缩进圆点
+  out = out.replace(/^(\s*)[-*]\s+/, '$1  • ')
+  // 有序列表：统一两个空格缩进
+  out = out.replace(/^(\s*)(\d+)\.\s+/, '  $2. ')
+  // 加粗 ***x*** / **x** → ANSI bold
+  out = out.replace(/\*\*\*([^*]+)\*\*\*/g, '\x1b[1m$1\x1b[0m')
+  out = out.replace(/\*\*([^*]+)\*\*/g, '\x1b[1m$1\x1b[0m')
+  // 行内代码 `x` → 青色
+  out = out.replace(/`([^`]+)`/g, '\x1b[96m$1\x1b[0m')
+  // 链接 [t](u) → 下划线文本 + 灰色 URL
+  out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '\x1b[4m$1\x1b[0m\x1b[90m ($2)\x1b[0m')
+  // 残留的孤立 ** 标记 → 直接清掉
+  out = out.replace(/\*\*/g, '')
+  return out
+}
+
+function feedMarkdown(text: string) {
+  mdBuffer += text
+  let idx: number
+  while ((idx = mdBuffer.indexOf('\n')) >= 0) {
+    const line = mdBuffer.slice(0, idx)
+    mdBuffer = mdBuffer.slice(idx + 1)
+    const formatted = formatMarkdownLine(line)
+    if (formatted !== null) term!.writeln(formatted)
+  }
+}
+
+function flushMarkdown() {
+  if (mdBuffer) {
+    const formatted = formatMarkdownLine(mdBuffer)
+    if (formatted !== null) term!.writeln(formatted)
+    mdBuffer = ''
+  }
+}
+
 function printPrompt() {
   term!.write('\x1b[1;96mspirit\x1b[0m\x1b[90m ❯ \x1b[0m')
 }
@@ -684,21 +786,30 @@ async function sendChatMessage(message: string) {
   term!.writeln('')
   isStreaming = true
   streamBuffer = ''
+  toolEventCount = 0
+  finalRendered = false
+  mdBuffer = ''
   startSpinner('思考中')
   try {
     const data = await wsSend('chat', { message }, 300000)  // 5 分钟超时
     // 清除 spinner
     stopSpinner()
+    flushMarkdown()
     if (streamBuffer) {
       // 如果有流式增量，已经显示过了，只需换行
       term!.writeln('')
-    } else if (data.response) {
-      const lines = data.response.split('\n')
-      for (const line of lines) {
-        term!.writeln(`  \x1b[97m${line}\x1b[0m`)
-      }
     } else if (data.error) {
       term!.writeln(`\x1b[91m  ✗ ${data.error}\x1b[0m`)
+    } else if (data.response) {
+      // chat_complete 应已兜底渲染；若因乱序未渲染，这里补上
+      if (!finalRendered) {
+        finalRendered = true
+        const lines = data.response.split('\n')
+        for (const line of lines) {
+          const formatted = formatMarkdownLine(line)
+          if (formatted !== null) term!.writeln(formatted)
+        }
+      }
     } else if (data.message) {
       term!.writeln(`  \x1b[97m${data.message}\x1b[0m`)
     } else {
@@ -1078,6 +1189,13 @@ html, body {
   font-weight: 600;
   color: #fb923c;
   font-family: 'Cascadia Code', 'Fira Code', monospace;
+}
+
+.terminal-hint {
+  font-size: 10px;
+  color: #888;
+  font-family: 'Cascadia Code', 'Fira Code', monospace;
+  opacity: 0.7;
 }
 
 .terminal-controls {
