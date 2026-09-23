@@ -1,5 +1,9 @@
 # Spirit Agent 架构设计 V2 — 完整技术方案
 
+> ⚠️ **本文是实施前的设计稿**。系统已全量落地并经历多轮生产修复，
+> **现状架构（as-built）请以 [`12-system-architecture-asbuilt.md`](./12-system-architecture-asbuilt.md) 为准**；
+> 两文冲突时以 as-built 文档为准。本文保留作为分层设计参考。
+
 > 基于 Hermes 架构参考，设计 Spirit Agent V2 的完整技术架构，涵盖桌宠、语音、自动化任务、钩子系统等核心模块。
 
 ---

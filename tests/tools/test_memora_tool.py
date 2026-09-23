@@ -82,7 +82,7 @@ class TestToolHandlers:
         with patch("spirit.tools.memora_tool._run_async") as mock_run:
             mock_run.return_value = json.dumps({
                 "error": "知识库服务不可用",
-                "hint": "请确认 Memora 服务正在运行 (默认端口 8080)",
+                "hint": "请确认 Memora 服务正在运行 (默认端口 8000)",
             }, ensure_ascii=False)
 
             result = _knowledge_search_impl("测试查询")

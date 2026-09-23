@@ -7,7 +7,7 @@ Memora 是一个自托管的个人 AI 知识库系统，提供：
 - AI 问答（LLM 驱动的知识整理）
 - 知识图谱可视化
 
-依赖：Memora 服务运行在 http://127.0.0.1:8080
+依赖：Memora 服务运行在 http://127.0.0.1:8000
 
 Usage:
     client = MemoraClient()
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 from spirit.config import get_config_value
 
 # 默认 Memora API 地址（来自集中式配置）
-DEFAULT_MEMORA_BASE = os.getenv("MEMORA_API_BASE", get_config_value("memora.base_url", "http://127.0.0.1:8080"))
+DEFAULT_MEMORA_BASE = os.getenv("MEMORA_API_BASE", get_config_value("memora.base_url", "http://127.0.0.1:8000"))
 
 
 @dataclass
@@ -77,7 +77,7 @@ class MemoraClient:
         """初始化客户端。
 
         Args:
-            base_url: Memora API 地址，默认 http://127.0.0.1:8080
+            base_url: Memora API 地址，默认 http://127.0.0.1:8000
         """
         self.base_url = (base_url or DEFAULT_MEMORA_BASE).rstrip("/")
         self.api_prefix = f"{self.base_url}/api/v1"

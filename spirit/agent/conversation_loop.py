@@ -40,6 +40,7 @@ from spirit.agent.tool_executor import (
 from spirit.agent.context_compressor import estimate_messages_tokens
 from spirit.agent.prompt_caching import apply_cache_control, should_use_prompt_caching
 from spirit.agent.text_tool_parser import parse_text_tool_calls
+from spirit.config import get_config_value
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,18 @@ logger = logging.getLogger(__name__)
 _STREAM_OPENER_RE = re.compile(
     r'<(?:think|thinking|reasoning|tool_call|invoke)\b', re.IGNORECASE,
 )
+
+# 各 provider 默认输出上限（llm.max_tokens 配置为 0 时生效）。
+# 思考模型（MiniMax-M3 等）的推理过程计入输出配额；不显式下发 max_tokens 时
+# 服务端默认上限偏小，长推理会把可见文本与工具调用截断（finish_reason=length），
+# 表现为“宣布步骤后就中断”。MiniMax-M3 输出上限 131072，32768 留足余量。
+_DEFAULT_MAX_TOKENS_BY_PROVIDER = {
+    "minimax": 32768,
+}
+_DEFAULT_MAX_TOKENS = 16384
+
+# 单轮内截断自动续写的最大次数（防止模型反复截断导致无限循环）
+_MAX_TRUNCATION_CONTINUATIONS = 2
 
 
 # =========================================================================
@@ -108,6 +121,9 @@ def run_conversation(
     tools = agent.get_tool_definitions()
     logger.info("工具定义已加载: %d 个工具", len(tools))
 
+    # ── 钩子：对话开始 ─────────────────────────────────
+    _emit_hook(agent, "before_conversation", user_message=user_message, session_id=agent.session_id)
+
     # ── Prompt caching 初始化 ──────────────────────────────────
     # 检测当前 provider/model 是否支持 Anthropic 风格的 cache_control
     use_cache, native_layout = should_use_prompt_caching(
@@ -139,6 +155,9 @@ def run_conversation(
     
     # 本轮工具调用列表（用于返回给 CLI 显示）
     tool_calls_in_turn = []
+
+    # 截断自动续写计数（finish_reason=length 时注入续写提示再推一轮）
+    truncation_continuations = 0
 
     # ── 主循环 ──────────────────────────────────────────────────
 
@@ -176,6 +195,12 @@ def run_conversation(
                     compression_attempts, approx_tokens,
                 )
                 agent._messages = compressor.compress(agent.messages, approx_tokens)
+                _emit_hook(
+                    agent, "on_context_compress",
+                    before_tokens=approx_tokens,
+                    after_tokens=estimate_messages_tokens(agent._messages),
+                    trigger="preemptive",
+                )
                 budget.refund()  # 压缩不消耗迭代
                 continue
 
@@ -196,10 +221,21 @@ def run_conversation(
 
         while retry_count < max_retries:
             try:
+                _emit_hook(
+                    agent, "before_llm_call",
+                    messages=api_messages, tools=tools, retry_count=retry_count,
+                )
+                _llm_started = time.monotonic()
                 response = _call_llm(agent, api_messages, tools, stream_callback)
+                _emit_hook(
+                    agent, "after_llm_call",
+                    response=response,
+                    duration_ms=(time.monotonic() - _llm_started) * 1000.0,
+                )
                 break  # 成功
             except Exception as exc:
                 retry_count += 1
+                _emit_hook(agent, "on_llm_error", error=exc, retry_count=retry_count)
                 classified = classify_api_error(
                     exc,
                     provider=agent.provider,
@@ -224,6 +260,12 @@ def run_conversation(
                 if plan.should_compress and compressor:
                     approx_tokens = estimate_messages_tokens(agent.messages)
                     agent._messages = compressor.compress(agent.messages, approx_tokens)
+                    _emit_hook(
+                        agent, "on_context_compress",
+                        before_tokens=approx_tokens,
+                        after_tokens=estimate_messages_tokens(agent._messages),
+                        trigger="error_recovery",
+                    )
                     api_messages = prepare_api_messages(agent.messages)
                     budget.refund()
                     break  # 跳出重试，回到主循环
@@ -257,6 +299,16 @@ def run_conversation(
                     "completion_tokens": response.usage.completion_tokens,
                     "total_tokens": response.usage.total_tokens,
                 })
+            # ── MoA：把 advisor fan-out 用量折进本轮记账（Phase 4.1）──────
+            # 参考模型跑在独立 slot 上，其 token 不在聚合器响应里；不折叠则
+            # advisor 花费（常是 MoA 轮的大头）对用量追踪完全不可见。仅折叠进
+            # 会话用量追踪器，**不**折叠进压缩器——advisor 是旁路调用，其 token
+            # 不进入对话上下文，不应膨胀压缩器对对话规模的估计。
+            _moa_client = agent.client
+            if hasattr(_moa_client, "consume_reference_usage"):
+                _ref_usage, _ = _moa_client.consume_reference_usage()
+                if _ref_usage and _ref_usage.get("total_tokens"):
+                    tracker.update(_ref_usage)
         except Exception as e:
             logger.debug("用量追踪失败 (非致命): %s", e)
 
@@ -278,6 +330,13 @@ def run_conversation(
                 logger.info(
                     "文本工具调用解析: 从响应文本中提取 %d 个工具调用",
                     len(tool_calls),
+                )
+            elif getattr(response, "_stream_gate_closed", False):
+                # 门控曾检测到 think/工具标签开头而暂扣推送，但解析不出
+                # 任何工具调用 — 记录被暂扣的原始内容，用于定位新格式/畸形输出
+                logger.warning(
+                    "门控暂扣内容未解析出工具调用 (content_len=%d)，原始内容前 800 字符: %r",
+                    len(message.content or ""), (message.content or "")[:800],
                 )
 
         # 有工具调用？
@@ -335,20 +394,76 @@ def run_conversation(
             continue
 
         else:
-            # 文本回复，结束循环
+            # 文本回复 — 先区分“模型说完了”与“输出被截断”
             content = message.content or ""
+            finish = getattr(choice, "finish_reason", "stop") or "stop"
+            logger.info(
+                "模型回复结束: finish_reason=%s content_len=%d gate_closed=%s",
+                finish, len(content), getattr(response, "_stream_gate_closed", False),
+            )
+
+            # ── 截断自愈 ─────────────────────────────────────
+            # 输出撞 max_tokens 上限（思考模型常见：推理消耗配额后可见文本与
+            # 工具调用被截断），不得当作最终回答结束轮次：保存干净文本、
+            # 注入续写提示后再推一轮，让模型从断点继续发出完整工具调用。
+            if (
+                finish == "length"
+                and truncation_continuations < _MAX_TRUNCATION_CONTINUATIONS
+                and budget.remaining > 0
+            ):
+                truncation_continuations += 1
+                logger.warning(
+                    "输出被截断 (finish_reason=length)，自动续写第 %d 轮",
+                    truncation_continuations,
+                )
+                agent.add_message("assistant", _clean_for_display(content) or content)
+                agent.add_message(
+                    "user",
+                    "[系统提示] 你上一轮输出因长度上限被截断，其中的工具调用未执行。"
+                    "请直接从中断处继续任务：重新发出完整的工具调用，"
+                    "不要重复已写过的说明文字。",
+                )
+                continue
+
             agent.add_message("assistant", content)
 
+            # ── 后台进程通知回灌（Phase 4.7）──────────────────
+            # 模型给出了最终文本回答，但返回前先检查是否有后台进程/
+            # 异步委托完成事件待处理。有则注入为 user 消息并再推一轮，让
+            # Agent 据此决定下一步（例如服务已就绪、后台构建完成）。
+            if budget.remaining > 0 and _inject_process_notifications(agent) > 0:
+                continue
+
             # 流式门控回补：若本轮文本因检测到 think/工具标签而被门控暂扣，
-            # 现在统一清理后一次性推送（最终回答）
+            # 现在统一清理后一次性推送（最终回答）。
+            # 只推暂扣的后缀：实时已推送的前缀不得重发，否则终端出现重复文本。
             if stream_callback and getattr(response, "_stream_gate_closed", False):
                 cleaned = _clean_for_display(content)
+                pushed = getattr(response, "_stream_pushed_text", "")
+                if pushed and cleaned.startswith(pushed):
+                    cleaned = cleaned[len(pushed):]
                 if cleaned:
                     try:
                         stream_callback(cleaned)
                     except Exception:
                         logger.debug("流式回补推送失败", exc_info=True)
 
+            # ── MoA：轮次边界刷写完整追踪（opt-in，Phase 4.1）──────────
+            # create() 在缓存 MISS 时暂存 pending trace；此处把实时 session_id 与
+            # 解析出的聚合器 acting 文本（content）拼入并刷到追踪文件。流式路径
+            # 靠 fallback 提供输出，非流式已内联捕获。追踪关闭时是廉价 no-op。
+            _moa_client = agent.client
+            if hasattr(_moa_client, "consume_and_save_trace"):
+                _moa_client.consume_and_save_trace(
+                    session_id=agent.session_id,
+                    aggregator_output_fallback=content,
+                )
+
+            _emit_hook(
+                agent, "after_conversation",
+                response=content, iterations=api_call_count,
+                tool_calls=tool_calls_in_turn,
+            )
             return ConversationResult(
                 response=content,
                 messages=agent.messages,
@@ -358,6 +473,11 @@ def run_conversation(
             )
 
     # 达到最大迭代
+    _emit_hook(
+        agent, "after_conversation",
+        response="[max_iterations]", iterations=api_call_count,
+        tool_calls=tool_calls_in_turn,
+    )
     return ConversationResult(
         response=f"[达到最大迭代次数 {agent.max_iterations}]",
         messages=agent.messages,
@@ -370,6 +490,43 @@ def run_conversation(
 # LLM 调用
 # =========================================================================
 
+def _inject_process_notifications(agent) -> int:
+    """把后台进程/异步委托的完成通知回灌进对话（Phase 4.7）。
+
+    返回注入的通知条数（0 表示无待处理事件，调用方据此决定是否结束循环）。
+    通知按当前会话键路由（``get_current_session_key``），单轮上限读
+    ``process.max_notifications_per_turn``，超出的事件重新入队留待下一轮。
+    任何异常都吞掉并返回 0 —— 通知回灌是增强，绝不能让它打断主对话。
+    """
+    try:
+        from spirit.process import process_registry
+        from spirit.tools.approval import get_current_session_key
+        from spirit.config import get_config_value
+
+        session_key = get_current_session_key(default="") or ""
+        events = process_registry.drain_notifications(session_key=session_key)
+        if not events:
+            return 0
+
+        limit = max(1, int(get_config_value("process.max_notifications_per_turn", 5)))
+        injected = 0
+        for _evt, text in events[:limit]:
+            if not text:
+                continue
+            agent.add_message("user", text)
+            injected += 1
+        # 超出单轮上限的事件重新入队，留待下一轮（避免静默丢弃）
+        for evt, _text in events[limit:]:
+            try:
+                process_registry.completion_queue.put(evt)
+            except Exception:
+                pass
+        return injected
+    except Exception:
+        logger.debug("后台进程通知回灌失败（非致命）", exc_info=True)
+        return 0
+
+
 def _clean_for_display(text: str) -> str:
     """清理 think/工具调用标签后的可见文本（延迟导入避免循环依赖）。"""
     try:
@@ -377,6 +534,17 @@ def _clean_for_display(text: str) -> str:
         return _clean_think_tags(text)
     except Exception:
         return text
+
+
+def _emit_hook(agent, event: str, **kwargs) -> None:
+    """触发钩子事件（钩子系统未启用时静默跳过）。
+
+    HookManager.emit 内部已对每个 handler 做异常隔离，
+    钩子失败不会影响主循环；这里只兼容 hook_manager 不存在的情况。
+    """
+    hook_manager = getattr(agent, "hook_manager", None)
+    if hook_manager is not None:
+        hook_manager.emit(event, **kwargs)
 
 
 def _call_llm(
@@ -400,6 +568,15 @@ def _call_llm(
         "messages": api_messages,
     }
 
+    # 显式下发输出上限：思考模型的推理计入输出配额，依赖服务端默认上限会
+    # 导致长推理截断可见文本与工具调用（见 _DEFAULT_MAX_TOKENS_BY_PROVIDER 注释）
+    max_tokens = getattr(agent, "max_tokens", 0) or get_config_value("llm.max_tokens", 0) or 0
+    if max_tokens <= 0:
+        max_tokens = _DEFAULT_MAX_TOKENS_BY_PROVIDER.get(
+            getattr(agent, "provider", ""), _DEFAULT_MAX_TOKENS,
+        )
+    request_kwargs["max_tokens"] = max_tokens
+
     if tools:
         request_kwargs["tools"] = tools
 
@@ -416,6 +593,7 @@ def _call_llm(
     stream = agent.client.chat.completions.create(**request_kwargs)
 
     content_parts: List[str] = []
+    pushed_parts: List[str] = []
     tc_buffers: Dict[int, Dict[str, str]] = {}
     finish_reason = None
     usage = None
@@ -443,6 +621,7 @@ def _call_llm(
                 else:
                     try:
                         stream_callback(piece)
+                        pushed_parts.append(piece)
                     except Exception:
                         logger.debug("流式增量推送失败", exc_info=True)
 
@@ -480,6 +659,7 @@ def _call_llm(
     )
     response = SimpleNamespace(choices=[choice_obj], usage=usage)
     response._stream_gate_closed = not gate_open
+    response._stream_pushed_text = "".join(pushed_parts)
     return response
 
 

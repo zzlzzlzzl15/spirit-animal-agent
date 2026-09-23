@@ -1,6 +1,6 @@
 # Spirit Agent — 桌宠形态的本地 AI Agent
 
-> v0.0.2 · Electron 桌面宠物 + Python Agent 后端 + 交互式 CLI 终端
+> v0.1.0 · Electron 桌面宠物 + Python Agent 后端 + 交互式 CLI 终端
 > 对话循环架构对标 [Hermes Agent](https://github.com/zzlzzlzzl15/spirit-animal-agent/tree/master) v0.18.2：单主循环 + 迭代预算 + 分支化响应处理。
 
 Spirit Agent 是一只住在你桌面上的小狐狸：它既是**桌面宠物**（会动、会说话、会感知 Agent 工作状态），也是一个**完整的本地 AI Agent**（工具调用、多轮循环、流式输出、知识库、语音）。所有能力通过一个 WebSocket 桥接层对多表面（桌宠窗口 / CLI 终端 / VSCode 扩展）统一开放。
@@ -65,6 +65,8 @@ Spirit Agent 是一只住在你桌面上的小狐狸：它既是**桌面宠物**
 
 ## 二、架构总览
 
+> 📘 完整现状架构（模块职责 / WS 协议 / 可靠性机制 / 文档地图）见 [`docs/12-system-architecture-asbuilt.md`](./docs/12-system-architecture-asbuilt.md)。
+
 ```
 ┌─────────────────────────── Electron 主进程 ───────────────────────────┐
 │  桌宠窗口(透明置顶)   CLI 终端窗口(xterm)   状态弹窗   气泡窗口(非焦点)   │
@@ -90,13 +92,15 @@ Spirit Agent 是一只住在你桌面上的小狐狸：它既是**桌面宠物**
 ```
 spirit-agent-main/
 ├── spirit/
-│   ├── agent/            # 对话循环 / 工具执行 / 上下文压缩 / LSP / 文本工具解析
-│   ├── tools/            # 90+ 工具实现
-│   ├── desktop/          # PetEngine / ws_server / pet_store / 语音引擎
-│   ├── cli/              # 增强版 CLI 入口
+│   ├── agent/            # 对话循环 / 工具执行 / 上下文压缩 / 截断自愈 / 流式门控
+│   ├── tools/            # 55 个工具定义（38 个实现文件，Hermes 全量映射）
+│   ├── desktop/          # ws_server(32 命令) / PetEngine / pet_store / 语音引擎 / _launcher
+│   ├── lsp/ goals/ moa/  # LSP 代码智能 / Ralph 目标循环 / MoA 聚合
+│   ├── storage/ sessions/ hooks/ process/ gateway/ task/  # 会话库 / 钩子 / 网关 / 任务检查
+│   ├── cli/ tui/ api/    # 终端与 HTTP 入口
 │   └── config.py         # 配置加载 (~/.spirit/config.yaml)
 ├── desktop-app/
-│   ├── electron/         # 主进程：窗口 / 托盘 / IPC / 后端 spawn
+│   ├── electron/         # 主进程：窗口 / 托盘 / IPC / 看门狗自愈 / 后端 spawn
 │   ├── src/              # Vue3：桌宠 / CLI 终端 / 状态弹窗 / 气泡 / 面板
 │   └── public/assets/pets/  # 内置宠物精灵图
 ├── e2e_tool_loop_test.py # 后端循环层端到端回归
@@ -132,7 +136,18 @@ python e2e_ws_event_test.py    # WS 事件层：tool_start/complete + stream_del
 
 ## 五、版本记录
 
-### v0.0.2（当前）
+### v0.1.0（当前）
+
+- **Computer Use**：新增桌面应用控制能力（截图 → 视觉路由 → 点击/输入），带权限确认与安全护栏（`spirit/computer_use/` + `computer_use_tool`）。
+- **Ralph Loop 目标系统**：长程目标管理（goal_state / judge / loop / manager），支持目标分解与自评判收敛（`spirit/goals/`）。
+- **MoA 混合智能体**：移植 Hermes `moa_loop`，多智能体 mixture-of-agents 协作 + 追踪（`spirit/moa/`）。
+- **Skills Hub**：技能发现 / 分发 / 打包 / 预处理 / 溯源统一入口（`spirit/skills_hub/`）。
+- **进程管理**：后台进程注册 / 会话 / 通知（`spirit/process/` + `process_tool`）。
+- **TUI 终端**：独立 TUI 服务 + 项目树 + slash 命令 + 渲染（`spirit/tui/`）。
+- 版本号全仓对齐 0.1.0（package.json / ws_server / `__init__` / pyproject / vscode-extension）。
+- 测试套件大幅扩充（computer_use / goals / moa / process / skills_hub / tui / tools / hooks 等）；新增 as-built 系统架构文档。
+
+### v0.0.2
 
 - 对话循环重构为 Hermes 同款单主循环（分支 A/B/C + 迭代预算 + 错误分类重试）。
 - CLI 终端：工具调用内联标注、Markdown→ANSI 逐行渲染、流式门控回补、chat_complete 兜底渲染。
@@ -140,6 +155,8 @@ python e2e_ws_event_test.py    # WS 事件层：tool_start/complete + stream_del
 - 气泡窗口非焦点化，不再打断聊天输入；休眠恢复强制重绘修复"狐狸消失"。
 - 宠物链路端到端：引导安装内置灵狐、切换广播同步、缩放单一真相源。
 - 90+ Hermes 工具全量迁移；Memora 知识库集成；prompt caching 与上下文压缩。
+- 长任务可靠性：chat 超时 1800s + 入口清中断标志；思考模型输出截断自动续写（finish_reason=length）；门控回补只推后缀消除重复文本。
+- 桌宠窗口分层自愈：15s 看门狗（销毁重建 / 隐藏恢复 / 离屏钳回 / rAF 心跳检测合成层停绘）+ GPU/渲染进程崩溃自动重绘；剪贴板 Ctrl+V/C 修复。
 
 ### v0.0.1
 

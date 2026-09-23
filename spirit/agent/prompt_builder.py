@@ -80,6 +80,28 @@ MEMORY_GUIDANCE = (
 )
 
 # =========================================================================
+# Memora 知识库指导（系统默认长期记忆工具）
+# =========================================================================
+
+MEMORA_GUIDANCE = (
+    "## Memora 知识库（本系统默认长期记忆工具）\n"
+    "本系统集成 Memora 作为默认的持久化知识库，承载长期记忆与文档沉淀，"
+    "通过 knowledge 工具集访问：\n"
+    "- knowledge_search: 语义搜索知识库文档\n"
+    "- knowledge_query: 搜索知识库并获取 AI 整理后的答案\n"
+    "- knowledge_save: 保存内容（结论、文档、经验）到知识库\n"
+    "- knowledge_list: 列出知识库中的文档\n\n"
+    "使用规则：\n"
+    "1. 当用户询问之前保存过的内容、项目背景或历史结论时，"
+    "优先用 knowledge_search/knowledge_query 检索知识库再回答。\n"
+    "2. 任务产出的重要结论、可复用经验、用户明确要求记住的文档，"
+    "用 knowledge_save 沉淀到知识库。\n"
+    "3. 简短的用户偏好仍用 memory 工具；大段结构化内容才存入 Memora。\n"
+    "4. 如果工具返回 Memora 不可用或错误，直接告知用户知识库暂不可用，"
+    "不要反复重试。"
+)
+
+# =========================================================================
 # 环境提示构建
 # =========================================================================
 
@@ -227,6 +249,7 @@ def build_system_prompt(
     include_environment: bool = True,
     include_tools: bool = True,
     include_memory: bool = True,
+    include_knowledge: bool = True,
     extra_context: Optional[str] = None,
 ) -> str:
     """组装完整系统提示词。
@@ -243,6 +266,7 @@ def build_system_prompt(
         include_environment: 是否包含环境提示
         include_tools: 是否包含工具指导
         include_memory: 是否包含记忆
+        include_knowledge: 是否包含 Memora 知识库指导
         extra_context: 额外上下文
 
     Returns:
@@ -268,6 +292,10 @@ def build_system_prompt(
     # 记忆指导
     if include_memory:
         stable_parts.append(MEMORY_GUIDANCE)
+
+    # Memora 知识库指导（系统默认长期记忆工具）
+    if include_knowledge:
+        stable_parts.append(MEMORA_GUIDANCE)
 
     # 环境提示
     if include_environment:
@@ -393,6 +421,7 @@ __all__ = [
     "TOOL_USE_GUIDANCE",
     "PARALLEL_TOOL_GUIDANCE",
     "MEMORY_GUIDANCE",
+    "MEMORA_GUIDANCE",
     "build_environment_hints",
     "load_context_files",
     "scan_context_content",

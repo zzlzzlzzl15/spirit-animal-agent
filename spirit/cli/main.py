@@ -66,6 +66,28 @@ def chat(model, api_key, base_url):
     # 创建 Agent
     agent = SpiritAgent(config)
 
+    # 注册交互式危险命令审批回调 + 标记交互式会话
+    from spirit.tools.approval import set_approval_callback, set_interactive_context
+
+    def _approval_callback(command: str, description: str, pattern_key: str) -> str:
+        console.print(Panel.fit(
+            f"[red]{command}[/red]\n\n原因: [cyan]{description}[/cyan]",
+            title="[bold yellow]⚠ 危险命令需审批[/bold yellow]",
+            border_style="yellow",
+        ))
+        try:
+            ans = console.input("允许执行? y=本次 / a=总是 / n=拒绝（默认 n）: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("a", "always"):
+            return "always"
+        if ans in ("y", "yes", "session"):
+            return "session"
+        return "deny"
+
+    set_approval_callback(_approval_callback)
+    set_interactive_context(True)
+
     # 工具回调
     def on_tool_start(name, args):
         console.print(f"  [dim]🔧 {name}({args})[/dim]")

@@ -90,6 +90,17 @@ def parse_tool_arguments(raw_arguments: Any) -> Tuple[dict, Optional[str]]:
 # 单个工具执行
 # =========================================================================
 
+def _emit_hook(agent: Any, event: str, **kwargs) -> None:
+    """触发钩子事件（钩子系统未启用时静默跳过）。
+
+    HookManager.emit 内部已对每个 handler 做异常隔离；
+    本地不能 import conversation_loop._emit_hook（会循环依赖）。
+    """
+    hook_manager = getattr(agent, "hook_manager", None)
+    if hook_manager is not None:
+        hook_manager.emit(event, **kwargs)
+
+
 def execute_single_tool(
     agent: Any,
     *,
@@ -129,11 +140,13 @@ def execute_single_tool(
         }, ensure_ascii=False), tool_name, None
 
     # 执行（on_tool_start/on_complete 回调统一在 invoke_tool 内触发，避免重复推送）
+    _emit_hook(agent, "before_tool_execute", tool_name=tool_name, tool_args=args)
     start_time = time.time()
     try:
         result = agent.invoke_tool(tool_name, args)
     except Exception as exc:
         logger.error("工具 %s 执行异常: %s", tool_name, exc, exc_info=True)
+        _emit_hook(agent, "on_tool_error", tool_name=tool_name, error=exc, tool_args=args)
         result = json.dumps({
             "error": f"工具执行异常: {type(exc).__name__}: {str(exc)[:500]}",
             "status": "error",
@@ -141,6 +154,12 @@ def execute_single_tool(
 
     duration_ms = int((time.time() - start_time) * 1000)
     logger.info("工具 %s 执行完成 (%d ms)", tool_name, duration_ms)
+    # args/result 别名供 memora_auto_save 钩子消费（其签名为 tool_name/args/result）
+    _emit_hook(
+        agent, "after_tool_execute",
+        tool_name=tool_name, tool_args=args, tool_result=result,
+        duration_ms=duration_ms, args=args, result=result,
+    )
 
     # 护栏：调用后检查
     guardrail_decision = None
@@ -274,6 +293,7 @@ def execute_tool_calls_concurrent(
 
     # 线程池执行
     results: Dict[int, str] = {}
+    start_times: Dict[int, float] = {}
     deadline = time.time() + timeout if timeout and timeout > 0 else None
 
     with concurrent.futures.ThreadPoolExecutor(
@@ -282,6 +302,8 @@ def execute_tool_calls_concurrent(
     ) as executor:
         future_to_idx = {}
         for idx, (tc, name, args) in enumerate(to_execute):
+            _emit_hook(agent, "before_tool_execute", tool_name=name, tool_args=args)
+            start_times[idx] = time.time()
             future = executor.submit(_run_tool_safe, agent, name, args)
             future_to_idx[future] = idx
 
@@ -334,6 +356,15 @@ def execute_tool_calls_concurrent(
             "error": "工具执行超时",
             "status": "timeout",
         }, ensure_ascii=False))
+
+        # 钩子：并发路径的执行后事件（异常已被 _run_tool_safe 封装进 result，
+        # 不单独触发 on_tool_error；args/result 别名供 memora_auto_save 消费）
+        duration_ms = int((time.time() - start_times.get(idx, time.time())) * 1000)
+        _emit_hook(
+            agent, "after_tool_execute",
+            tool_name=name, tool_args=args, tool_result=result,
+            duration_ms=duration_ms, args=args, result=result,
+        )
 
         # 护栏后检
         guardrail_decision = None

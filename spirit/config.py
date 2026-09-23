@@ -84,6 +84,87 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,                      # 是否启用 prompt caching（减少 ~75% 输入 token 成本）
         "ttl": "5m",                          # 缓存有效期: '5m' 或 '1h'（Anthropic 支持两种）
     },
+    # ── 目标系统（Ralph Loop — 持久目标自主循环，Phase 4） ────
+    "goals": {
+        "enabled": True,                      # 是否启用持久目标系统（Ralph Loop）
+        "max_turns": 20,                      # 单个目标自主续传的最大轮数预算（超出后暂停）
+        "max_consecutive_parse_failures": 3,  # judge 连续 N 次响应解析失败后自动暂停（弱模型兜底）
+        "judge": {
+            "model": "",                      # judge 辅助模型，留空复用主 Agent 模型
+            "max_tokens": 4096,               # judge 调用最大输出 token 数
+            "temperature": 0,                 # judge 温度（0 = 最确定性裁决）
+            "timeout": 30.0,                  # judge 单次调用超时（秒）
+        },
+    },
+    # ── 后台进程注册表（terminal background=true，Phase 4.7） ──
+    "process": {
+        "max_output_chars": 200_000,          # 单个后台进程的滚动输出缓冲上限（字符）
+        "finished_ttl_seconds": 1800,         # 已退出进程的保留时长（30 分钟），超时被 prune
+        "max_processes": 64,                  # 同时追踪的进程上限（超出按 started_at 淘汰最旧已完成项）
+        "max_active_age_seconds": 86400,      # 运行超过该时长视为陈旧，不再阻塞会话重置/空闲判定
+        "wait_default_seconds": 180,          # process(action="wait") 的默认与最大阻塞秒数（超出被钳制）
+        "daemon_term_grace_seconds": 2.0,     # SIGTERM 到升级 SIGKILL 的宽限窗口（0 = 关闭升级）
+        "checkpoint_enabled": True,           # 是否写 processes.json 崩溃恢复检查点
+        "notify_on_complete_default": True,   # terminal(background=true) 默认是否在退出时通知 Agent
+        "watch_min_interval_seconds": 15,     # 每会话 watch 匹配通知的最小间隔（限流）
+        "watch_strike_limit": 3,              # 连续 N 个限流窗口后永久关闭该会话的 watch
+        "watch_global_max_per_window": 15,    # 全局熔断：单窗口内最多放行的 watch 通知数
+        "watch_global_window_seconds": 10,    # 全局熔断的滑动窗口长度（秒）
+        "watch_global_cooldown_seconds": 30,  # 全局熔断触发后的冷却时长（秒）
+        "max_notifications_per_turn": 5,      # 单轮回灌对话的最大通知条数（防刷屏）
+    },
+    # ── Mixture of Agents（MoA — 多模型参考+聚合，Phase 4.1） ──
+    # provider=="moa" 时，agent.client 换成 MoAClient facade：并行跑参考模型
+    # （advisory）→ 注入 guidance → 调聚合器（acting model）。预设（presets）是命名
+    # 的模型组合；读时容错降级到默认，写时用 validate_moa_payload 严格校验。
+    "moa": {
+        "default_preset": "default",          # 无显式预设名时使用的预设
+        "active_preset": "",                  # /moa use <name> 设定的活动预设（空=default）
+        "save_traces": False,                 # 是否把完整 MoA 轮次追踪写入 JSONL（opt-in）
+        "trace_dir": None,                    # 追踪目录覆盖（默认 <spirit_home>/moa-traces）
+        "presets": {
+            "default": {
+                "enabled": True,              # 关闭后跳过参考 fan-out，聚合器独自行动
+                "reference_models": [          # 参考（advisory）模型 slot 列表
+                    {"provider": "openrouter", "model": "deepseek/deepseek-v3"},
+                    {"provider": "openai", "model": "gpt-4o"},
+                ],
+                "aggregator": {"provider": "anthropic", "model": "claude-3-5-sonnet"},
+                "reference_temperature": None,     # None = 不下发（用 provider 默认）
+                "aggregator_temperature": None,
+                "max_tokens": 4096,                # 兼容字段；MoA 运行时不封顶聚合器
+                "reference_max_tokens": None,      # 仅封顶 advisor 输出（None=不封顶）
+                "fanout": "per_iteration",         # per_iteration | user_turn
+            },
+        },
+    },
+    # ── 技能中心（Skills Hub — 发现/调用/市场，Phase 4.6） ──────
+    # 技能是 ~/.spirit/skills/<name>/SKILL.md（YAML frontmatter + 正文）。/<skill-name>
+    # 把正文注入对话；/<bundle-name> 一次载一组。市场安装走「隔离→扫描→安装」，离线
+    # 可测（hub.set_fetcher 注入获取器）。读时容错降级（load_skills_config 异常→空节）。
+    "skills": {
+        "template_vars": True,                # 是否替换 ${SPIRIT_SKILL_DIR}/${SPIRIT_SESSION_ID} 模板变量
+        "inline_shell": False,                # 是否展开技能正文里的 !`cmd` 内联 shell（安全成本，默认关）
+        "inline_shell_timeout": 10,           # 单条内联 shell 的超时（秒）
+        "disabled": [],                       # 全局禁用的技能名列表（offer 面隐藏，显式加载仍放行）
+        "platform_disabled": {},              # 按平台禁用：{"windows": ["name"], ...}（与全局禁用取并集）
+        "external_dirs": [],                  # 额外技能根目录（相对 SPIRIT_HOME 或绝对路径；本地优先于外部）
+    },
+    # ── Computer Use（桌面控制可测试抽象层，Phase 4.5） ──────────
+    # 对标 Hermes tools/computer_use/：backend 抽象 + 安全分级 + 审批门 + 派发 + 响应塑形。
+    # 真实驱动经 tool.set_backend_factory 注入；缺省 noop 后端安全降级（动作只记录、不触碰
+    # 真实桌面），故全套逻辑可离线单测。env 覆盖优先于本节（SPIRIT_COMPUTER_USE_BACKEND /
+    # SPIRIT_CUA_DRIVER_CMD）；本节值是模块默认值的单一来源。
+    "computer_use": {
+        "enabled": True,                      # 是否暴露 computer_use 工具（check_fn 参考；关闭则工具面隐藏）
+        "backend": "noop",                    # 默认后端名（noop=安全降级；真实驱动经工厂注入后改名）
+        "driver_cmd": "cua-driver",           # 真实桌面驱动二进制名 / 路径（就绪度探测用）
+        "default_capture_mode": "som",        # capture 默认模式：som（视觉标记）| vision（纯截图）| ax（无障碍树）
+        "max_elements": 100,                  # 单次捕获默认返回的可交互元素上限（超出截断并提示）
+        "max_elements_ceiling": 1000,         # max_elements 的硬上限（调用方传更大值也被钳制到此）
+        "wait_max_seconds": 30,               # wait 动作单次阻塞秒数上限（超出被钳制）
+        "approval_required": True,            # 改变状态的动作是否经审批门（网关外层已审批时可关）
+    },
     # ── 工具循环护栏（防止工具调用死循环） ────────────────────
     "tool_loop_guardrails": {
         "warnings_enabled": True,             # 是否启用循环检测警告（向 LLM 发送提醒）
@@ -185,7 +266,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     # ── Memora 知识库 ─────────────────────────────────────────
     "memora": {
-        "base_url": "http://127.0.0.1:8080", # Memora 后端服务地址
+        "base_url": "http://127.0.0.1:8000", # Memora 后端服务地址（compose 映射 8000->容器 8080）
         "min_file_size": 100,                 # 自动保存最小文件大小（bytes），过小不保存
         "max_file_size": 5_242_880,           # 自动保存最大文件大小（5MB），过大不自动保存
     },

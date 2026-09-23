@@ -85,6 +85,16 @@ let pendingDy = 0
 // 随机气泡定时器
 let bubbleTimer: ReturnType<typeof setInterval> | null = null
 
+// ── 合成层停绘自愈心跳 ────────────────────────────────────
+// Windows 透明窗口的合成层可能停止绘制（渲染进程活着但狐狸不显示）。
+// rAF 帧数在合成停止时不再增长；主进程对比心跳帧数判定停绘并强制重建合成层。
+let rafFrames = 0
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+function rafTick() {
+  rafFrames++
+  requestAnimationFrame(rafTick)
+}
+
 // 趣味对话列表
 const IDLE_BUBBLES = [
   '今天也要加油哦~ ✨',
@@ -122,6 +132,14 @@ onMounted(async () => {
     }
   }, 30000)
 
+  // 仅桌宠主视图：启动合成心跳（气泡/状态/CLI 窗口不需要）
+  if (!isStatusPopup.value && !isSpeechBubble.value && !isCLITerminal.value) {
+    requestAnimationFrame(rafTick)
+    heartbeatTimer = setInterval(() => {
+      window.electronAPI?.petHeartbeat?.(rafFrames)
+    }, 10000)
+  }
+
   // 托盘“切换宠物”→ 转发给服务端（服务端持久化并广播 pet_switch，
   // 所有窗口经 onEvent 同步精灵图）
   if (window.electronAPI?.onSwitchPet) {
@@ -134,6 +152,7 @@ onMounted(async () => {
 onUnmounted(() => {
   disconnect()
   if (bubbleTimer) clearInterval(bubbleTimer)
+  if (heartbeatTimer) clearInterval(heartbeatTimer)
 })
 
 // ── 交互事件 ──────────────────────────────────────────────

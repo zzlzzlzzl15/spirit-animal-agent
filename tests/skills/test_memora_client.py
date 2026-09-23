@@ -69,7 +69,7 @@ class TestDataClasses:
 class TestClientInit:
     def test_default_base_url(self):
         c = MemoraClient()
-        assert "127.0.0.1:8080" in c.base_url
+        assert "127.0.0.1:8000" in c.base_url
 
     def test_custom_base_url(self):
         c = MemoraClient(base_url="http://custom:9090/")

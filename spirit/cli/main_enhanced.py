@@ -104,6 +104,32 @@ def _format_tool_calls_display(tool_calls: list) -> str:
     return "\n".join(lines)
 
 
+def _make_cli_approval_callback():
+    """构建 CLI 交互式危险命令审批回调。
+
+    签名: (command, description, pattern_key) -> "deny"/"session"/"always"。
+    在终端弹出安全审批面板，让用户选择本次放行 / 总是放行 / 拒绝。
+    """
+    def _callback(command: str, description: str, pattern_key: str) -> str:
+        console.print(Panel.fit(
+            f"[red]{command}[/red]\n\n原因: [cyan]{description}[/cyan]",
+            title="[bold yellow]⚠ 危险命令需审批[/bold yellow]",
+            border_style="yellow",
+        ))
+        try:
+            ans = console.input(
+                "允许执行? [bold]y[/bold]=本次 / [bold]a[/bold]=总是 / [bold]n[/bold]=拒绝（默认 n）: "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            ans = "n"
+        if ans in ("a", "always"):
+            return "always"
+        if ans in ("y", "yes", "session"):
+            return "session"
+        return "deny"
+    return _callback
+
+
 @click.group()
 @click.option("-v", "--verbose", is_flag=True, help="详细日志")
 @click.pass_context
@@ -140,6 +166,12 @@ def chat(model, api_key, base_url):
     # 创建 Agent
     agent = SpiritAgent(config)
 
+    # 注册交互式危险命令审批回调 + 标记交互式会话
+    # （terminal 工具执行危险命令前会征求用户意见，而非静默阻止）
+    from spirit.tools.approval import set_approval_callback, set_interactive_context
+    set_approval_callback(_make_cli_approval_callback())
+    set_interactive_context(True)
+
     # 欢迎信息
     console.print(Panel.fit(
         f"[bold green]Spirit Agent[/bold green] v0.1.0\n"
@@ -170,7 +202,12 @@ def chat(model, api_key, base_url):
 
             # 斜杠命令
             if user_input.startswith("/"):
-                if _handle_slash_command(user_input, agent):
+                # 动态技能 / 捆绑 slash 命令（/<skill-name> [指令]）解析为调用消息后
+                # 落到下面的对话路径；解析不到（含 /skill 等固定命令）走固定命令处理。
+                skill_message = _try_resolve_skill_slash(user_input)
+                if skill_message is not None:
+                    user_input = skill_message
+                elif _handle_slash_command(user_input, agent):
                     continue
                 else:
                     break
@@ -241,6 +278,11 @@ def _handle_slash_command(cmd: str, agent) -> bool:
             "  /status      显示状态\n"
             "  /tools       列出工具\n"
             "  /sessions    会话历史\n"
+            "  /goal        持久目标（Ralph Loop）: /goal <text> | status | show | pause | resume | clear | draft <obj> | wait <pid> | unwait\n"
+            "  /subgoal     子目标: /subgoal <text> | remove <n> | clear\n"
+            "  /moa         智囊团（Mixture of Agents）: /moa list | use <name> | off | <prompt>（一次性）\n"
+            "  /skill       技能中心: /skill list | reload | browse | install <id> | uninstall <name> | scan | bundles | info <name> | audit\n"
+            "  /<skill>     调用技能: /<skill-name> [指令] · 捆绑: /<bundle-name> [指令]\n"
             "  /quit        退出",
             title="帮助",
             border_style="blue",
@@ -288,10 +330,182 @@ def _handle_slash_command(cmd: str, agent) -> bool:
         except Exception as e:
             console.print(f"  [red]查询失败: {e}[/red]")
 
+    elif command == "/goal":
+        _handle_goal_slash(agent, args)
+
+    elif command == "/subgoal":
+        from spirit.goals import handle_subgoal_command
+        result = handle_subgoal_command(agent, args)
+        _render_goal_result(result)
+
+    elif command == "/moa":
+        _handle_moa_slash(agent, args)
+
+    elif command in ("/skill", "/skills"):
+        from spirit.skills_hub import handle_skill_command
+        result = handle_skill_command(agent, args)
+        _render_skill_result(result)
+
     else:
         console.print(f"[red]未知命令: {command}[/red] 输入 /help 查看帮助")
 
     return True
+
+
+def _render_goal_result(result: dict) -> None:
+    """把 handle_goal_command / handle_subgoal_command 的结果 dict 渲染到 Rich console。"""
+    msg = result.get("message", "")
+    style = "green" if result.get("ok") else "yellow"
+    if msg:
+        console.print(f"  [{style}]{msg}[/{style}]")
+    for line in result.get("lines", []):
+        if line:
+            console.print(f"  [dim]{line}[/dim]")
+
+
+def _render_skill_result(result: dict) -> None:
+    """把 handle_skill_command 的结果 dict 渲染到 Rich console。"""
+    msg = result.get("message", "")
+    style = "green" if result.get("ok") else "yellow"
+    if msg:
+        console.print(f"  [{style}]{msg}[/{style}]")
+    for line in result.get("lines", []):
+        if line:
+            console.print(f"  [dim]{line}[/dim]")
+
+
+def _try_resolve_skill_slash(user_input: str):
+    """把 ``/<skill-name>`` 或 ``/<bundle>`` [指令] 解析为技能调用消息（解析不到 None）。
+
+    仅拦截能解析为已安装技能 / 捆绑的命令；``/skill`` 等保留命令（不在技能命令面）
+    返回 None，交给固定命令处理。任何异常都降级为 None（绝不因技能系统拖垮 CLI）。
+    """
+    parts = user_input.split(maxsplit=1)
+    command = parts[0].lstrip("/").lower()
+    rest = parts[1] if len(parts) > 1 else ""
+    if not command:
+        return None
+    try:
+        from spirit.skills_hub import resolve_slash_skill_or_bundle
+
+        return resolve_slash_skill_or_bundle(command, rest)
+    except Exception:
+        return None
+
+
+def _handle_moa_slash(agent, args: str) -> None:
+    """处理 /moa：派发 + 渲染。一次性模式（/moa <prompt>）会阻塞跑一轮 MoA。
+
+    参考输出通过 ``_moa_reference_callback`` 实时渲染（每个 advisor 完成一块），
+    聚合器最终响应作为 Markdown 打印。list/use/off 为纯状态流转，不触网。
+    """
+    from spirit.moa import handle_moa_command
+
+    # 装一个参考展示钩子：MoA fan-out 每完成一个 advisor 就打印其输出块。
+    prev_cb = getattr(agent, "_moa_reference_callback", None)
+    agent._moa_reference_callback = _render_moa_reference_event
+    try:
+        result = handle_moa_command(agent, args)
+    finally:
+        agent._moa_reference_callback = prev_cb
+    _render_moa_result(result)
+
+
+def _render_moa_reference_event(event: str, **kwargs) -> None:
+    """把 MoAClient 发射的 moa.reference / moa.aggregating 事件渲染到 console。
+
+    事件 kwargs 契约（见 moa_loop.MoAChatCompletions._emit）：
+      moa.reference   → index, count, label, text
+      moa.aggregating → aggregator(label), ref_count
+    """
+    try:
+        if event == "moa.reference":
+            label = kwargs.get("label", "?")
+            idx = kwargs.get("index")
+            count = kwargs.get("count")
+            head = f"🎭 参考[{label}]"
+            if idx is not None and count:
+                head = f"🎭 参考 {idx}/{count}[{label}]"
+            console.print(f"  [magenta]{head}:[/magenta]")
+            snippet = (kwargs.get("text", "") or "").strip()
+            if len(snippet) > 1200:
+                snippet = snippet[:1200] + " …"
+            if snippet:
+                console.print(f"  [dim]{snippet}[/dim]")
+        elif event == "moa.aggregating":
+            agg = kwargs.get("aggregator", "?")
+            ref_count = kwargs.get("ref_count", 0)
+            console.print(f"  [cyan]🎭 聚合器[{agg}] 正在综合 {ref_count} 条参考并行动…[/cyan]")
+    except Exception:
+        pass
+
+
+def _render_moa_result(result: dict) -> None:
+    """把 handle_moa_command 的结果 dict 渲染到 Rich console。"""
+    msg = result.get("message", "")
+    style = "green" if result.get("ok") else "yellow"
+    if msg:
+        console.print(f"  [{style}]{msg}[/{style}]")
+    for line in result.get("lines", []):
+        if line:
+            console.print(f"  [dim]{line}[/dim]")
+    response = result.get("response")
+    if response:
+        console.print("\n[bold blue]🎭 MoA 聚合响应:[/bold blue]")
+        console.print(Markdown(_clean_think_tags(response)))
+
+
+def _handle_goal_slash(agent, args: str) -> None:
+    """处理 /goal：派发 + 渲染，必要时驱动 Ralph Loop（对齐 Hermes "kick the loop off"）。"""
+    from spirit.goals import handle_goal_command
+
+    result = handle_goal_command(agent, args)
+    _render_goal_result(result)
+
+    kick_off = result.get("kick_off")
+    if not kick_off or not result.get("ok"):
+        return
+    # 设完/恢复目标后立即驱动 Ralph Loop，免得用户再发一条消息。
+    _drive_goal_loop(agent, kick_off)
+
+
+def _drive_goal_loop(agent, first_input: str) -> None:
+    """在当前进程驱动 Ralph Loop，直到 done / paused / waiting / 预算耗尽。"""
+    from spirit.goals import run_goal_turn_loop
+
+    console.print("\n[dim italic] Spirit Agent 正在朝目标自主推进（Ralph Loop）...[/dim italic]")
+
+    def _on_turn(text, idx):
+        cleaned = _clean_think_tags(text) if text else ""
+        if cleaned:
+            console.print(f"\n[bold blue]💡 Spirit Agent（第 {idx} 轮）:[/bold blue]")
+            console.print(Markdown(cleaned))
+
+    def _on_decision(decision):
+        dmsg = decision.get("message", "")
+        if dmsg:
+            console.print(f"  [dim]{dmsg}[/dim]")
+
+    try:
+        result = run_goal_turn_loop(
+            agent, first_input, on_turn=_on_turn, on_decision=_on_decision
+        )
+    except KeyboardInterrupt:
+        console.print("\n[yellow]已中断目标循环（目标仍保留，可 /goal resume 继续）[/yellow]")
+        try:
+            agent.interrupt()
+        except Exception:
+            pass
+        return
+    except Exception as exc:
+        console.print(f"  [red]目标循环出错: {exc}[/red]")
+        return
+
+    outcome = result.get("outcome", "")
+    turns = result.get("turns_used", 0)
+    reason = result.get("reason", "")
+    tail = f" — {reason}" if reason else ""
+    console.print(f"\n[dim]目标循环结束: outcome={outcome}, turns={turns}{tail}[/dim]")
 
 
 @cli.command()

@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, Optional
 
 from spirit.tools.registry import registry
 from spirit.config import get_config_value
+from spirit.tools.approval import request_command_approval
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +180,8 @@ TERMINAL_SCHEMA = {
         "description": (
             "在终端中执行 shell 命令。\n\n"
             "返回命令的 stdout 和 stderr 输出。\n"
-            "支持设置超时时间。适合运行构建、测试、git 等操作。"
+            "支持设置超时时间。适合运行构建、测试、git 等操作。\n"
+            "需要长时间运行的服务/监听器请用 background=true，然后用 process 工具跟进。"
         ),
         "parameters": {
             "type": "object",
@@ -197,11 +199,112 @@ TERMINAL_SCHEMA = {
                     "type": "string",
                     "description": "工作目录（默认当前目录）",
                 },
+                "force": {
+                    "type": "boolean",
+                    "description": (
+                        "跳过危险命令审批门禁（仅当用户已显式预确认时为 true）。"
+                        "默认 false：危险命令会被安全策略拦截或要求审批。"
+                    ),
+                    "default": False,
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": (
+                        "后台运行（不阻塞等待结果）。适合开发服务器、监听器、长时间构建。"
+                        "立即返回 session_id，之后用 process 工具 poll/log/wait/kill。"
+                    ),
+                    "default": False,
+                },
+                "notify_on_complete": {
+                    "type": "boolean",
+                    "description": (
+                        "仅 background=true 时生效：进程退出时主动通知 Agent（而不是等它去 poll）。"
+                        "缺省读 process.notify_on_complete_default。"
+                    ),
+                },
+                "watch_patterns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "仅 background=true 时生效：输出命中任一子串即通知 Agent（带限流与熔断）。"
+                        "适合“服务就绪就推一下”这类场景，例如 [\"ready in\", \"Listening on\"]。"
+                    ),
+                },
+                "interactive": {
+                    "type": "boolean",
+                    "description": (
+                        "仅 background=true 时生效：开 stdin 管道，之后可用 "
+                        "process(action=write/submit/close) 回答交互式提示。"
+                    ),
+                    "default": False,
+                },
             },
             "required": ["command"],
         },
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# 后台执行（Phase 4.7 —— spirit/process 注册表）
+# ---------------------------------------------------------------------------
+
+def _spawn_background(
+    command: str,
+    work_dir: Optional[Path],
+    notify_on_complete: Optional[bool] = None,
+    watch_patterns: Optional[Any] = None,
+    interactive: bool = False,
+) -> str:
+    """把命令交给进程注册表后台派生，立即返回会话信息 JSON。
+
+    与前台执行不同，这里**不**等待输出：调用方拿到 ``session_id`` 后用
+    ``process`` 工具去 poll/log/wait/kill。失败（派生异常）时返回带
+    ``failed_start`` 状态的会话，而不是抛异常穿透到工具层。
+    """
+    from spirit.process import process_registry
+    from spirit.tools.approval import get_current_session_key
+
+    if notify_on_complete is None:
+        notify_on_complete = bool(
+            get_config_value("process.notify_on_complete_default", True)
+        )
+
+    patterns: list = []
+    if isinstance(watch_patterns, (list, tuple)):
+        patterns = [str(p) for p in watch_patterns if p]
+    elif isinstance(watch_patterns, str) and watch_patterns.strip():
+        # 容错：模型有时会把数组发成逗号分隔的字符串
+        patterns = [p.strip() for p in watch_patterns.split(",") if p.strip()]
+
+    session = process_registry.spawn_local(
+        command,
+        cwd=str(work_dir) if work_dir else None,
+        session_key=get_current_session_key(default="") or "",
+        notify_on_complete=notify_on_complete,
+        watch_patterns=patterns,
+        interactive=bool(interactive),
+    )
+
+    payload: Dict[str, Any] = {
+        "background": True,
+        "session_id": session.id,
+        "pid": session.pid,
+        "command": command,
+        "cwd": session.cwd,
+        "status": "failed_start" if session.completion_reason == "failed_start" else "running",
+        "notify_on_complete": session.notify_on_complete,
+        "hint": (
+            "命令已在后台启动。用 process 工具跟进："
+            "action=poll 查状态，action=log 读输出，action=wait 阻塞等待，"
+            "action=kill 终止。不要重复启动同一命令。"
+        ),
+    }
+    if patterns:
+        payload["watch_patterns"] = patterns
+    if session.completion_reason == "failed_start":
+        payload["error"] = session.output_buffer
+    return json.dumps(payload, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -212,11 +315,22 @@ def _handle_terminal(
     command: str,
     timeout: int = DEFAULT_TIMEOUT,
     cwd: str = None,
+    force: bool = False,
+    background: bool = False,
+    notify_on_complete: Optional[bool] = None,
+    watch_patterns: Optional[Any] = None,
+    interactive: bool = False,
 ) -> str:
-    """执行 shell 命令并返回输出（双模式）。
+    """执行 shell 命令并返回输出（双模式 + 后台模式）。
 
     当 VSCode 终端桥可用时，发送到 VSCode 集成终端执行。
     否则使用 subprocess 直接执行（CLI 模式）。
+    ``background=True`` 时交给进程注册表后台派生并立即返回 session_id
+    （VSCode 桥不支持后台，因此后台路径总是本地 subprocess）。
+
+    执行前经过危险命令审批门禁（request_command_approval）：
+    HARDLINE / 用户 deny / sudo stdin 无条件阻止；危险模式需审批（回调或 fail-safe 阻止）。
+    ``force=True`` 跳过门禁（用户已预确认）。
     """
     # 超时限制
     timeout = min(max(timeout, 1), MAX_TIMEOUT)
@@ -228,13 +342,54 @@ def _handle_terminal(
         if not work_dir.exists():
             return json.dumps({"error": f"目录不存在: {cwd}"})
 
+    # ── 危险命令审批门禁（执行前）──
+    approval = request_command_approval(command, force=force)
+    if not approval.get("approved"):
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": approval.get("message", "命令被安全策略阻止"),
+            "status": approval.get("status", "blocked"),
+            "blocked": True,
+            "pattern_key": approval.get("pattern_key"),
+            "requires_user_approval": approval.get("requires_user_approval", False),
+        }, ensure_ascii=False)
+
+    approval_note = None
+    if approval.get("user_approved") and approval.get("pattern_key"):
+        approval_note = (
+            f"[审批] 命令被标记为危险（{approval.get('pattern_key')}），已由用户批准执行。"
+        )
+
+    # ── 后台模式：派生后立即返回（不走 VSCode 桥）──
+    if background:
+        result = _spawn_background(
+            command, work_dir,
+            notify_on_complete=notify_on_complete,
+            watch_patterns=watch_patterns,
+            interactive=interactive,
+        )
+        return _prepend_approval_note(result, approval_note)
+
     # ── 尝试 VSCode 模式 ──
     vscode_result = _try_vscode_terminal(command, timeout, str(work_dir) if work_dir else None)
     if vscode_result is not None:
-        return vscode_result
+        return _prepend_approval_note(vscode_result, approval_note)
 
     # ── CLI 模式：subprocess 执行 ──
-    return _execute_subprocess(command, timeout, work_dir)
+    return _prepend_approval_note(_execute_subprocess(command, timeout, work_dir), approval_note)
+
+
+def _prepend_approval_note(result: str, note: Optional[str]) -> str:
+    """将审批说明前置到命令输出（如果有）。
+
+    避免破坏 JSON 错误结果：若 result 是 JSON 对象（以 { 开头）则不前置。
+    """
+    if not note:
+        return result
+    if (result or "").lstrip().startswith("{"):
+        return result
+    return f"{note}\n{result}"
 
 
 def _try_vscode_terminal(command: str, timeout: int, cwd: Optional[str]) -> Optional[str]:

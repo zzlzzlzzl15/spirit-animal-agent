@@ -1,5 +1,7 @@
 # Spirit Agent 架构设计
 
+> ⚠️ 早期设计稿，已被 [`12-system-architecture-asbuilt.md`](./12-system-architecture-asbuilt.md)（现状架构）取代，仅保留作历史参考。
+
 > 基于 Hermes 架构参考，设计 Spirit Agent 的完整产品架构。
 
 ---

@@ -5,7 +5,7 @@
  * 不直接暴露 Node.js / Electron 完整能力。
  */
 
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, clipboard } from 'electron'
 
 // ---------------------------------------------------------------------------
 // 暴露给渲染进程的 API
@@ -58,6 +58,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   /** 用浏览器打开 Memora 知识库 */
   openMemora: (): Promise<boolean> =>
     ipcRenderer.invoke('open-memora'),
+
+  // ── 剪贴板 ────────────────────────────────────────────────
+
+  /** 读取系统剪贴板文本（同步，供 CLI 终端 Ctrl+V 粘贴） */
+  clipboardRead: (): string => clipboard.readText(),
+
+  /** 写入文本到系统剪贴板（同步，供 CLI 终端 Ctrl+C 复制） */
+  clipboardWrite: (text: string): void => {
+    clipboard.writeText(text)
+  },
+
+  /** 桌宠渲染进程心跳：上报 rAF 帧数，供主进程检测合成层停绘 */
+  petHeartbeat: (frames: number): void => {
+    ipcRenderer.send('pet-heartbeat', { frames })
+  },
 
   // ── 窗口控制 ──────────────────────────────────────────────
 
@@ -117,6 +132,9 @@ declare global {
       showBubble: (text: string) => Promise<boolean>
       hideBubble: () => Promise<boolean>
       openMemora: () => Promise<boolean>
+      clipboardRead: () => string
+      clipboardWrite: (text: string) => void
+      petHeartbeat: (frames: number) => void
       savePosition: (x: number, y: number) => void
       saveScale: (scale: number) => void
       moveWindow: (deltaX: number, deltaY: number) => void

@@ -360,11 +360,18 @@ class VoiceEngine:
     # 便捷方法
     # ------------------------------------------------------------------
 
-    async def listen_and_respond(self, audio_data: bytes) -> dict:
+    async def listen_and_respond(self, audio_data: bytes, *, agent_chat=None) -> dict:
         """完整的语音问答流程：STT → Agent → TTS。
 
+        Args:
+            audio_data: 用户语音的原始音频数据
+            agent_chat: 可选的 Agent 对话回调。签名 (text: str) -> str，
+                也支持 async 回调或返回 dict（{"response": ...} / {"text": ...}）。
+                为 None 时退化为回显（无 Agent 注入）。
+
         Returns:
-            {"text": "识别文本", "response": "回复文本", "audio": bytes}
+            {"text": 识别文本, "response": 回复文本, "audio": bytes,
+             "format": str, "error": str}
         """
         # STT
         stt = await self.transcribe(audio_data)
@@ -373,6 +380,8 @@ class VoiceEngine:
                 "text": "",
                 "response": stt.error or "未能识别语音",
                 "audio": b"",
+                "format": "",
+                "error": stt.error,
             }
 
         # 唤醒词检测
@@ -381,18 +390,37 @@ class VoiceEngine:
                 "text": stt.text,
                 "response": "",
                 "audio": b"",
+                "format": "",
+                "error": "",
             }
 
-        # Agent 对话（需要外部注入 agent 实例）
-        response_text = f"收到: {stt.text}"
+        # Agent 对话（可注入回调；无则退化为回显）
+        if agent_chat is None:
+            response_text = f"收到: {stt.text}"
+        else:
+            try:
+                result = agent_chat(stt.text)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                if isinstance(result, dict):
+                    response_text = result.get("response") or result.get("text") or ""
+                else:
+                    response_text = str(result or "")
+            except Exception as exc:
+                logger.warning("语音问答 Agent 调用失败: %s", exc)
+                response_text = f"抱歉，处理时出错: {exc}"
 
         # TTS
-        tts = await self.synthesize(response_text)
+        if response_text.strip():
+            tts = await self.synthesize(response_text)
+        else:
+            tts = TTSResult(error="无回复内容")
 
         return {
             "text": stt.text,
             "response": response_text,
             "audio": tts.audio_data if tts.is_success else b"",
+            "format": tts.format if tts.is_success else "",
             "error": tts.error,
         }
 

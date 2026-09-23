@@ -1,6 +1,6 @@
 {
   "name": "spirit-desktop-pet",
-  "version": "0.0.2",
+  "version": "0.1.0",
   "description": "Spirit Agent 桌面宠物 — Electron + Vue 3 前端",
   "main": "dist-electron/main.js",
   "scripts": {

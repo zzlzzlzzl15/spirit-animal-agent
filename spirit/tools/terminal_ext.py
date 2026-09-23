@@ -63,80 +63,14 @@ class DaemonThreadPoolExecutor(ThreadPoolExecutor):
 
 
 # ============================================================================
-# 进程注册表（来自 process_registry.py，简化版）
+# 进程注册表
 # ============================================================================
+#
+# 旧版玩具级 ProcessEntry/ProcessRegistry 已在 Phase 4.7 移除，统一改用
+# ``spirit.process.process_registry``（对标 Hermes tools/process_registry.py）：
+# 后台派生走 terminal_tool(background=true)，本文件的 close_terminal /
+# read_terminal 工具直接委托给新注册表的 request_close_terminal / read_log。
 
-
-class ProcessEntry:
-    """一个后台进程条目。"""
-
-    def __init__(self, process_id: str, process, command: str, cwd: str = ""):
-        self.process_id = process_id
-        self.process = process
-        self.command = command
-        self.cwd = cwd
-        self.output_lines: List[str] = []
-        self.exit_code: Optional[int] = None
-        self.started_at = __import__("time").time()
-
-    def read_output(self, start: int = 0, count: Optional[int] = None) -> str:
-        """读取进程输出。"""
-        end = start + count if count else len(self.output_lines)
-        return "\n".join(self.output_lines[start:end])
-
-    @property
-    def is_running(self) -> bool:
-        return self.process.poll() is None
-
-
-class ProcessRegistry:
-    """管理所有后台进程。"""
-
-    def __init__(self):
-        self._entries: Dict[str, ProcessEntry] = {}
-        self._lock = threading.Lock()
-
-    def register(self, process_id: str, process, command: str, cwd: str = "") -> ProcessEntry:
-        entry = ProcessEntry(process_id, process, command, cwd)
-        with self._lock:
-            self._entries[process_id] = entry
-        return entry
-
-    def get(self, process_id: str) -> Optional[ProcessEntry]:
-        with self._lock:
-            return self._entries.get(process_id)
-
-    def list_all(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            result = []
-            for pid, entry in self._entries.items():
-                result.append({
-                    "process_id": pid,
-                    "command": entry.command,
-                    "cwd": entry.cwd,
-                    "running": entry.is_running,
-                    "output_lines": len(entry.output_lines),
-                    "exit_code": entry.exit_code,
-                })
-            return result
-
-    def kill(self, process_id: str) -> bool:
-        entry = self.get(process_id)
-        if not entry or not entry.is_running:
-            return False
-        try:
-            entry.process.kill()
-            return True
-        except Exception:
-            return False
-
-    def remove(self, process_id: str):
-        with self._lock:
-            self._entries.pop(process_id, None)
-
-
-# 全局进程注册表
-process_registry = ProcessRegistry()
 
 
 # ============================================================================
@@ -284,11 +218,16 @@ def _handle_close_terminal(args: Dict[str, Any], **kwargs) -> str:
     pid = (args.get("process_id") or "").strip()
     if not pid:
         return json.dumps({"error": "process_id 不能为空"})
-    entry = process_registry.get(pid)
-    if not entry:
-        return json.dumps({"error": f"未找到进程: {pid}"})
-    process_registry.remove(pid)
-    return json.dumps({"success": True, "message": f"已关闭终端标签: {pid}"})
+    from spirit.process import process_registry
+
+    result = process_registry.request_close_terminal(pid)
+    if result.get("status") == "error":
+        return json.dumps({"error": result.get("error", "关闭失败")}, ensure_ascii=False)
+    return json.dumps({
+        "success": True,
+        "message": result.get("note", f"已关闭终端标签: {pid}"),
+        "closed": result.get("closed", pid),
+    }, ensure_ascii=False)
 
 
 registry.register(
@@ -335,15 +274,28 @@ def _handle_read_terminal(args: Dict[str, Any], **kwargs) -> str:
     pid = (args.get("process_id") or "").strip()
     if not pid:
         return json.dumps({"error": "process_id 不能为空"})
-    entry = process_registry.get(pid)
-    if not entry:
-        return json.dumps({"error": f"未找到进程: {pid}"})
-    start = args.get("start_line", 0) or 0
-    count = args.get("count")
-    output = entry.read_output(start, count)
+    from spirit.process import process_registry
+
+    offset = int(args.get("start_line", 0) or 0)
+    raw_count = args.get("count")
+    # count 未给时用大 limit 保留旧“从 offset 读到尾”语义（read_log 的
+    # offset=0 分支取末尾 N 行，offset>0 分支取 [offset, offset+limit)）。
+    limit = int(raw_count) if raw_count else 100_000
+    result = process_registry.read_log(pid, offset=offset, limit=limit)
+    if result.get("status") == "not_found":
+        return json.dumps({"error": f"未找到进程: {pid}"}, ensure_ascii=False)
     return json.dumps({
         "process_id": pid,
-        "total_lines": len(entry.output_lines),
-        "running": entry.is_running,
-        "text": output,
-    })
+        "total_lines": result.get("total_lines", 0),
+        "running": result.get("status") == "running",
+        "text": result.get("output", ""),
+    }, ensure_ascii=False)
+
+
+registry.register(
+    name="read_terminal",
+    toolset="terminal",
+    schema=READ_TERMINAL_SCHEMA,
+    handler=_handle_read_terminal,
+    emoji="📄",
+)

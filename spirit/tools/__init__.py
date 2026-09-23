@@ -13,6 +13,7 @@ from spirit.tools import execute_code
 # 终端工具
 from spirit.tools import terminal_tool
 from spirit.tools import terminal_ext
+from spirit.tools import process_tool
 
 # Web 工具
 from spirit.tools import web_tools

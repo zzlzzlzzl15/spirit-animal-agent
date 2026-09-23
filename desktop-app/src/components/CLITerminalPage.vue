@@ -791,7 +791,7 @@ async function sendChatMessage(message: string) {
   mdBuffer = ''
   startSpinner('思考中')
   try {
-    const data = await wsSend('chat', { message }, 300000)  // 5 分钟超时
+    const data = await wsSend('chat', { message }, 1800000)  // 30 分钟超时（与后端 timeouts.chat_request 默认对齐）
     // 清除 spinner
     stopSpinner()
     flushMarkdown()
@@ -932,6 +932,39 @@ onMounted(async () => {
   term.loadAddon(fitAddon)
   term.loadAddon(new WebLinksAddon())
   term.open(terminalRef.value)
+
+  // ── 剪贴板快捷键修复（Ctrl+V 粘贴 / Ctrl+C 复制）─────────────
+  // Electron 无边框窗口默认不带 Edit 菜单角色，Ctrl+C/V 不会自动
+  // 触发浏览器 copy/paste 事件，xterm 的 helper textarea 收不到粘贴。
+  // 这里显式接管按键，直接经 preload 暴露的 clipboard API 读写系统剪贴板。
+  term.attachCustomKeyEventHandler((e) => {
+    const api = window.electronAPI
+    const key = e.key?.toLowerCase()
+
+    // 粘贴：Ctrl+V / Ctrl+Shift+V / Shift+Insert
+    const isPaste = (e.ctrlKey && key === 'v') || (e.shiftKey && e.key === 'Insert')
+    if (isPaste && e.type === 'keydown') {
+      if (isProcessing) { e.preventDefault(); return false }  // 处理中忽略粘贴
+      if (!api?.clipboardRead) return true                    // 回退：交给默认行为
+      e.preventDefault()
+      const text = api.clipboardRead()
+      if (text) insertText(text)
+      return false
+    }
+
+    // 复制：Ctrl+C — 有选区则复制选区，无选区放行（触发 SIGINT 取消当前输入）
+    if (e.ctrlKey && !e.shiftKey && key === 'c' && e.type === 'keydown') {
+      const sel = term!.getSelection()
+      if (sel && api?.clipboardWrite) {
+        e.preventDefault()
+        api.clipboardWrite(sel)
+        return false
+      }
+      return true
+    }
+
+    return true
+  })
 
   // ── IME 焦点修复 ────────────────────────────────────────────
   // 中文输入法确认字符后，xterm.js 内部 textarea 会失去焦点，
@@ -1114,15 +1147,7 @@ onMounted(async () => {
 
     // 可打印字符（支持中文等多字节字符）
     if (code >= 32) {
-      // 插入到光标位置，cursorPos 按实际字符数递增
-      inputBuffer = inputBuffer.slice(0, cursorPos) + data + inputBuffer.slice(cursorPos)
-      cursorPos += data.length
-      // 简单情况（光标在末尾）：直接写入字符，避免 rewriteLine 闪烁
-      if (cursorPos === inputBuffer.length) {
-        term!.write(data)
-      } else {
-        rewriteLine()
-      }
+      insertText(data)
     }
   })
 
@@ -1141,6 +1166,19 @@ function rewriteLine() {
   const back = inputBuffer.length - cursorPos
   if (back > 0) {
     term!.write('\x1b[' + back + 'D')
+  }
+}
+
+function insertText(data: string) {
+  // 在光标处插入文本（普通键入与剪贴板粘贴共用此逻辑）
+  if (!data || !term) return
+  inputBuffer = inputBuffer.slice(0, cursorPos) + data + inputBuffer.slice(cursorPos)
+  cursorPos += data.length
+  // 光标在末尾：直接写入避免闪烁；否则整行重绘以修正光标位置
+  if (cursorPos === inputBuffer.length) {
+    term.write(data)
+  } else {
+    rewriteLine()
   }
 }
 

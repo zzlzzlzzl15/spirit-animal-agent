@@ -82,7 +82,7 @@ class TestDefaultConfig:
 
     def test_default_memora(self):
         assert "memora" in DEFAULT_CONFIG
-        assert DEFAULT_CONFIG["memora"]["base_url"] == "http://127.0.0.1:8080"
+        assert DEFAULT_CONFIG["memora"]["base_url"] == "http://127.0.0.1:8000"
 
     def test_default_browser(self):
         assert "browser" in DEFAULT_CONFIG

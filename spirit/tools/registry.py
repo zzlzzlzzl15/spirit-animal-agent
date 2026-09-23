@@ -12,6 +12,7 @@
 
 import ast
 import importlib
+import inspect
 import json
 import logging
 import threading
@@ -40,6 +41,9 @@ class ToolEntry:
     description: str = ""
     emoji: str = ""
     max_result_size_chars: Optional[int] = None
+    # handler 签名约定：True = args-dict 形式 handler(args: Dict, **kwargs)；
+    # False = 显式 kwargs 形式 handler(**args)。注册时自动探测。
+    takes_args_dict: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +135,40 @@ def discover_tools(tools_dir: Optional[Path] = None) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# handler 签名约定探测
+# ---------------------------------------------------------------------------
+
+def _detect_args_dict_handler(handler: Callable) -> bool:
+    """探测 handler 是否采用 args-dict 签名约定。
+
+    Spirit 工具 handler 有两种历史约定：
+    1. args-dict：``def _handle_x(args: Dict[str, Any], **kwargs)``
+       —— 首个位置参数名为 ``args``，期望收到整个参数字典。
+    2. 显式 kwargs：``def _handle_x(path: str, offset: int = 0)``
+       —— 期望 ``handler(**args)`` 展开调用。
+
+    ``dispatch`` 统一用 ``handler(**args)`` 会让约定 1 因缺少位置参数
+    ``args`` 而 TypeError。此函数在注册时探测约定，让 dispatch 能正确适配两者。
+
+    探测失败（内置函数 / 无签名）时保守返回 False（按显式 kwargs 处理）。
+    """
+    try:
+        sig = inspect.signature(handler)
+    except (ValueError, TypeError):
+        return False
+    for param in sig.parameters.values():
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            # 首个位置参数名为 args → args-dict 约定
+            return param.name == "args"
+        # 首个参数就是 *args / **kwargs / keyword-only → 非 args-dict
+        break
+    return False
+
+
+# ---------------------------------------------------------------------------
 # 工具注册表（全局单例）
 # ---------------------------------------------------------------------------
 
@@ -194,6 +232,7 @@ class ToolRegistry:
                 description=description or schema.get("function", {}).get("description", ""),
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
+                takes_args_dict=_detect_args_dict_handler(handler),
             )
             self._generation += 1
             logger.debug("注册工具: %s (toolset=%s)", name, toolset)
@@ -300,7 +339,11 @@ class ToolRegistry:
             return json.dumps({"error": f"工具 '{name}' 不存在"})
 
         try:
-            result = entry.handler(**args)
+            # 适配两种 handler 签名约定（args-dict vs 显式 kwargs）
+            if entry.takes_args_dict:
+                result = entry.handler(args)
+            else:
+                result = entry.handler(**args)
             # 截断过大的结果
             if entry.max_result_size_chars and isinstance(result, str):
                 if len(result) > entry.max_result_size_chars:
@@ -309,9 +352,42 @@ class ToolRegistry:
                         + f"\n\n... [结果已截断，共 {len(result)} 字符]"
                     )
             return result if isinstance(result, str) else json.dumps(result)
+        except TypeError as e:
+            # 参数签名不匹配（常见于模型输出畸形导致参数丢失/多余）：
+            # 返回带完整参数清单的结构化提示，引导模型自行重试
+            logger.warning("工具 %s 参数错误: %s", name, e)
+            hint = self._signature_hint(entry)
+            return json.dumps({
+                "error": f"工具 '{name}' 参数不正确: {e}",
+                "hint": hint,
+            }, ensure_ascii=False)
         except Exception as e:
             logger.warning("工具 %s 执行失败: %s", name, e)
             return json.dumps({"error": f"工具执行失败: {e}"})
+
+    @staticmethod
+    def _signature_hint(entry: ToolEntry) -> str:
+        """生成 handler 参数清单提示，供参数错误时引导模型重试。"""
+        try:
+            import inspect
+
+            sig = inspect.signature(entry.handler)
+            params = []
+            for pname, p in sig.parameters.items():
+                if p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                    continue
+                if p.default is inspect.Parameter.empty:
+                    params.append(f"{pname}（必填）")
+                else:
+                    params.append(f"{pname}（可选，默认 {p.default!r}）")
+            if params:
+                return (
+                    f"请重新调用工具 '{entry.name}'，在 arguments JSON 中完整提供以下参数："
+                    + "、".join(params)
+                )
+        except (TypeError, ValueError):
+            pass
+        return f"请重新调用工具 '{entry.name}'，并在 arguments JSON 中提供全部必填参数"
 
 
 # ---------------------------------------------------------------------------

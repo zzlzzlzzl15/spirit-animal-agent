@@ -127,12 +127,17 @@ def initialize_agent(
 
 
 def _init_hooks(agent: SpiritAgent) -> None:
-    """初始化钩子系统。"""
+    """初始化钩子系统（SpiritAgent.__init__ 已自装配，存在则跳过）。"""
+    if getattr(agent, "hook_manager", None) is not None:
+        logger.debug("钩子系统已由 SpiritAgent.__init__ 装配，跳过")
+        return
+
     from spirit.hooks.hook_manager import HookManager
     from spirit.hooks.lifecycle_hooks import register_lifecycle_hooks
     from spirit.hooks.tool_hooks import register_tool_hooks
     from spirit.hooks.task_hooks import register_task_hooks
     from spirit.hooks.conversation_hooks import register_conversation_hooks
+    from spirit.hooks.memora_auto_save import register_auto_save_hook
 
     hook_manager = HookManager()
     agent.hook_manager = hook_manager
@@ -142,6 +147,9 @@ def _init_hooks(agent: SpiritAgent) -> None:
     register_tool_hooks(hook_manager, agent)
     register_task_hooks(hook_manager, agent)
     register_conversation_hooks(hook_manager, agent)
+    # Memora 自动保存：监听 after_tool_execute，文件生成后自动入库；
+    # Memora 不可用时 handler 内部 health_check 失败会静默跳过（非致命）
+    register_auto_save_hook(hook_manager)
 
     logger.debug("钩子系统已初始化")
 

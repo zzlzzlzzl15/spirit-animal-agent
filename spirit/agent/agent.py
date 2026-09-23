@@ -216,6 +216,9 @@ class SpiritAgent:
         # 工具注册表（延迟初始化）
         self._registry = None
 
+        # 目标管理器（Ralph Loop 持久目标 — 延迟初始化，Phase 4）
+        self._goal_manager = None
+
         # 会话数据库（延迟初始化）
         self._session_db = None
         
@@ -226,6 +229,28 @@ class SpiritAgent:
             logger.info("会话数据库已初始化")
         except Exception as e:
             logger.warning("会话数据库初始化失败 (非致命): %s", e)
+
+        # 钩子系统（在 __init__ 统一装配：CLI/桌面 launcher/gateway 都是
+        # 直接构造 SpiritAgent，不走 agent_init.create_agent；失败非致命）
+        self.hook_manager = None
+        try:
+            from spirit.hooks.hook_manager import HookManager
+            from spirit.hooks.lifecycle_hooks import register_lifecycle_hooks
+            from spirit.hooks.tool_hooks import register_tool_hooks
+            from spirit.hooks.task_hooks import register_task_hooks
+            from spirit.hooks.conversation_hooks import register_conversation_hooks
+            from spirit.hooks.memora_auto_save import register_auto_save_hook
+
+            _hm = HookManager()
+            register_lifecycle_hooks(_hm, self)
+            register_tool_hooks(_hm, self)
+            register_task_hooks(_hm, self)
+            register_conversation_hooks(_hm, self)
+            register_auto_save_hook(_hm)
+            self.hook_manager = _hm
+            logger.info("钩子系统已初始化")
+        except Exception as e:
+            logger.warning("钩子系统初始化失败 (非致命): %s", e)
 
         # ── 智能模块 ────────────────────────────────────────────
 
@@ -251,6 +276,11 @@ class SpiritAgent:
         # 额外 API 参数（provider 特定）
         self._extra_api_params: Dict[str, Any] = {}
 
+        # MoA 参考展示钩子（provider=="moa" 时传给 MoAClient）。
+        # 签名：callback(event, **kwargs)，event ∈ {"moa.reference", "moa.aggregating"}。
+        # CLI/前端可设置以在聚合器行动前渲染每个参考模型的输出块。
+        self._moa_reference_callback: Optional[Callable] = None
+
         logger.info(
             "SpiritAgent 初始化: model=%s, session=%s, compression=%s, prompt_cache=%s",
             self.model,
@@ -265,13 +295,27 @@ class SpiritAgent:
 
     @property
     def client(self):
-        """OpenAI 兼容客户端（延迟初始化）。"""
+        """OpenAI 兼容客户端（延迟初始化）。
+
+        ``provider == "moa"`` 时返回 :class:`MoAClient` facade（其
+        ``.chat.completions.create`` 拦截为 MoA 流程：并行跑参考模型 → 注入
+        guidance → 调聚合器），``self.model`` 即预设名。facade 缓存在 ``_client``，
+        使其 turn 域参考缓存跨一轮内的多次 ``create()``（每工具迭代一次）持久；
+        ``set_model`` 重置 ``_client`` 时会重建。
+        """
         if self._client is None:
-            from openai import OpenAI
-            self._client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-            )
+            if str(self.provider or "").strip().lower() == "moa":
+                from spirit.moa.moa_loop import MoAClient
+                self._client = MoAClient(
+                    self.model,
+                    reference_callback=getattr(self, "_moa_reference_callback", None),
+                )
+            else:
+                from openai import OpenAI
+                self._client = OpenAI(
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                )
         return self._client
 
     @property
@@ -282,6 +326,34 @@ class SpiritAgent:
             discover_tools()  # 触发工具自注册
             self._registry = registry
         return self._registry
+
+    @property
+    def goal_manager(self):
+        """当前会话的目标管理器（Ralph Loop，延迟初始化）。
+
+        绑定到 ``self.session_id``，持久化走 SessionDB 的 ``state_meta`` 表（因此
+        ``/resume`` 能重新捡起未完成的目标）。judge 的 LLM 调用通过
+        ``build_agent_llm_caller(self)`` 从本 Agent 的 client 构造闭包——``goals.enabled``
+        关闭时 llm_caller 为 None，judge 直接 fail-open 返回 continue（不自主续传）。
+        """
+        if self._goal_manager is None:
+            from spirit.goals import (
+                GoalManager,
+                SessionDBGoalStore,
+                build_agent_llm_caller,
+            )
+            from spirit.config import get_config_value
+
+            enabled = bool(get_config_value("goals.enabled", True))
+            store = SessionDBGoalStore(db=self._session_db)
+            caller = build_agent_llm_caller(self) if enabled else None
+            self._goal_manager = GoalManager(
+                self.session_id,
+                default_max_turns=get_config_value("goals.max_turns", 20),
+                store=store,
+                llm_caller=caller,
+            )
+        return self._goal_manager
 
     @property
     def messages(self) -> List[Dict[str, Any]]:
@@ -392,6 +464,12 @@ class SpiritAgent:
         self._interrupt_requested = True
         logger.info("收到中断请求")
 
+    def _emit_hook(self, event: str, **kwargs) -> None:
+        """触发钩子事件（钩子系统未启用时静默跳过，异常由 HookManager 隔离）。"""
+        hook_manager = getattr(self, "hook_manager", None)
+        if hook_manager is not None:
+            hook_manager.emit(event, **kwargs)
+
     def clear_interrupt(self):
         """清除中断标志。"""
         self._interrupt_requested = False
@@ -403,7 +481,12 @@ class SpiritAgent:
         数据库会话保持活跃，Agent 实例继续运行。
         用于 /new 命令或上下文压缩触发。
         """
+        # 0. 钩子：会话结束（handler 会把内存消息持久化到 session_db，
+        #    必须在清空 _messages 之前触发；add_message 不做逐条落库，无重复风险）
+        self._emit_hook("on_session_end", session_id=self.session_id)
+
         # 1. Soft End: 结束当前会话（标记为 'compression' 或 'new_session'）
+        old_session_id = self.session_id  # 记住旧 id，用于持久目标迁移
         if self.session_id and self._session_db:
             try:
                 self._session_db.end_session(self.session_id, reason="new_session")
@@ -416,6 +499,8 @@ class SpiritAgent:
         self._interrupt_requested = False
         self._cached_system_prompt = None
         self.session_id = str(uuid.uuid4())
+        # 目标管理器绑定了旧 session_id —— 丢弃，让 goal_manager property 按新 id 重建。
+        self._goal_manager = None
 
         # 3. 重置压缩器
         if self._context_compressor:
@@ -442,7 +527,29 @@ class SpiritAgent:
         except Exception as e:
             logger.warning("用量追踪启动失败 (非致命): %s", e)
 
+        # 6. 迁移持久目标到新会话（Ralph Loop 目标不应在会话轮换边界静默死亡）
+        if old_session_id and old_session_id != self.session_id:
+            try:
+                from spirit.goals import SessionDBGoalStore, migrate_goal_to_session
+                migrated = migrate_goal_to_session(
+                    old_session_id,
+                    self.session_id,
+                    store=SessionDBGoalStore(db=self._session_db),
+                    reason="reset_session",
+                )
+                if migrated:
+                    logger.info(
+                        "持久目标已迁移到新会话: %s -> %s",
+                        old_session_id[:8], self.session_id[:8],
+                    )
+            except Exception as e:
+                logger.warning("目标迁移失败 (非致命): %s", e)
+
         logger.info("会话已重置 (Soft End): %s", self.session_id[:8])
+
+        # 7. 钩子：会话重置 + 新会话开始（新 id 无历史，handler 加载为空 no-op）
+        self._emit_hook("on_session_reset", old_session_id=old_session_id)
+        self._emit_hook("on_session_start", session_id=self.session_id)
 
     def shutdown_memory_provider(self):
         """关闭记忆提供者（Medium End）。
@@ -473,6 +580,9 @@ class SpiritAgent:
         这是三层终止机制中的第三层：杀死所有资源，
         标记数据库会话结束。用于真正终止 Agent。
         """
+        # 0. 钩子：Agent 销毁（handler 会在 db 关闭前持久化当前消息）
+        self._emit_hook("on_agent_destroy", session_id=self.session_id)
+
         # 1. Hard End: 结束会话
         if self.session_id and self._session_db:
             try:

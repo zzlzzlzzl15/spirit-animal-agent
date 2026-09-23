@@ -1,6 +1,6 @@
 """Memora API 反向代理 — 统一 API 入口。
 
-将 /memora/api/v1/* 请求代理到 Memora 后端 (http://localhost:8080/api/v1/*)。
+将 /memora/api/v1/* 请求代理到 Memora 后端 (http://localhost:8000/api/v1/*)。
 好处：
 - 前端无需处理跨域
 - 统一入口，浏览器只需知道 Spirit 地址
@@ -24,14 +24,14 @@ logger = logging.getLogger(__name__)
 from spirit.config import get_config_value
 
 # 默认 Memora 后端地址（来自集中式配置）
-DEFAULT_MEMORA_URL = get_config_value("memora.base_url", "http://127.0.0.1:8080")
+DEFAULT_MEMORA_URL = get_config_value("memora.base_url", "http://127.0.0.1:8000")
 
 
 def create_memora_router(memora_base_url: str = None) -> APIRouter:
     """创建 Memora 反向代理路由。
 
     Args:
-        memora_base_url: Memora 后端地址，默认 http://127.0.0.1:8080
+        memora_base_url: Memora 后端地址，默认 http://127.0.0.1:8000
 
     Returns:
         FastAPI APIRouter 实例

@@ -40,6 +40,12 @@ _TOOL_CALL_JSON_RE = re.compile(
     re.DOTALL,
 )
 
+# 包装标签：部分 provider 会把 JSON 工具调用裹在 <tool_calls>/<tool_response> 里
+_WRAPPER_BLOCK_RE = re.compile(
+    r'\x3c(?:tool_calls|tool_response|function_calls)\x3e\s*([\s\S]*?)\s*\x3c/(?:tool_calls|tool_response|function_calls)\x3e',
+    re.DOTALL | re.IGNORECASE,
+)
+
 # MiniMax style: 
 _MINIMAX_INVOKE_RE = re.compile(
     r'\x3cinvoke\s+name\s*=\s*["\']([^"\']+)["\']\s*\x3e(.*?)\x3c/invoke\x3e',
@@ -82,8 +88,7 @@ def _parse_minimax_invoke(match, call_counter):
             params[param_name] = parsed_value
         except (ValueError, Exception):
             params[param_name] = param_value
-    if not params:
-        return None
+    # 零参数工具调用同样合法（如 get_date），不得丢弃
     call_id = f'minimax_call_{call_counter}'
     arguments_str = json.dumps(params, ensure_ascii=False)
     return _build_openai_tool_call(call_id, name, arguments_str)
@@ -164,6 +169,14 @@ def parse_text_tool_calls(text: str) -> Tuple[List[Dict[str, Any]], str]:
         _try_add_tool_call(raw)
         # 块被识别为工具调用块即消费（避免原始 JSON 进入上下文）
         if len(extracted) > before or raw.strip().startswith("{"):
+            consumed_spans.append((m.start(), m.end()))
+
+    # 1.5 包装标签块：<tool_calls>/<tool_response>/<function_calls> 内的 JSON
+    for m in _WRAPPER_BLOCK_RE.finditer(text):
+        raw = m.group(1)
+        before = len(extracted)
+        _try_add_tool_call(raw)
+        if len(extracted) > before:
             consumed_spans.append((m.start(), m.end()))
 
     # 2. Bare JSON fallback (only when no XML blocks found)

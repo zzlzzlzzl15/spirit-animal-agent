@@ -9,7 +9,7 @@
  */
 
 import { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, powerMonitor } from 'electron'
-import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow } from './window'
+import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow, showPetWindow, hidePetWindow, forceRedrawPetWindow, startPetWatchdog, stopPetWatchdog, movePetWindow } from './window'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 
@@ -84,6 +84,21 @@ app.whenReady().then(async () => {
   }
   powerMonitor.on('resume', refreshPetWindow)
   screen.on('display-metrics-changed', refreshPetWindow)
+
+  // 8. GPU 进程退出自愈：GPU 重启后透明窗口合成层可能失效，强制重建
+  app.on('child-process-gone', (_event, details) => {
+    if (details.type === 'GPU') {
+      console.warn('[main] GPU process gone:', details.reason, '— force redraw pet window')
+      forceRedrawPetWindow()
+    }
+  })
+
+  // 9. 启动宠物窗口看门狗：覆盖窗口意外销毁/被 hide/掉层/合成层停绘
+  startPetWatchdog(() => ({
+    x: store.get('windowX') as number,
+    y: store.get('windowY') as number,
+    scale: store.get('petScale') as number,
+  }))
 })
 
 app.on('window-all-closed', () => {
@@ -94,6 +109,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  stopPetWatchdog()  // 先停看门狗，防止退出过程中窗口被重建
   saveWindowPosition()
   stopPythonBackend()
 })
@@ -117,12 +133,7 @@ function createTray(): void {
     { type: 'separator' },
     {
       label: '显示/隐藏',
-      click: () => {
-        const win = getPetWindow()
-        if (win) {
-          win.isVisible() ? win.hide() : win.show()
-        }
-      },
+      click: () => togglePetVisible(),
     },
     {
       label: '重置位置',
@@ -159,12 +170,17 @@ function createTray(): void {
   tray.setContextMenu(contextMenu)
 
   // 左键点击托盘 → 显示/隐藏
-  tray.on('click', () => {
-    const win = getPetWindow()
-    if (win) {
-      win.isVisible() ? win.hide() : win.show()
-    }
-  })
+  tray.on('click', () => togglePetVisible())
+}
+
+/**
+ * 托盘切换宠物可见性：走 showPetWindow/hidePetWindow 同步 petUserHidden 标志，
+ * 看门狗不会覆盖用户主动隐藏的意图。
+ */
+function togglePetVisible(): void {
+  const win = getPetWindow()
+  if (!win) return
+  win.isVisible() ? hidePetWindow() : showPetWindow()
 }
 
 // ---------------------------------------------------------------------------
@@ -196,12 +212,12 @@ function registerIPC(): void {
     }
   })
 
-  // 窗口拖拽移动
+  // 窗口拖拽移动（走 movePetWindow 统一入口，坐标经屏幕边界钳制，防止拖出屏幕）
   ipcMain.on('move-window', (_event, { deltaX, deltaY }: { deltaX: number; deltaY: number }) => {
     const win = getPetWindow()
     if (!win) return
     const [x, y] = win.getPosition()
-    win.setPosition(x + deltaX, y + deltaY)
+    movePetWindow(x + deltaX, y + deltaY)
   })
 
   // 窗口大小调整（缩放）

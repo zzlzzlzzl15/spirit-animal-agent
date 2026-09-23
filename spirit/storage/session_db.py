@@ -79,6 +79,15 @@ class SessionDB:
                 VALUES (new.id, new.content);
             END;
 
+            -- 状态元数据表（KV 存储 — goal 等跨轮次持久状态）
+            -- 参考 Hermes hermes_state.py 的 state_meta 表：goals 系统用
+            -- key='goal:<session_id>' 持久化 Ralph Loop 状态，/resume 可恢复。
+            CREATE TABLE IF NOT EXISTS state_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             -- 索引
             CREATE INDEX IF NOT EXISTS idx_messages_session
                 ON messages(session_id);
@@ -330,6 +339,37 @@ class SessionDB:
             (query, limit),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # 状态元数据（KV 存储 — goal 等跨轮次持久状态）
+    # ------------------------------------------------------------------
+
+    def get_meta(self, key: str) -> Optional[str]:
+        """读取一个状态元数据值。不存在返回 None。
+
+        goals 系统用 ``goal:<session_id>`` 作为 key 持久化 Ralph Loop 状态。
+        """
+        row = self.conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        """写入（upsert）一个状态元数据值。"""
+        self.conn.execute(
+            """INSERT INTO state_meta (key, value, updated_at)
+               VALUES (?, ?, CURRENT_TIMESTAMP)
+               ON CONFLICT(key) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at = CURRENT_TIMESTAMP""",
+            (key, value),
+        )
+        self.conn.commit()
+
+    def delete_meta(self, key: str) -> None:
+        """删除一个状态元数据值（不存在时无副作用）。"""
+        self.conn.execute("DELETE FROM state_meta WHERE key = ?", (key,))
+        self.conn.commit()
 
     # ------------------------------------------------------------------
     # 清理

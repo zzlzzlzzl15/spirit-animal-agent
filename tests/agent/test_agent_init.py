@@ -9,8 +9,17 @@ class TestLoadConfig:
     """配置加载测试。"""
 
     def test_default_config(self):
+        """无 YAML / 无环境变量时，配置应等于 DEFAULT_CONFIG。
+
+        必须隔离真实用户配置（~/.spirit/config.yaml、.env），否则在开发者
+        机器上会读到已填写的 model 而失败。
+        """
+        import spirit.config as spirit_config
         from spirit.agent.agent_init import load_config
-        config = load_config()
+
+        with patch.object(spirit_config, "_load_yaml", lambda *a, **kw: {}), \
+             patch.object(spirit_config, "_load_env_config", lambda *a, **kw: {}):
+            config = load_config()
         # 默认值来自 DEFAULT_CONFIG — model 留空, provider 为 auto
         assert config.model == ""
         assert config.provider == "auto"

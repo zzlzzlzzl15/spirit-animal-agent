@@ -26,19 +26,23 @@ from spirit.tools.registry import registry
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# 技能目录与配置
+# 技能目录与配置（委托 skills_hub.paths — 按调用解析，尊重 SPIRIT_HOME / env 覆盖）
 # ============================================================================
 
-from spirit.config import SPIRIT_HOME, get_config_value
+from spirit.config import get_config_value
+from spirit.skills_hub import discovery as _discovery
+from spirit.skills_hub import paths as _paths
 
-SKILLS_DIR = SPIRIT_HOME / "skills"
-HUB_DIR = SKILLS_DIR / ".hub"
-LOCK_FILE = HUB_DIR / "lock.json"
-QUARANTINE_DIR = HUB_DIR / "quarantine"
-AUDIT_LOG = HUB_DIR / "audit.jsonl"
+# 向后兼容的模块级常量（导入期快照）。新代码应调用 ``_paths.skills_dir()`` 等函数，
+# 以便测试 monkeypatch ``config.SPIRIT_HOME`` 或 env 覆盖能即时生效。
+SKILLS_DIR = _paths.skills_dir()
+HUB_DIR = _paths.hub_dir()
+LOCK_FILE = _paths.lock_file()
+QUARANTINE_DIR = _paths.quarantine_dir()
+AUDIT_LOG = _paths.audit_log()
 INDEX_CACHE_TTL = get_config_value("internal.skills_index_cache_ttl", 3600)
 
-EXCLUDED_SKILL_DIRS = {".hub", ".git", "__pycache__", "node_modules", ".DS_Store"}
+EXCLUDED_SKILL_DIRS = set(_paths.EXCLUDED_SKILL_DIRS)
 
 
 # ============================================================================
@@ -138,87 +142,27 @@ def format_scan_report(result: ScanResult) -> str:
 
 
 # ============================================================================
-# 技能发现与解析
+# 技能发现与解析（委托 skills_hub.discovery — 单一事实源）
 # ============================================================================
 
+# 向后兼容别名：discovery.SkillMeta 是本包唯一的技能元数据模型（含 environments）。
+SkillMeta = _discovery.SkillMeta
+
+
 def _split_frontmatter(text: str) -> Optional[Dict[str, Any]]:
-    """解析 YAML frontmatter。"""
-    if not isinstance(text, str):
-        return None
-    stripped = text.lstrip("\ufeff").lstrip()
-    if not stripped.startswith("---"):
-        return None
-    after_open = stripped[3:]
-    end = after_open.find("\n---")
-    if end == -1:
-        return None
-    fm_text = after_open[:end]
-    try:
-        import yaml
-        data = yaml.safe_load(fm_text)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-@dataclass
-class SkillMeta:
-    name: str
-    description: str
-    version: str = ""
-    path: str = ""
-    tags: List[str] = field(default_factory=list)
-    platforms: List[str] = field(default_factory=list)
+    """解析 YAML frontmatter（委托 discovery.parse_frontmatter，返回 dict 或 None）。"""
+    fm, _body = _discovery.parse_frontmatter(text if isinstance(text, str) else "")
+    return fm or None
 
 
 def _parse_skill_md(skill_md_path: Path) -> Optional[SkillMeta]:
-    """解析 SKILL.md 文件的元数据。"""
-    try:
-        text = skill_md_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-
-    fm = _split_frontmatter(text)
-    if not fm:
-        return None
-
-    name = str(fm.get("name", "")).strip()
-    desc = str(fm.get("description", "")).strip()
-    if not name or not desc:
-        return None
-    if len(name) > 64:
-        name = name[:64]
-    if len(desc) > 1024:
-        desc = desc[:1024]
-
-    meta = fm.get("metadata", {})
-    hermes_meta = meta.get("hermes", {}) if isinstance(meta, dict) else {}
-    tags = hermes_meta.get("tags", []) if isinstance(hermes_meta, dict) else []
-
-    return SkillMeta(
-        name=name, description=desc,
-        version=str(fm.get("version", "")),
-        path=str(skill_md_path.parent),
-        tags=[str(t) for t in tags] if isinstance(tags, list) else [],
-        platforms=[str(p) for p in fm.get("platforms", [])] if isinstance(fm.get("platforms"), list) else [],
-    )
+    """解析 SKILL.md 文件的元数据（委托 discovery.parse_skill_md）。"""
+    return _discovery.parse_skill_md(skill_md_path)
 
 
 def _find_all_skills() -> List[SkillMeta]:
-    """扫描技能目录，返回所有技能元数据。"""
-    skills = []
-    base = SKILLS_DIR
-    if not base.is_dir():
-        return skills
-
-    for skill_md in base.rglob("SKILL.md"):
-        if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
-            continue
-        meta = _parse_skill_md(skill_md)
-        if meta:
-            skills.append(meta)
-
-    return sorted(skills, key=lambda s: s.name.lower())
+    """扫描所有技能根，返回按名排序的技能元数据（委托 discovery.find_all_skills）。"""
+    return _discovery.find_all_skills()
 
 
 # ============================================================================
@@ -286,16 +230,12 @@ def _handle_skill_view(args: Dict[str, Any], **kwargs) -> str:
 
     file_ref = args.get("file", "").strip()
 
-    # 查找技能目录
-    candidates = list(SKILLS_DIR.rglob(f"**/{name}/SKILL.md"))
-    if not candidates:
-        candidates = list(SKILLS_DIR.glob(f"*/{name}/SKILL.md")) + \
-                     list(SKILLS_DIR.glob(f"{name}/SKILL.md"))
+    # 查找技能目录（委托 commands._resolve_skill_dir：名 / 相对路径 / frontmatter 名，跨所有技能根）。
+    from spirit.skills_hub import commands as _commands
 
-    if not candidates:
+    skill_dir = _commands._resolve_skill_dir(_discovery.normalize_skill_lookup_name(name))
+    if skill_dir is None:
         return json.dumps({"error": f"技能 '{name}' 未找到"})
-
-    skill_dir = candidates[0].parent
 
     if file_ref:
         target = skill_dir / file_ref
@@ -314,7 +254,7 @@ def _handle_skill_view(args: Dict[str, Any], **kwargs) -> str:
 
     # 读取主 SKILL.md
     try:
-        content = candidates[0].read_text(encoding="utf-8", errors="replace")
+        content = (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return json.dumps({"error": str(exc)})
 
@@ -324,6 +264,14 @@ def _handle_skill_view(args: Dict[str, Any], **kwargs) -> str:
         if f.is_file() and f.name != "SKILL.md":
             ref_files.append(str(f.relative_to(skill_dir)))
 
+    # 记一次查看（供 /skill info 的活跃度统计）。
+    try:
+        from spirit.skills_hub import usage as _usage
+
+        _usage.bump_view(name)
+    except Exception:
+        pass
+
     return json.dumps({
         "name": name, "content": content,
         "files": ref_files[:50],
@@ -331,9 +279,9 @@ def _handle_skill_view(args: Dict[str, Any], **kwargs) -> str:
 
 
 registry.register(name="skills_list", toolset="skills", schema=SKILLS_LIST_SCHEMA,
-                  handler=_handle_skills_list, check_fn=lambda: SKILLS_DIR.is_dir(), emoji="📚")
+                  handler=_handle_skills_list, check_fn=lambda: _paths.skills_dir().is_dir(), emoji="📚")
 registry.register(name="skill_view", toolset="skills", schema=SKILL_VIEW_SCHEMA,
-                  handler=_handle_skill_view, check_fn=lambda: SKILLS_DIR.is_dir(), emoji="📖")
+                  handler=_handle_skill_view, check_fn=lambda: _paths.skills_dir().is_dir(), emoji="📖")
 
 
 # ============================================================================
@@ -360,14 +308,14 @@ def _handle_skills_scan(args: Dict[str, Any], **kwargs) -> str:
     results = []
 
     if name:
-        candidates = list(SKILLS_DIR.rglob(f"**/{name}"))
-        if not candidates:
+        from spirit.skills_hub import commands as _commands
+
+        skill_dir = _commands._resolve_skill_dir(_discovery.normalize_skill_lookup_name(name))
+        if skill_dir is None:
             return json.dumps({"error": f"技能 '{name}' 未找到"})
-        dirs_to_scan = [d for d in candidates if d.is_dir()]
+        dirs_to_scan = [skill_dir]
     else:
-        dirs_to_scan = [d for d in SKILLS_DIR.rglob("*/SKILL.md")
-                        if not any(p in EXCLUDED_SKILL_DIRS for p in d.parts)]
-        dirs_to_scan = [d.parent for d in dirs_to_scan]
+        dirs_to_scan = [Path(m.path) for m in _discovery.find_all_skills() if m.path]
 
     for skill_dir in dirs_to_scan[:50]:
         result = scan_skill(skill_dir)
@@ -382,4 +330,106 @@ def _handle_skills_scan(args: Dict[str, Any], **kwargs) -> str:
 
 
 registry.register(name="skills_scan", toolset="skills", schema=SKILLS_SCAN_SCHEMA,
-                  handler=_handle_skills_scan, check_fn=lambda: SKILLS_DIR.is_dir(), emoji="🛡️")
+                  handler=_handle_skills_scan, check_fn=lambda: _paths.skills_dir().is_dir(), emoji="🛡️")
+
+
+# ============================================================================
+# 技能市场工具（委托 skills_hub.hub — 浏览 / 安装 / 卸载）
+# ============================================================================
+
+SKILLS_BROWSE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "skills_browse",
+        "description": "浏览 / 搜索技能市场索引（按名 / 描述 / 标签子串；空 query 返回全部）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索关键词（可选）"},
+                "source": {"type": "string", "description": "源名（默认 community）"},
+            },
+        },
+    },
+}
+
+
+def _handle_skills_browse(args: Dict[str, Any], **kwargs) -> str:
+    from spirit.skills_hub import hub as _hub
+
+    query = (args.get("query") or "").strip()
+    source = (args.get("source") or "community").strip() or "community"
+    try:
+        entries = _hub.search_skills(query, source=source) if query else _hub.browse_index(source)
+    except _hub.HubError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    return json.dumps({"entries": entries[:50], "count": len(entries)}, ensure_ascii=False)
+
+
+SKILLS_INSTALL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "skills_install",
+        "description": "从市场获取并安装一个技能（隔离 → 安全扫描 → 安装 / 留隔离）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "identifier": {"type": "string", "description": "技能标识符（如 owner/repo 或源内名）"},
+                "source": {"type": "string", "description": "源名（默认 community）"},
+                "category": {"type": "string", "description": "安装子目录（可选）"},
+            },
+            "required": ["identifier"],
+        },
+    },
+}
+
+
+def _handle_skills_install(args: Dict[str, Any], **kwargs) -> str:
+    from spirit.skills_hub import hub as _hub
+    from spirit.skills_hub import commands as _commands
+
+    identifier = (args.get("identifier") or "").strip()
+    if not identifier:
+        return json.dumps({"error": "identifier 不能为空"}, ensure_ascii=False)
+    source = (args.get("source") or "community").strip() or "community"
+    category = (args.get("category") or "").strip()
+    ok, message = _hub.install_skill(identifier, source=source, category=category)
+    if ok:
+        _commands.invalidate_skill_commands()
+    return json.dumps({"ok": ok, "message": message}, ensure_ascii=False)
+
+
+SKILLS_UNINSTALL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "skills_uninstall",
+        "description": "卸载一个市场安装的技能（拒绝移除非市场安装的 / 内置技能）。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "技能名"},
+            },
+            "required": ["name"],
+        },
+    },
+}
+
+
+def _handle_skills_uninstall(args: Dict[str, Any], **kwargs) -> str:
+    from spirit.skills_hub import hub as _hub
+    from spirit.skills_hub import commands as _commands
+
+    name = (args.get("name") or "").strip()
+    if not name:
+        return json.dumps({"error": "name 不能为空"}, ensure_ascii=False)
+    ok, message = _hub.uninstall_skill(name)
+    if ok:
+        _commands.invalidate_skill_commands()
+    return json.dumps({"ok": ok, "message": message}, ensure_ascii=False)
+
+
+registry.register(name="skills_browse", toolset="skills", schema=SKILLS_BROWSE_SCHEMA,
+                  handler=_handle_skills_browse, check_fn=lambda: True, emoji="🌐")
+registry.register(name="skills_install", toolset="skills", schema=SKILLS_INSTALL_SCHEMA,
+                  handler=_handle_skills_install, check_fn=lambda: True, emoji="📦")
+registry.register(name="skills_uninstall", toolset="skills", schema=SKILLS_UNINSTALL_SCHEMA,
+                  handler=_handle_skills_uninstall, check_fn=lambda: True, emoji="🗑️")

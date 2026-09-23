@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import threading
+import time
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -747,6 +748,188 @@ def check_command_approval(command: str) -> Dict[str, Any]:
 def is_session_approve(pattern_key: str) -> bool:
     """检查模式是否在会话白名单中（别名兼容）。"""
     return is_session_approved(pattern_key)
+
+
+# ============================================================================
+# 交互式审批回调（线程局部，参考 Hermes terminal_tool.set_approval_callback）
+# ============================================================================
+#
+# CLI / 桌宠等交互式前端可注册一个回调，在危险命令执行前征求用户意见。
+# 回调签名: callback(command: str, description: str, pattern_key: str) -> decision
+#   decision ∈ {"deny", "session", "always"}，也接受 bool（True=session）。
+#
+# 存储分两层（get 时线程局部优先、回退全局）：
+#   - 全局：CLI / 桌宠单一 agent 场景。工具可能在 ThreadPoolExecutor
+#     工作线程执行（execute_tool_calls_concurrent 不传播上下文），
+#     故全局回调才能跨线程可见。
+#   - 线程局部：为未来并发会话隔离（ACP 风格）预留的每线程覆盖。
+
+_approval_callback_tls = threading.local()
+_approval_callback_global: Optional[Any] = None
+
+
+def set_approval_callback(cb: Optional[Any], *, scope: str = "global") -> None:
+    """注册危险命令审批回调。
+
+    Args:
+        cb: 回调函数，签名 (command, description, pattern_key) -> decision。
+            传 None 清除回调。
+        scope: "global"（默认，所有线程可见）或 "thread"（仅当前线程）。
+    """
+    global _approval_callback_global
+    if scope == "thread":
+        _approval_callback_tls.approval = cb
+    else:
+        _approval_callback_global = cb
+
+
+def get_approval_callback() -> Optional[Any]:
+    """返回当前生效的审批回调：线程局部优先，回退到全局（都无则 None）。"""
+    cb = getattr(_approval_callback_tls, "approval", None)
+    if cb is not None:
+        return cb
+    return _approval_callback_global
+
+
+def clear_approval_callback() -> None:
+    """清除当前线程与全局的审批回调。"""
+    global _approval_callback_global
+    _approval_callback_tls.approval = None
+    _approval_callback_global = None
+
+
+def normalize_approval_decision(decision: Any) -> str:
+    """将回调返回值规范化为 deny / session / always。
+
+    宽容解析：bool、常见英文/单字母缩写、中文都映射到三态之一，
+    无法识别时保守返回 deny（fail-safe）。
+    """
+    if isinstance(decision, bool):
+        return "session" if decision else "deny"
+    if isinstance(decision, str):
+        d = decision.strip().lower()
+        if d in ("always", "permanent", "forever", "a", "always-allow"):
+            return "always"
+        if d in ("session", "yes", "y", "allow", "approve", "approved", "ok", "true", "1"):
+            return "session"
+        if d in ("", "deny", "denied", "no", "n", "reject", "rejected", "false", "0", "cancel"):
+            return "deny"
+        # 中文决策
+        stripped = decision.strip()
+        if stripped in ("总是", "永久", "一直允许"):
+            return "always"
+        if stripped in ("允许", "批准", "是", "本次", "会话"):
+            return "session"
+        if stripped in ("拒绝", "否", "取消"):
+            return "deny"
+    return "deny"
+
+
+# ============================================================================
+# 命令执行审批门禁（terminal 工具入口）
+# ============================================================================
+
+def request_command_approval(command: str, *, force: bool = False) -> Dict[str, Any]:
+    """命令执行前的统一审批门禁 —— terminal 工具在跑命令前调用。
+
+    在 :func:`check_command_approval` 的静态裁决之上叠加交互式审批回调：
+
+    - ``force=True``：用户已预确认，直接放行。
+    - 静态裁决已放行（YOLO / off / 白名单 / 无危险）：原样返回。
+    - HARDLINE / 用户 deny / sudo stdin：无条件阻止（不可绕过，不提示）。
+    - 需要用户审批（requires_user_approval）：
+        - 有回调 → 征求用户意见，按 deny/session/always 处理并持久化；
+        - 无回调 → fail-safe 阻止，消息说明如何放行。
+
+    Returns:
+        dict，在 check_command_approval 结果基础上补充：
+        - ``user_approved``: bool，是否经用户交互批准
+        - ``status``: "denied" / "blocked_no_callback" / "blocked_callback_error"
+          （仅在未批准且需要审批时出现）
+    """
+    if force:
+        return {
+            "approved": True,
+            "message": "force=True：用户已预确认，跳过审批。",
+            "pattern_key": None,
+            "requires_user_approval": False,
+            "user_approved": True,
+        }
+
+    result = check_command_approval(command)
+
+    # 已放行 → 原样返回
+    if result.get("approved"):
+        return result
+
+    # 不可绕过的阻止（HARDLINE / 用户 deny / sudo stdin）→ 不提示，直接返回
+    if not result.get("requires_user_approval"):
+        return result
+
+    # 需要用户审批
+    pattern_key = result.get("pattern_key") or ""
+    description = pattern_key or "dangerous command"
+    callback = get_approval_callback()
+
+    if callback is None:
+        # 无回调：fail-safe 阻止（危险命令绝不在无人确认时静默执行）
+        base_msg = result.get("message", "")
+        return {
+            "approved": False,
+            "message": (
+                f"{base_msg} 当前无交互式审批回调，已阻止执行。"
+                "放行方式：注册审批回调（set_approval_callback）、"
+                "设置 SPIRIT_YOLO=1、approvals.mode=off，"
+                "或将该模式加入 approvals.command_allowlist。"
+            ),
+            "pattern_key": pattern_key,
+            "requires_user_approval": True,
+            "status": "blocked_no_callback",
+        }
+
+    # 调用回调征求用户意见
+    try:
+        decision = callback(command, description, pattern_key)
+    except Exception as exc:  # 回调异常 → fail-safe 阻止
+        logger.warning("审批回调执行异常，阻止命令: %s", exc)
+        return {
+            "approved": False,
+            "message": f"审批回调失败，已阻止执行: {exc}",
+            "pattern_key": pattern_key,
+            "requires_user_approval": True,
+            "status": "blocked_callback_error",
+        }
+
+    decision_str = normalize_approval_decision(decision)
+
+    if decision_str == "always":
+        add_permanent_approval(pattern_key)
+        return {
+            "approved": True,
+            "message": f"已永久批准（写入 config.yaml 白名单）: {description}",
+            "pattern_key": pattern_key,
+            "requires_user_approval": False,
+            "user_approved": True,
+        }
+
+    if decision_str == "session":
+        add_session_approval(pattern_key)
+        return {
+            "approved": True,
+            "message": f"本会话已批准: {description}",
+            "pattern_key": pattern_key,
+            "requires_user_approval": False,
+            "user_approved": True,
+        }
+
+    # deny
+    return {
+        "approved": False,
+        "message": f"用户拒绝执行该命令: {description}",
+        "pattern_key": pattern_key,
+        "requires_user_approval": True,
+        "status": "denied",
+    }
 
 
 # ============================================================================

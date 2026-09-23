@@ -72,3 +72,14 @@ test_tool_call_display.py
 # Local config (should use example)
 config.yaml
 spirit/config.yaml
+
+# SWE-bench 评测工作区（克隆的仓库树 + 镜像缓存，体积巨大且临时）
+# 忽略以防父仓库误跟踪，并为 collect_patch 防逃逸守卫做二次兑底
+benchmarks/swe/workspaces/
+
+# SWE-bench 评测脚手架与产物（预测/trace/日志/脚本）——本地评测用，不入发布仓库
+benchmarks/
+
+# 临时诊断脚本（一次性调试用）
+diag_*.py
+add_tool_call_removal.py

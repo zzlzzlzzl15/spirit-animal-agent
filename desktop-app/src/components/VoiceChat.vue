@@ -2,7 +2,15 @@
   <div class="panel voice-panel">
     <div class="panel-header">
       <span class="panel-title">🎤 语音问答</span>
-      <button class="panel-close" @click="$emit('close')">✕</button>
+      <div class="header-actions">
+        <button
+          class="voice-toggle"
+          :class="{ active: voiceOutput }"
+          :title="voiceOutput ? '语音播报：开' : '语音播报：关'"
+          @click="voiceOutput = !voiceOutput"
+        >{{ voiceOutput ? '🔊' : '🔇' }}</button>
+        <button class="panel-close" @click="$emit('close')">✕</button>
+      </div>
     </div>
     <div class="voice-body">
       <!-- 对话历史 -->
@@ -68,6 +76,10 @@ const processing = ref(false)
 const textInput = ref('')
 const historyRef = ref<HTMLElement>()
 const recordStatus = ref('')
+const voiceOutput = ref(true)
+
+// 当前播放的音频元素（用于打断上一段）
+let currentAudio: HTMLAudioElement | null = null
 
 // ── 浏览器录音 ──────────────────────────────────────────
 let mediaRecorder: MediaRecorder | null = null
@@ -169,6 +181,7 @@ async function chatWithAgent(text: string) {
         messages.value.push({ role: 'assistant', text: '错误: ' + result.error })
       } else if (result.response) {
         messages.value.push({ role: 'assistant', text: result.response })
+        await speakResponse(result.response)
       } else {
         messages.value.push({ role: 'assistant', text: '(无响应)' })
       }
@@ -187,6 +200,27 @@ function scrollToBottom() {
       historyRef.value.scrollTop = historyRef.value.scrollHeight
     }
   })
+}
+
+// ── 语音播报（TTS）──────────────────────────
+async function speakResponse(text: string) {
+  if (!voiceOutput.value || !text || !wsSend) return
+  try {
+    const result = await wsSend('synthesize_speech', { text })
+    if (result.error || !result.audio_base64) return
+    const mime = result.format === 'wav' ? 'audio/wav' : 'audio/mpeg'
+    const dataUrl = `data:${mime};base64,${result.audio_base64}`
+    // 打断上一段播放
+    if (currentAudio) {
+      currentAudio.pause()
+      currentAudio = null
+    }
+    currentAudio = new Audio(dataUrl)
+    await currentAudio.play()
+  } catch (err: any) {
+    // 播放失败静默处理（不影响文字对话）
+    console.warn('语音播报失败:', err?.message || err)
+  }
 }
 </script>
 
@@ -242,6 +276,29 @@ function scrollToBottom() {
 .panel-close:hover {
   color: #fff;
   background: rgba(255, 255, 255, 0.1);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.voice-toggle {
+  background: none;
+  border: none;
+  color: #666;
+  cursor: pointer;
+  font-size: 15px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  line-height: 1;
+}
+.voice-toggle:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+.voice-toggle.active {
+  color: #ff8c32;
 }
 
 .voice-body {

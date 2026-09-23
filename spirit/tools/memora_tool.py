@@ -86,7 +86,7 @@ def _knowledge_search_impl(query: str, limit: int = 5) -> str:
         if not await client.health_check():
             return json.dumps({
                 "error": "知识库服务不可用",
-                "hint": "请确认 Memora 服务正在运行 (默认端口 8080)",
+                "hint": "请确认 Memora 服务正在运行 (默认端口 8000)",
             }, ensure_ascii=False)
         results = await client.search(query, limit=limit)
         return json.dumps({

@@ -393,10 +393,17 @@ class WSServer:
                 return {"error": "缺少 message 参数"}
             if self.agent is None:
                 return {"error": "Agent 未连接"}
-            
-            # 从配置读取超时时间（默认 300 秒 = 5 分钟）
+
+            # 新对话开始前清除历史中断标志：上一轮超时/中断留下的
+            # _interrupt_requested 若不清除，conversation_loop 会在本轮
+            # 开头立即返回 "[已中断]"，表现为 Agent 假死——之后每条
+            # 消息都秒回 [已中断]，看起来像崩溃。
+            self.agent.clear_interrupt()
+
+            # 从配置读取超时时间（默认 1800 秒 = 30 分钟；
+            # 多工具聚合的长任务 5 分钟远远不够，过早超时会误杀正常任务）
             from spirit.config import get_config_value
-            chat_timeout = get_config_value("timeouts.chat_request", 300.0)
+            chat_timeout = get_config_value("timeouts.chat_request", 1800.0)
             
             try:
                 # 注册临时回调用于进度推送
@@ -569,6 +576,95 @@ class WSServer:
                 return {"error": str(exc)}
         reg("transcribe_audio", cmd_transcribe_audio)
 
+        async def cmd_synthesize_speech(client, data):
+            """语音合成（TTS）：接收文本，返回 base64 音频供前端播放。"""
+            text = data.get("text", "")
+            if not text or not text.strip():
+                return {"error": "缺少 text 参数"}
+            try:
+                # 延迟初始化语音引擎
+                if self._voice_engine is None:
+                    self._voice_engine = VoiceEngine(VoiceConfig.from_env())
+                result = await self._voice_engine.synthesize(text)
+                if result.error:
+                    return {"error": result.error}
+                if not result.is_success:
+                    return {"error": "语音合成失败（无音频数据）"}
+                return {
+                    "audio_base64": base64.b64encode(result.audio_data).decode("ascii"),
+                    "format": result.format,
+                    "voice": result.voice,
+                    "duration_ms": result.duration_ms,
+                }
+            except Exception as exc:
+                logger.warning("语音合成失败: %s", exc)
+                return {"error": str(exc)}
+        reg("synthesize_speech", cmd_synthesize_speech)
+
+        async def cmd_voice_backends(client, data):
+            """返回可用的语音后端（STT/TTS）供前端展示。"""
+            try:
+                if self._voice_engine is None:
+                    self._voice_engine = VoiceEngine(VoiceConfig.from_env())
+                return {"backends": self._voice_engine.get_available_backends()}
+            except Exception as exc:
+                return {"backends": {"stt": [], "tts": []}, "error": str(exc)}
+        reg("voice_backends", cmd_voice_backends)
+
+        async def cmd_voice_chat(client, data):
+            """一站式语音问答：STT → Agent → TTS（listen_and_respond 全管线）。
+
+            等价于 transcribe_audio + chat + synthesize_speech 三段式的单命令版本，
+            适合唤醒词常驻监听等场景：前端一次往返即可拿到文本与语音回复。
+            """
+            audio_b64 = data.get("audio_base64", "")
+            if not audio_b64:
+                return {"error": "缺少 audio_base64 参数"}
+            try:
+                audio_bytes = base64.b64decode(audio_b64)
+            except Exception as exc:
+                return {"error": f"音频解码失败: {exc}"}
+
+            try:
+                if self._voice_engine is None:
+                    self._voice_engine = VoiceEngine(VoiceConfig.from_env())
+
+                # 注入 Agent 对话回调（同步 chat 放线程池，避免阻塞事件循环）
+                agent_chat = None
+                if self.agent is not None:
+                    loop = asyncio.get_running_loop()
+
+                    async def agent_chat(text: str) -> str:
+                        result = await loop.run_in_executor(None, self.agent.chat, text)
+                        if isinstance(result, dict):
+                            return result.get("response", "")
+                        return str(result or "")
+
+                from spirit.config import get_config_value
+                timeout = get_config_value("timeouts.chat_request", 300.0)
+                out = await asyncio.wait_for(
+                    self._voice_engine.listen_and_respond(audio_bytes, agent_chat=agent_chat),
+                    timeout=timeout,
+                )
+
+                payload = {
+                    "text": out.get("text", ""),
+                    "response": out.get("response", ""),
+                    "error": out.get("error", ""),
+                }
+                audio = out.get("audio") or b""
+                if audio:
+                    payload["audio_base64"] = base64.b64encode(audio).decode("ascii")
+                    payload["format"] = out.get("format", "")
+                return payload
+            except asyncio.TimeoutError:
+                logger.warning("语音问答超时")
+                return {"error": "语音问答超时，已中断处理", "timeout": True}
+            except Exception as exc:
+                logger.warning("语音问答失败: %s", exc)
+                return {"error": str(exc)}
+        reg("voice_chat", cmd_voice_chat)
+
         # ── 状态控制 ──────────────────────────────────────────
 
         async def cmd_set_state(client, data):
@@ -730,6 +826,166 @@ class WSServer:
                 return {"error": str(exc)}
         reg("compress_context", cmd_compress_context)
 
+        # ── 目标系统（Ralph Loop — 持久目标自主循环，Phase 4）──────
+
+        async def cmd_goal(client, data):
+            """目标状态管理（不驱动循环，立即返回）。
+
+            data: {"args": "</goal 之后的整段参数>"}，如 "status" / "pause" /
+            "Migrate auth to JWT"。设完/恢复目标时结果带 ``kick_off``，前端可据此
+            发下一条 chat 或调 ``goal_run`` 驱动自主循环。
+            """
+            if self.agent is None:
+                return {"ok": False, "error": "Agent 未连接"}
+            try:
+                from spirit.goals import handle_goal_command
+                args = data.get("args", "") or data.get("command", "")
+                return handle_goal_command(self.agent, args)
+            except Exception as exc:
+                logger.warning("goal 命令失败: %s", exc)
+                return {"ok": False, "error": str(exc)}
+        reg("goal", cmd_goal)
+
+        async def cmd_subgoal(client, data):
+            """子目标管理。data: {"args": "<text> | remove <n> | clear"}。"""
+            if self.agent is None:
+                return {"ok": False, "error": "Agent 未连接"}
+            try:
+                from spirit.goals import handle_subgoal_command
+                args = data.get("args", "") or data.get("command", "")
+                return handle_subgoal_command(self.agent, args)
+            except Exception as exc:
+                logger.warning("subgoal 命令失败: %s", exc)
+                return {"ok": False, "error": str(exc)}
+        reg("subgoal", cmd_subgoal)
+
+        async def cmd_moa(client, data):
+            """MoA（Mixture of Agents）预设管理 + 一次性 prompt。
+
+            data: {"args": "</moa 之后的整段参数>"}，如 "list" / "use review" /
+            "off" / "帮我审这段代码"（一次性）。list/use/off 为纯状态流转；一次性
+            模式会阻塞跑一轮 MoA（多参考 + 聚合器），故在 executor 中运行（与
+            cmd_goal_run 同构），不卡事件循环。结果 dict 带 ok/action/message/lines/
+            status_line/response（一次性），前端自行渲染。
+            """
+            if self.agent is None:
+                return {"ok": False, "error": "Agent 未连接"}
+            from spirit.config import get_config_value
+
+            args = data.get("args", "") or data.get("command", "")
+            loop = asyncio.get_event_loop()
+
+            def _run():
+                from spirit.moa import handle_moa_command
+                return handle_moa_command(self.agent, args)
+
+            timeout = float(get_config_value("timeouts.chat_request", 300.0))
+            try:
+                future = loop.run_in_executor(None, _run)
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("moa 命令超时 (%.0f 秒)，中断 Agent", timeout)
+                if self.agent:
+                    self.agent.interrupt()
+                return {"ok": False, "error": f"MoA 命令超时（{timeout:.0f} 秒），已中断", "timeout": True}
+            except Exception as exc:
+                logger.warning("moa 命令失败: %s", exc)
+                return {"ok": False, "error": str(exc)}
+        reg("moa", cmd_moa)
+
+        async def cmd_skill(client, data):
+            """技能中心管理（/skill 子命令）。
+
+            data: {"args": "</skill 之后的整段参数>"}，如 "list" / "reload" /
+            "browse <query>" / "install <id>" / "uninstall <name>" / "scan [name]" /
+            "bundles" / "info <name>" / "audit"。多为本地快速操作；install 可能触网，
+            故在 executor 中运行，不卡事件循环。结果 dict 带 ok/action/message/lines/
+            status_line，前端自行渲染。技能调用（/<skill-name>）走 chat 路径，不在此。
+            """
+            args = data.get("args", "") or data.get("command", "")
+            loop = asyncio.get_event_loop()
+
+            def _run():
+                from spirit.skills_hub import handle_skill_command
+                return handle_skill_command(self.agent, args)
+
+            from spirit.config import get_config_value
+            timeout = float(get_config_value("timeouts.chat_request", 300.0))
+            try:
+                future = loop.run_in_executor(None, _run)
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("skill 命令超时 (%.0f 秒)", timeout)
+                return {"ok": False, "error": f"技能命令超时（{timeout:.0f} 秒）", "timeout": True}
+            except Exception as exc:
+                logger.warning("skill 命令失败: %s", exc)
+                return {"ok": False, "error": str(exc)}
+        reg("skill", cmd_skill)
+
+        async def cmd_goal_run(client, data):
+            """驱动 Ralph Loop：跑第一轮 + 自主续传直到 done/paused/waiting/预算耗尽。
+
+            data: {"input": "<触发轮输入，缺省用当前目标文本>"}。每轮响应通过
+            ``goal_turn`` 事件实时广播；循环结束后返回 outcome 汇总。在 executor 中
+            运行（阻塞式 agent.chat），与 cmd_chat 同构，不卡事件循环。
+            """
+            if self.agent is None:
+                return {"ok": False, "error": "Agent 未连接"}
+            from spirit.config import get_config_value
+            # 目标循环可能跑很多轮 —— 用 chat 超时 × 预算上限作为总兜底。
+            per_turn = float(get_config_value("timeouts.chat_request", 300.0))
+            budget = int(get_config_value("goals.max_turns", 20))
+            total_timeout = per_turn * max(1, budget)
+
+            loop = asyncio.get_event_loop()
+
+            def _broadcast_turn(text, idx):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        client.send_event("goal_turn", {"turn": idx, "response": text}), loop
+                    )
+                except Exception:
+                    pass
+
+            def _broadcast_decision(decision):
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        client.send_event("goal_decision", {
+                            "verdict": decision.get("verdict", ""),
+                            "status": decision.get("status", ""),
+                            "message": decision.get("message", ""),
+                        }), loop
+                    )
+                except Exception:
+                    pass
+
+            def _drive():
+                from spirit.goals import run_goal_turn_loop
+                first_input = data.get("input", "")
+                if not first_input:
+                    mgr = getattr(self.agent, "goal_manager", None)
+                    first_input = mgr.state.goal if (mgr and mgr.state) else ""
+                return run_goal_turn_loop(
+                    self.agent,
+                    first_input,
+                    on_turn=_broadcast_turn,
+                    on_decision=_broadcast_decision,
+                )
+
+            try:
+                future = loop.run_in_executor(None, _drive)
+                result = await asyncio.wait_for(future, timeout=total_timeout)
+                return {"ok": True, **result}
+            except asyncio.TimeoutError:
+                logger.warning("goal_run 超时 (%.0f 秒)，中断 Agent", total_timeout)
+                if self.agent:
+                    self.agent.interrupt()
+                return {"ok": False, "error": f"目标循环超时（{total_timeout:.0f} 秒），已中断", "timeout": True}
+            except Exception as exc:
+                logger.warning("goal_run 失败: %s", exc)
+                return {"ok": False, "error": str(exc)}
+        reg("goal_run", cmd_goal_run)
+
         # ── 工具与信息 ────────────────────────────────────────
 
         async def cmd_list_tools(client, data):
@@ -750,7 +1006,7 @@ class WSServer:
             import sys
             import platform
             return {
-                "version": "0.0.2",
+                "version": "0.1.0",
                 "python": platform.python_version(),
                 "platform": platform.system(),
                 "arch": platform.machine(),

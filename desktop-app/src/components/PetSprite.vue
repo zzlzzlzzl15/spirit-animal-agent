@@ -126,7 +126,9 @@ function renderFrame() {
 
   // 在离屏画布上绘制
   ensureOffscreen(w, h)
-  if (!offCtx) return
+  // 局部引用便于 TS 收窄类型（模块级 let 无法保证非空）
+  const buffer = offscreen
+  if (!offCtx || !buffer) return
 
   offCtx.clearRect(0, 0, w, h)
 
@@ -140,7 +142,7 @@ function renderFrame() {
 
   // 一次性拷贝到主画布（减少闪烁）
   ctx.clearRect(0, 0, w, h)
-  ctx.drawImage(offscreen, 0, 0)
+  ctx.drawImage(buffer, 0, 0)
 }
 
 // 渲染循环
