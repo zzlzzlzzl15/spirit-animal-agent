@@ -365,8 +365,8 @@ export function createStatusWindow(petBounds: { x: number; y: number; w: number;
     statusWindow.close()
   }
 
-  const popupW = 220
-  const popupH = 230
+  const popupW = 240
+  const popupH = 276
   const gap = 8
   
   // 智能定位：宠物在屏幕右半 → 弹窗在左边；否则在右边

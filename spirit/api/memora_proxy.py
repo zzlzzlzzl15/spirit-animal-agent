@@ -49,6 +49,7 @@ def create_memora_router(memora_base_url: str = None) -> APIRouter:
                 base_url=target_base,
                 timeout=httpx.Timeout(30.0, connect=5.0),
                 follow_redirects=True,
+                trust_env=False,  # 关键：忽略系统代理（Clash/V2Ray 等），避免劫持到代理端口
             )
         return _client
 

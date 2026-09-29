@@ -85,13 +85,19 @@ class MemoraClient:
         self._available: Optional[bool] = None
 
     async def _get_client(self):
-        """获取或创建 httpx 客户端（延迟初始化）。"""
+        """获取或创建 httpx 客户端（延迟初始化）。
+
+        注意：必须显式 `trust_env=False`，否则在 Windows 上 httpx 会从
+        系统注册表读取 Clash/V2Ray 写入的代理 (例如 127.0.0.1:7890)，
+        把请求劫持到代理端口，导致本地 Memora (8000) 无法连通。
+        """
         if self._client is None:
             try:
                 import httpx
                 self._client = httpx.AsyncClient(
                     timeout=httpx.Timeout(30.0, connect=5.0),
                     follow_redirects=True,
+                    trust_env=False,  # 关键：忽略系统代理环境与 Windows 注册表代理
                 )
             except ImportError:
                 # httpx 不可用时回退到 urllib

@@ -5,6 +5,16 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
 
+export interface ProviderUsage {
+  name: string
+  available: boolean
+  window?: string
+  used_percent?: number
+  weekly_used_percent?: number
+  reset_seconds?: number
+  reason?: string
+}
+
 export interface AgentStatus {
   running: boolean
   model: string
@@ -13,6 +23,8 @@ export interface AgentStatus {
   message_count: number
   tool_count: number
   api_call_count: number
+  session_started_at: number
+  usage: { ts: number; providers: ProviderUsage[] } | null
 }
 
 export interface SystemMetrics {
@@ -30,6 +42,8 @@ export const useStatusStore = defineStore('status', () => {
     message_count: 0,
     tool_count: 0,
     api_call_count: 0,
+    session_started_at: 0,
+    usage: null,
   })
 
   const systemMetrics = ref<SystemMetrics>({
@@ -39,8 +53,15 @@ export const useStatusStore = defineStore('status', () => {
   })
 
   function syncFromServer(data: any) {
-    if (data.agent) {
-      agentStatus.value = { ...agentStatus.value, ...data.agent }
+    // 服务端 Agent 字段是扁平合并在顶层的（get_status / init 同一真相源），
+    // 同时兼容旧的嵌套 data.agent 形态
+    const flat: Partial<AgentStatus> = {}
+    for (const k of ['running', 'model', 'provider', 'session_id', 'message_count', 'tool_count', 'api_call_count', 'session_started_at', 'usage'] as const) {
+      if (k in data) (flat as any)[k] = data[k]
+    }
+    if (data.agent) Object.assign(flat, data.agent)
+    if (Object.keys(flat).length) {
+      agentStatus.value = { ...agentStatus.value, ...flat }
     }
     if (data.cpu) {
       systemMetrics.value.cpu = { ...systemMetrics.value.cpu, ...data.cpu }

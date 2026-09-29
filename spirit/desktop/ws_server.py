@@ -19,6 +19,8 @@ import base64
 import json
 import logging
 import time
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Optional, Set
 
 from spirit.desktop.pet_engine import PetEngine
@@ -34,6 +36,70 @@ _RESUME_CONTINUATION_PROMPT = (
     "请查看上面的对话历史，定位你中断在哪个步骤，从该处继续完成剩余工作："
     "不要重做已完成的步骤，不要复述背景，不要向我确认，直接执行并给出最终结论。"
 )
+
+# ---------------------------------------------------------------------------
+# Provider 订阅用量查询（状态弹窗「5h 额度」行）
+# ---------------------------------------------------------------------------
+
+_USAGE_HTTP_TIMEOUT = 8.0
+_USAGE_CACHE_TTL = 60.0  # 秒；弹窗每次打开会强制刷新，TTL 只挡 init/重连的高频调用
+
+
+def _fetch_minimax_usage(name: str, base_url: str, api_key: str) -> Dict[str, Any]:
+    """MiniMax Token Plan 官方用量接口 GET {host}/v1/token_plan/remains。
+
+    取 model_remains 里 5h 固定窗口条目（end-start==5h），返回已用百分比与
+    重置倒计时；有次数字段时优先用次数算，否则用 remaining_percent 反推。
+    """
+    root = (base_url or "").rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    req = urllib.request.Request(root + "/v1/token_plan/remains", headers={
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": "application/json",
+        "User-Agent": "spirit-agent/usage",
+    })
+    with urllib.request.urlopen(req, timeout=_USAGE_HTTP_TIMEOUT) as resp:
+        payload = json.loads(resp.read().decode("utf-8", "replace"))
+    entries = payload.get("model_remains") or []
+    if not entries:
+        return {"name": name, "available": False, "reason": "接口无额度记录"}
+    pick = next(
+        (e for e in entries if (e.get("end_time", 0) - e.get("start_time", 0)) == 18_000_000),
+        entries[0],
+    )
+    total = float(pick.get("current_interval_total_count") or 0)
+    used_cnt = float(pick.get("current_interval_usage_count") or 0)
+    if total > 0:
+        used_pct = round(used_cnt / total * 100)
+    else:
+        used_pct = 100 - int(pick.get("current_interval_remaining_percent") or 0)
+    return {
+        "name": name,
+        "available": True,
+        "source": "api",
+        "window": "5h",
+        "used_percent": used_pct,
+        "weekly_used_percent": 100 - int(pick.get("current_weekly_remaining_percent") or 0),
+        "reset_seconds": max(0, int((pick.get("remains_time") or 0) // 1000)),
+    }
+
+
+def _fetch_provider_usage(name: str, provider: str, base_url: str, api_key: str) -> Optional[Dict[str, Any]]:
+    """按 base_url / key 前缀分派订阅用量适配器；无适配器的 provider 返回 None。"""
+    base = (base_url or "").lower()
+    if "minimaxi.com" in base or api_key.startswith("sk-cp-"):
+        try:
+            return _fetch_minimax_usage(name, base_url, api_key)
+        except Exception as e:
+            # 网络/鉴权失败降级为不可用，不影响弹窗其余行
+            return {"name": name, "available": False, "reason": "查询失败: %s" % type(e).__name__}
+    if "maas.aliyuncs.com" in base or api_key.startswith("sk-sp-"):
+        # 阿里云 Token Plan 个人版是月度 Credits 限额（无 5h/周窗口），
+        # 官方无 key 级查询 API（OpenAPI 需 AK/SK 签名），如实标注
+        return {"name": name, "available": False, "window": "month",
+                "reason": "月度Credits·控制台查"}
+    return None
 
 # 尝试导入 websockets（可选依赖）
 try:
@@ -158,6 +224,13 @@ class WSServer:
         # 服务器引用
         self._server = None
         self._running = False
+        # 进行中的 chat 任务数（前端空闲/运行中判定用，见 _status_with_agent）
+        self._active_chats = 0
+        # provider 用量查询缓存（弹窗每次打开强制刷新；TTL 挡 init/重连高频调用）
+        self._usage_cache: Dict[str, Any] = {"ts": 0.0, "providers": []}
+        # 会话起始时间（弹窗会话行显示 开始时刻+历时，不裸显 UUID）
+        self._session_track_id: Optional[str] = None
+        self._session_started_at: float = 0.0
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -226,8 +299,9 @@ class WSServer:
         logger.info("客户端已连接: %s (总计: %d)", client.id, len(self._clients))
 
         try:
-            # 发送初始状态同步
-            await client.send_event("init", self.engine.get_full_status())
+            # 发送初始状态同步（含 Agent 字段：状态弹窗等页面
+            # 只消费 init 就能拿到真实数据，不必再发 get_status）
+            await client.send_event("init", self._status_with_agent())
 
             # 消息循环
             async for raw in ws:
@@ -298,6 +372,85 @@ class WSServer:
     # 内置命令
     # ------------------------------------------------------------------
 
+    def _usage_targets(self) -> list:
+        """去重后的待查询 provider 列表：当前生效配置 + failover 候选。"""
+        targets = []
+        seen = set()
+        cfg = getattr(self.agent, "config", None) if self.agent is not None else None
+        if cfg is not None and getattr(cfg, "api_key", ""):
+            base = (getattr(cfg, "base_url", "") or "").rstrip("/")
+            seen.add((base, (cfg.api_key or "")[:12]))
+            targets.append((getattr(cfg, "model", "") or "current",
+                            getattr(cfg, "provider", "") or "", base, cfg.api_key))
+        # failover 列表要走 llm_pool.load_providers()（解析用户 YAML）；
+        # get_config_value 只读 DEFAULT_CONFIG，拿不到用户配置的 providers
+        from spirit.llm_pool import load_providers
+        for entry in load_providers():
+            key = entry.get("api_key") or ""
+            base = (entry.get("base_url") or "").rstrip("/")
+            if not key or (base, key[:12]) in seen:
+                continue
+            seen.add((base, key[:12]))
+            targets.append((entry.get("name") or entry.get("model") or "provider",
+                            entry.get("provider") or "", base, key))
+        return targets
+
+    def _usage_sync(self, force: bool = False) -> Dict[str, Any]:
+        """并行查询各 provider 订阅用量（同步版，跑在线程池里）。"""
+        now = time.time()
+        if not force and now - self._usage_cache["ts"] < _USAGE_CACHE_TTL:
+            return self._usage_cache
+        providers = []
+        targets = self._usage_targets()
+        if targets:
+            with ThreadPoolExecutor(max_workers=min(4, len(targets))) as ex:
+                for out in ex.map(lambda t: _fetch_provider_usage(*t), targets):
+                    if out:
+                        providers.append(out)
+        self._usage_cache = {"ts": now, "providers": providers}
+        return self._usage_cache
+
+    def _kick_usage_refresh(self) -> None:
+        """缓存过期时后台刷新（不阻塞调用方，init/get_status 先拿旧值）。"""
+        if time.time() - self._usage_cache["ts"] < _USAGE_CACHE_TTL:
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.run_in_executor(None, self._usage_sync, False)
+        except RuntimeError:
+            pass
+
+    def _status_with_agent(self) -> Dict[str, Any]:
+        """PetEngine 全量状态 + Agent 运行字段（扁平合并）。
+
+        get_status 命令与 init 事件推送的单一真相源；running 不再是
+        "agent 活着就 True"，而是"是否有进行中的 chat 任务"，
+        避免前端空闲时仍显示运行中。
+        """
+        result = self.engine.get_full_status()
+        if self.agent is not None:
+            result.update(self.agent.get_status())
+            result["running"] = self._active_chats > 0
+            # 会话行显示 开始时刻+历时：session_id 变化时记起始点
+            sid = result.get("session_id")
+            if sid != self._session_track_id:
+                self._session_track_id = sid
+                self._session_started_at = time.time()
+            result["session_started_at"] = self._session_started_at
+        else:
+            result["model"] = ""
+            result["provider"] = ""
+            result["session_id"] = ""
+            result["message_count"] = 0
+            result["tool_count"] = 0
+            result["api_call_count"] = 0
+            result["running"] = False
+            result["session_started_at"] = 0.0
+        result["usage"] = self._usage_cache
+        self._kick_usage_refresh()
+        return result
+
     def _register_builtin_commands(self) -> None:
         """注册内置命令。"""
         reg = self.commands.register
@@ -306,22 +459,14 @@ class WSServer:
 
         async def cmd_get_status(client, data):
             """获取完整状态（PetEngine + Agent）。"""
-            result = self.engine.get_full_status()
-            # 补充 Agent 信息
-            if self.agent is not None:
-                agent_status = self.agent.get_status()
-                result.update(agent_status)
-                result["running"] = True
-            else:
-                result["model"] = ""
-                result["provider"] = ""
-                result["session_id"] = ""
-                result["message_count"] = 0
-                result["tool_count"] = 0
-                result["api_call_count"] = 0
-                result["running"] = False
-            return result
+            return self._status_with_agent()
         reg("get_status", cmd_get_status)
+
+        async def cmd_get_usage(client, data):
+            """provider 订阅用量（强制重查官方接口；弹窗每次打开拉最新）。"""
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, self._usage_sync, True)
+        reg("get_usage", cmd_get_usage)
 
         async def cmd_get_pet_info(client, data):
             return self.engine.get_pet_info()
@@ -419,6 +564,7 @@ class WSServer:
             resume_grace = float(get_config_value("chat.resume_grace_seconds", 120))
             
             try:
+                self._active_chats += 1  # 计入在跑任务，running=True
                 # 注册临时回调用于进度推送
                 original_on_tool_start = self.agent.on_tool_start
                 original_on_tool_complete = self.agent.on_tool_complete
@@ -619,6 +765,7 @@ class WSServer:
                 # 恢复原始回调（覆盖正常/超时续跑封顶/异常全部退出路径）
                 self.agent.on_tool_start = original_on_tool_start
                 self.agent.on_tool_complete = original_on_tool_complete
+                self._active_chats -= 1
         reg("chat", cmd_chat)
 
         async def cmd_transcribe_audio(client, data):

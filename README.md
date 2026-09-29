@@ -1,6 +1,6 @@
 # Spirit Agent — 桌宠形态的本地 AI Agent
 
-> v0.2.0 · Electron 桌面宠物 + Python Agent 后端 + 交互式 CLI 终端
+> v0.2.1 · Electron 桌面宠物 + Python Agent 后端 + 交互式 CLI 终端
 > 对话循环架构对标 [Hermes Agent](https://github.com/zzlzzlzzl15/spirit-animal-agent/tree/master) v0.18.2：单主循环 + 迭代预算 + 分支化响应处理。
 
 Spirit Agent 是一只住在你桌面上的小狐狸：它既是**桌面宠物**（会动、会说话、会感知 Agent 工作状态），也是一个**完整的本地 AI Agent**（工具调用、多轮循环、流式输出、知识库、语音）。所有能力通过一个 WebSocket 桥接层对多表面（桌宠窗口 / CLI 终端 / VSCode 扩展）统一开放。
@@ -136,7 +136,16 @@ python e2e_ws_event_test.py    # WS 事件层：tool_start/complete + stream_del
 
 ## 五、版本记录
 
-### v0.2.0（当前）
+### v0.2.1（当前）
+
+- **CLI 运行可见性**：状态栏常驻 spinner + 阶段（思考/执行/输出）+ 每步计时；工具完成行带 `✓ 完成 (X.Xs)` 每步耗时。
+- **输入修复**：Backspace 折行重复行（格数算物理行上移 + `\x1b[J` 清到屏末）；CJK/全角光标格数化。
+- **状态弹窗端到端修复**：`_status_with_agent()` 单一真相源（init 与 get_status 共用）；running = 进行中 chat 计数；storeToRefs 响应式修复 + 开窗主动拉取；会话行改 开始时刻+历时（不裸显 UUID）。
+- **订阅用量查询**：新增 `get_usage` 命令并行查各家官方接口；MiniMax Token Plan 5h 窗口已用% + 重置倒计时；阿里云 Token Plan 如实标注月度 Credits（官方无 key 级查询 API）。
+- **Memora 防代理劫持**：httpx 客户端 `trust_env=False`，避免系统代理劫持本地 8000 连接。
+- 版本号全仓对齐 0.2.1。
+
+### v0.2.0
 
 - **对话可靠性**：空结论自愈（收尾提示 + 兜底总结，杜绝静默结束）；截断自动续写；chat 超时 300s→800s 修正为 1800s + 超时自动续跑（≤3 轮、可见通知、`chat.*` 可配置）。
 - **跨 provider 模型切换**：`llm.failover.providers` fallback 链（Hermes 语义：零探活走链、turn 作用域恢复主家），超时/5xx/限流/计费等自动换"哪个能用用哪个"，切换对用户可见。

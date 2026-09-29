@@ -10,6 +10,9 @@
     </div>
     <div ref="terminalRef" class="terminal-container"></div>
     <div class="status-bar" v-if="statusInfo">
+      <span class="sb-run" v-if="runInfo.running">{{ runInfo.frame }} {{ runInfo.phase }} {{ runInfo.elapsed }}</span>
+      <span class="sb-idle" v-else>◌ 空闲</span>
+      <span class="sb-sep">│</span>
       <span class="sb-model">⚡ {{ statusInfo.model || '未连接' }}</span>
       <span class="sb-sep">│</span>
       <span class="sb-session">⏱ {{ statusInfo.duration }}</span>
@@ -64,6 +67,37 @@ function startDurationTimer() {
   durationTimer = setInterval(() => {
     statusInfo.duration = formatDuration(Date.now() - sessionStartTime)
   }, 1000)
+}
+
+// ── 运行指示（底部状态栏 spinner + 当前步骤计时）─────────────
+// 运行中底部状态栏不停转动（当前阶段 + 本步已耗时），空闲显示"空闲"，
+// 一眼可辨 Agent 是在干活还是停了。
+const runInfo = reactive({ running: false, phase: '', elapsed: '0.0s', frame: '⠋' })
+let runTimer: ReturnType<typeof setInterval> | null = null
+let runPhaseStart = 0
+let runFrameIdx = 0
+const pendingToolStarts: number[] = []  // tool_start 起始时间戳 FIFO，tool_complete 取出做每步计时
+
+function setRunning(phase: string) {
+  runInfo.running = true
+  runInfo.phase = phase
+  runPhaseStart = Date.now()
+  runInfo.elapsed = '0.0s'
+  if (runTimer) return
+  runTimer = setInterval(() => {
+    runFrameIdx = (runFrameIdx + 1) % SPINNER_FRAMES.length
+    runInfo.frame = SPINNER_FRAMES[runFrameIdx]
+    runInfo.elapsed = ((Date.now() - runPhaseStart) / 1000).toFixed(1) + 's'
+  }, 100)
+}
+
+function setIdle() {
+  runInfo.running = false
+  pendingToolStarts.length = 0
+  if (runTimer) {
+    clearInterval(runTimer)
+    runTimer = null
+  }
 }
 
 function wsConnect(): Promise<void> {
@@ -136,6 +170,8 @@ function handleEvent(msg: any) {
     case 'tool_start':
       // 工具开始执行 — 在终端显示进度（内联标注）
       toolEventCount++
+      pendingToolStarts.push(Date.now())
+      setRunning(`执行 ${data.tool}`)
       if (term && isStreaming) {
         flushMarkdown()  // 先flush未完成行，避免标注插进半行中间
         term.write('\r\x1b[K')  // 清掉当前 spinner 行，避免标注接在 spinner 后面
@@ -145,14 +181,20 @@ function handleEvent(msg: any) {
           const preview = rawPreview.substring(0, 80)
           term.writeln(`\x1b[90m     参数: ${preview}${rawPreview.length > 80 ? '...' : ''}\x1b[0m`)
         }
+        startSpinner(`执行 ${data.tool}`)  // 工具执行期间也保持转动（带本步计时）
       }
       break
 
     case 'tool_complete':
+      // 每步计时：与 tool_start FIFO 配对，完成行显示本步耗时
+      const toolStart = pendingToolStarts.shift()
+      const toolDur = toolStart ? ` (${((Date.now() - toolStart) / 1000).toFixed(1)}s)` : ''
+      setRunning('思考中')
       if (term && isStreaming) {
         flushMarkdown()
         term.write('\r\x1b[K')
-        term.writeln(`\x1b[92m  ✓ ${data.tool} 完成\x1b[0m`)
+        term.writeln(`\x1b[92m  ✓ ${data.tool} 完成\x1b[0m\x1b[90m${toolDur}\x1b[0m`)
+        startSpinner('思考中')  // 到下一个事件（思考/等流）的空档继续转
       }
       break
 
@@ -165,6 +207,7 @@ function handleEvent(msg: any) {
         // 第一个 delta，停止 spinner 并换行到输出区域
         if (streamBuffer.length === data.text.length) {
           stopSpinner()
+          setRunning('输出中')  // 流式输出期间状态栏继续转
         }
         feedMarkdown(data.text)
       }
@@ -175,6 +218,7 @@ function handleEvent(msg: any) {
       // 最终文本优先由 stream_delta 实时渲染；若增量未送达（乱序/丢失），
       // 在这里用 chat_complete 携带的 response 兜底，保证结果绝不丢失。
       stopSpinner()
+      setIdle()
       console.log('[cli] chat_complete resp_len=', (data.response || '').length, 'streamBuffer=', streamBuffer.length, 'toolEvents=', toolEventCount)
       flushMarkdown()
 
@@ -766,6 +810,9 @@ function flushMarkdown() {
   }
 }
 
+// 提示符可见文本（"spirit ❯ "）占的终端格数 —— rewriteLine 折行行号计算用
+const PROMPT_CELLS = 9
+
 function printPrompt() {
   term!.write('\x1b[1;96mspirit\x1b[0m\x1b[90m ❯ \x1b[0m')
 }
@@ -789,11 +836,13 @@ async function sendChatMessage(message: string) {
   toolEventCount = 0
   finalRendered = false
   mdBuffer = ''
+  setRunning('思考中')
   startSpinner('思考中')
   try {
     const data = await wsSend('chat', { message }, 14400000)  // 4 小时看门狗：需覆盖后端单轮 30min ×(1+自动续跑 3)+宽限的总时长；后端真死时 WS 关闭会立即报错，不会干等
     // 清除 spinner
     stopSpinner()
+    setIdle()
     flushMarkdown()
     // 错误优先：超时/中断等终止原因必须可见，不得被流式缓冲分支吞掉
     // （旧顺序 if(streamBuffer) 优先 → 有流式文本时 error 永远不渲染，任务静默结束）
@@ -825,6 +874,7 @@ async function sendChatMessage(message: string) {
     stopSpinner()
     term!.writeln(`\x1b[91m  ✗ ${e.message}\x1b[0m`)
   }
+  setIdle()
   isStreaming = false
   streamBuffer = ''
   term!.writeln('')
@@ -1063,16 +1113,16 @@ onMounted(async () => {
         rewriteLine()
         return
       }
-      // Left arrow (D)
+      // 左箭头 (D) —— 按格数移动（CJK 占 2 格）
       if (seq === 'D' && cursorPos > 0) {
         cursorPos--
-        term!.write('\x1b[D')
+        term!.write('\x1b[' + cellWidth(inputBuffer[cursorPos]) + 'D')
         return
       }
-      // Right arrow (C)
+      // 右箭头 (C) —— 按格数移动（CJK 占 2 格）
       if (seq === 'C' && cursorPos < inputBuffer.length) {
+        term!.write('\x1b[' + cellWidth(inputBuffer[cursorPos]) + 'C')
         cursorPos++
-        term!.write('\x1b[C')
         return
       }
       // Home (H or 1)
@@ -1159,13 +1209,40 @@ onMounted(async () => {
   })
 })
 
+// 字符串的终端格宽（CJK/emoji/全角占 2 格）—— 光标移动与折行行号计算必须按格数而非字符数
+function cellWidth(s: string): number {
+  let w = 0
+  for (const ch of s) {
+    const c = ch.codePointAt(0)!
+    w += (c >= 0x1100 && (c <= 0x115f || c === 0x2329 || c === 0x232a ||
+      (c >= 0x2e80 && c <= 0xa4cf && c !== 0x303f) ||
+      (c >= 0xac00 && c <= 0xd7a3) ||
+      (c >= 0xf900 && c <= 0xfaff) ||
+      (c >= 0xfe30 && c <= 0xfe6f) ||
+      (c >= 0xff00 && c <= 0xff60) ||
+      (c >= 0xffe0 && c <= 0xffe6) ||
+      (c >= 0x1f300 && c <= 0x1f64f) ||
+      (c >= 0x1f900 && c <= 0x1f9ff) ||
+      (c >= 0x20000 && c <= 0x3fffd))) ? 2 : 1
+  }
+  return w
+}
+
 function rewriteLine() {
-  // 清除当前行并重新写入
-  term!.write('\r\x1b[K')
+  // 清除整条逻辑行（含折行续行）：先把光标移回逻辑行起始行，
+  // 再用 \x1b[J（清到屏末）一次性抹掉当前行及下方所有折行。
+  // 旧写法 \r\x1b[K 只清当前物理行——折行续行上的旧文本残留，
+  // 重绘后看起来像"多复制出一行"（Backspace/方向键历史最明显）。
+  const cols = term!.cols || 80
+  const beforeCells = PROMPT_CELLS + cellWidth(inputBuffer.slice(0, cursorPos))
+  const rowsUp = Math.floor(beforeCells / cols)
+  term!.write('\r')
+  if (rowsUp > 0) term!.write(`\x1b[${rowsUp}A`)
+  term!.write('\x1b[J')
   printPrompt()
   term!.write(inputBuffer)
-  // 回退光标到正确位置
-  const back = inputBuffer.length - cursorPos
+  // 回退光标到正确位置（按格数，CJK 占 2 格）
+  const back = cellWidth(inputBuffer.slice(cursorPos))
   if (back > 0) {
     term!.write('\x1b[' + back + 'D')
   }
@@ -1188,6 +1265,7 @@ onUnmounted(() => {
   ws?.close()
   term?.dispose()
   stopSpinner()
+  setIdle()
   if (durationTimer) clearInterval(durationTimer)
   window.removeEventListener('resize', () => fitAddon?.fit())
 })
@@ -1287,6 +1365,15 @@ html, body {
 
 .sb-sep {
   color: rgba(251, 146, 60, 0.3);
+}
+
+.sb-run {
+  color: #facc15;
+  font-weight: 600;
+}
+
+.sb-idle {
+  color: #666;
 }
 
 .sb-model {
