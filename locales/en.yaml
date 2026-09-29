@@ -1,0 +1,32 @@
+# Spirit Agent —— 英文 catalog（默认语言 / 回退源）
+# 点分 key 空间。新增 key 后请在 zh.yaml 等其它 catalog 补齐翻译。
+common:
+  ok: "OK"
+  cancel: "Cancel"
+  confirm: "Confirm"
+  yes: "Yes"
+  no: "No"
+  error: "Error"
+  done: "Done"
+
+approval:
+  title: "Command approval required"
+  choose_long: "This command needs your approval before it runs."
+  allow_once: "Allow once"
+  allow_always: "Always allow"
+  deny: "Deny"
+
+profile:
+  switched: "Switched to profile '{name}'. Restart to apply."
+  created: "Created profile '{name}'."
+  deleted: "Deleted profile '{name}'."
+  active: "Active profile: {name}"
+
+goal:
+  started: "Goal started: {title}"
+  completed: "Goal completed: {title}"
+  failed: "Goal failed: {title}"
+
+gateway:
+  drain: "Draining {count} pending message(s)..."
+  connected: "Connected to {platform}."

@@ -61,6 +61,26 @@ _DEFAULT_MAX_TOKENS = 16384
 # 单轮内截断自动续写的最大次数（防止模型反复截断导致无限循环）
 _MAX_TRUNCATION_CONTINUATIONS = 2
 
+# 单轮内"最终回复为空"时注入收尾提示的最大次数（保证任务不以无结论静默结束）
+_MAX_EMPTY_FINAL_NUDGES = 2
+
+# 值得跨 provider 故障转移的失败原因（provider 侧不可用，换一家可能就能用）。
+# 不含自身载荷问题（context_overflow/payload_too_large/image_too_large/
+# content_policy_blocked/format_error）——换家解决不了，走压缩/修复路径。
+_PROVIDER_FAILOVER_REASONS = {
+    FailoverReason.timeout,
+    FailoverReason.server_error,
+    FailoverReason.overloaded,
+    FailoverReason.rate_limit,
+    FailoverReason.upstream_rate_limit,
+    FailoverReason.auth,
+    FailoverReason.auth_permanent,
+    FailoverReason.billing,
+    FailoverReason.model_not_found,
+    FailoverReason.ssl_cert_verification,
+    FailoverReason.unknown,
+}
+
 
 # =========================================================================
 # 主入口
@@ -106,6 +126,10 @@ def run_conversation(
         "Turn context initialized: session=%s, msg_count=%d",
         agent.session_id[:8], len(turn_ctx.messages),
     )
+
+    # fallback 是 turn 作用域（Hermes 语义）：新一轮恢复主 provider、重置链索引，
+    # 主家持续不可用时每轮先给它一次机会，失败再按消息重新激活链
+    _restore_primary_runtime(agent)
 
     # ── 系统提示词构建/缓存 ───────────────────────────────────
 
@@ -158,6 +182,9 @@ def run_conversation(
 
     # 截断自动续写计数（finish_reason=length 时注入续写提示再推一轮）
     truncation_continuations = 0
+
+    # 空结论收尾提示计数（最终回复为空时注入收尾提示再推一轮）
+    empty_final_nudges = 0
 
     # ── 主循环 ──────────────────────────────────────────────────
 
@@ -248,6 +275,26 @@ def run_conversation(
                     retry_count, max_retries,
                     classified.reason.value, plan.message,
                 )
+
+                # 跨 provider 切换（Hermes try_activate_fallback 语义）：这家不可用
+                # 时沿 fallback 链换下一家，重试计数清零、按新 provider 重建请求
+                # 上下文，本轮内继续重试。放在 abort 判定之前：billing 类 plan 会
+                # 直接 abort，但换一家还能救。
+                if classified.reason in _PROVIDER_FAILOVER_REASONS:
+                    if _try_activate_fallback(agent, classified.reason, stream_callback):
+                        retry_count = 0
+                        use_cache, native_layout = should_use_prompt_caching(
+                            provider=agent.provider, model=agent.model,
+                            base_url=agent.base_url,
+                        )
+                        api_messages = prepare_api_messages(agent.messages)
+                        if use_cache:
+                            api_messages = apply_cache_control(
+                                api_messages,
+                                cache_ttl=getattr(agent, "_cache_ttl", "5m"),
+                                native_anthropic=native_layout,
+                            )
+                        continue
 
                 if plan.should_abort or not plan.should_retry:
                     return ConversationResult(
@@ -425,6 +472,39 @@ def run_conversation(
                 )
                 continue
 
+            # ── 空结论自愈 ─────────────────────────────────────
+            # 思考模型可能把输出配额全耗在推理上，最终 message.content 为空：
+            # 绝不能当作"最终回答"静默收尾（用户会看到任务跑完却没有任何结论）。
+            # 先注入收尾提示再推一轮让模型补结论；提示用尽仍为空则合成兜底总结。
+            if not content.strip():
+                if empty_final_nudges < _MAX_EMPTY_FINAL_NUDGES and budget.remaining > 0:
+                    empty_final_nudges += 1
+                    logger.warning(
+                        "模型最终回复为空，注入收尾提示第 %d 轮", empty_final_nudges,
+                    )
+                    agent.add_message(
+                        "user",
+                        "[系统提示] 你上一轮没有输出任何内容。请基于前面工具调用"
+                        "已得到的结果，直接给出本任务的最终结论或总结；"
+                        "除非确有必要，不要再调用工具。",
+                    )
+                    continue
+                fallback = _synthesize_fallback_summary(tool_calls_in_turn)
+                logger.warning("模型最终回复为空且收尾提示用尽，返回兜底总结")
+                agent.add_message("assistant", fallback)
+                _emit_hook(
+                    agent, "after_conversation",
+                    response=fallback, iterations=api_call_count,
+                    tool_calls=tool_calls_in_turn,
+                )
+                return ConversationResult(
+                    response=fallback,
+                    messages=agent.messages,
+                    usage=_extract_usage(response),
+                    iterations=api_call_count,
+                    tool_calls=tool_calls_in_turn,
+                )
+
             agent.add_message("assistant", content)
 
             # ── 后台进程通知回灌（Phase 4.7）──────────────────
@@ -525,6 +605,131 @@ def _inject_process_notifications(agent) -> int:
     except Exception:
         logger.debug("后台进程通知回灌失败（非致命）", exc_info=True)
         return 0
+
+
+def _get_fallback_chain(agent) -> List[Dict[str, Any]]:
+    """惰性构建并缓存 fallback 链（Hermes ``_fallback_chain`` 语义）。
+
+    链 = 配置里 ``llm.failover.providers`` 的优先级列表（复用 llm_pool 的
+    声明式解析：inline 值优先，缺省从 ProviderProfile/环境变量补齐）；
+    未启用 failover 时为空链（行为与单 provider 完全一致）。
+    """
+    chain = getattr(agent, "_fallback_chain", None)
+    if chain is None:
+        try:
+            from spirit import llm_pool
+            chain = llm_pool.load_providers() if llm_pool.failover_enabled() else []
+        except Exception as exc:  # noqa: BLE001 - 链构建失败绝不阻断主循环
+            logger.debug("fallback 链构建失败（非致命）: %s", exc)
+            chain = []
+        agent._fallback_chain = chain
+    return chain
+
+
+def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callable[[str], None]] = None) -> bool:
+    """切换到 fallback 链中下一个可用的 provider（照搬 Hermes try_activate_fallback）。
+
+    沿 ``_fallback_index`` 走链：跳过曾标记不可用的条目、字段不全的条目、
+    以及与当前后端重复的条目（回退到刚失败的同一后端会循环失败）。
+    激活本身**零网络请求**（Hermes 同款）：只换连接参数 + 重置惰性 client；
+    切过去若仍失败，重试循环会再次分类并激活下一家，天然实现"哪个能用
+    用哪个"。切换通知经 stream_callback 推给前端保证可见。
+    """
+    chain = _get_fallback_chain(agent)
+    unavailable = getattr(agent, "_unavailable_fallback_keys", None)
+    if unavailable is None:
+        unavailable = set()
+        agent._unavailable_fallback_keys = unavailable
+    current_base = (getattr(agent, "base_url", "") or "").rstrip("/")
+
+    while getattr(agent, "_fallback_index", 0) < len(chain):
+        idx = getattr(agent, "_fallback_index", 0)
+        agent._fallback_index = idx + 1
+        fb = chain[idx]
+        key = f"{fb.get('provider')}/{fb.get('model')}"
+        if key in unavailable:
+            logger.debug("fallback 跳过：%s 曾标记不可用", key)
+            continue
+        fb_provider = (fb.get("provider") or "").strip().lower()
+        fb_model = (fb.get("model") or "").strip()
+        fb_base = (fb.get("base_url") or "").rstrip("/")
+        if not (fb_provider and fb_model and fb_base and fb.get("api_key")):
+            logger.debug("fallback 跳过：%s 条目不完整", key)
+            unavailable.add(key)
+            continue
+        if fb_base == current_base or (
+            fb_provider == str(getattr(agent, "provider", "")).strip().lower()
+            and fb_model == getattr(agent, "model", "")
+        ):
+            logger.debug("fallback 跳过：%s 与当前后端重复", key)
+            continue
+
+        # 首次切换前快照主运行时（turn 作用域：下一轮开头恢复，Hermes 语义）
+        if getattr(agent, "_primary_runtime", None) is None:
+            agent._primary_runtime = {
+                "provider": agent.provider,
+                "model": agent.model,
+                "api_key": agent.api_key,
+                "base_url": agent.base_url,
+            }
+        agent.provider = fb.get("provider")
+        agent.model = fb_model
+        agent.api_key = fb.get("api_key")
+        agent.base_url = fb.get("base_url")
+        agent._client = None  # 惰性 client 下次访问时按新参数重建
+        agent._fallback_activated = True
+        reason_txt = getattr(reason, "value", None) or str(reason or "") or "调用失败"
+        notice = (
+            f"\n⚠ {reason_txt} — 已切换 fallback 提供方 {fb.get('name')}"
+            f"（模型 {fb_model}）\n"
+        )
+        logger.warning("[fallback] %s", notice.strip())
+        if stream_callback:
+            try:
+                stream_callback(notice)
+            except Exception:  # noqa: BLE001 - 通知失败不影响切换
+                logger.debug("fallback 通知推送失败", exc_info=True)
+        return True
+    return False
+
+
+def _restore_primary_runtime(agent) -> None:
+    """新一轮开始时恢复主 provider（Hermes：fallback 是 turn 作用域）。
+
+    主家持续不可用期间，每轮先给它一次机会，失败则链会按消息重新激活；
+    无论上一轮是否切换过都重置索引，防止索引搁浅后永久阻断后续
+    fallback（Hermes #20465 语义）。曾标记不可用的条目集合跨轮保留。
+    """
+    primary = getattr(agent, "_primary_runtime", None)
+    if getattr(agent, "_fallback_activated", False) and primary:
+        agent.provider = primary["provider"]
+        agent.model = primary["model"]
+        agent.api_key = primary["api_key"]
+        agent.base_url = primary["base_url"]
+        agent._client = None
+        logger.info(
+            "[fallback] 新一轮开始，恢复主 provider=%s model=%s",
+            primary["provider"], primary["model"],
+        )
+    agent._fallback_activated = False
+    agent._fallback_index = 0
+
+
+def _synthesize_fallback_summary(tool_calls) -> str:
+    """模型最终回复为空且收尾提示用尽时的兜底总结（保证任务不以静默结束）。"""
+    names = []
+    for tc in (tool_calls or [])[-6:]:
+        if isinstance(tc, dict):
+            fn = tc.get("function") or {}
+            name = fn.get("name") or tc.get("name") or ""
+        else:
+            name = getattr(tc, "name", "") or ""
+        if name:
+            names.append(str(name))
+    head = f"[本轮未产出最终结论] 共执行 {len(tool_calls or [])} 次工具调用"
+    if names:
+        head += f"（最近：{', '.join(names)}）"
+    return head + "。模型未给出总结性结论，请查看上述工具结果，或重新提问以获取结论。"
 
 
 def _clean_for_display(text: str) -> str:

@@ -282,6 +282,7 @@ def _handle_slash_command(cmd: str, agent) -> bool:
             "  /subgoal     子目标: /subgoal <text> | remove <n> | clear\n"
             "  /moa         智囊团（Mixture of Agents）: /moa list | use <name> | off | <prompt>（一次性）\n"
             "  /skill       技能中心: /skill list | reload | browse | install <id> | uninstall <name> | scan | bundles | info <name> | audit\n"
+            "  /profile     多实例隔离: /profile list | current | create <name> [--from <src>] [--clone-all|--clone-config] | use <name> | delete <name> | rename <old> <new> | describe <name> | info <name>\n"
             "  /<skill>     调用技能: /<skill-name> [指令] · 捆绑: /<bundle-name> [指令]\n"
             "  /quit        退出",
             title="帮助",
@@ -346,6 +347,9 @@ def _handle_slash_command(cmd: str, agent) -> bool:
         result = handle_skill_command(agent, args)
         _render_skill_result(result)
 
+    elif command == "/profile":
+        _handle_profile_slash(agent, args)
+
     else:
         console.print(f"[red]未知命令: {command}[/red] 输入 /help 查看帮助")
 
@@ -372,6 +376,29 @@ def _render_skill_result(result: dict) -> None:
     for line in result.get("lines", []):
         if line:
             console.print(f"  [dim]{line}[/dim]")
+
+
+def _render_profile_result(result: dict) -> None:
+    """把 handle_profile_command 的结果 dict 渲染到 Rich console。"""
+    msg = result.get("message", "")
+    style = "green" if result.get("ok") else "yellow"
+    if msg:
+        console.print(f"  [{style}]{msg}[/{style}]")
+    for line in result.get("lines", []):
+        if line:
+            console.print(f"  [dim]{line}[/dim]")
+
+
+def _handle_profile_slash(agent, args: str) -> None:
+    """处理 /profile：派发（传输无关）+ 渲染。
+
+    除 ``describe``（走一次辅助 LLM side call）外均为纯本地状态流转，不触网。
+    ``use`` 已在当前进程即时切换 SPIRIT_HOME，restart_hint 仅提醒子进程/彻底激活。
+    """
+    from spirit.profile import handle_profile_command
+
+    result = handle_profile_command(agent, args)
+    _render_profile_result(result)
 
 
 def _try_resolve_skill_slash(user_input: str):

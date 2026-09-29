@@ -791,15 +791,17 @@ async function sendChatMessage(message: string) {
   mdBuffer = ''
   startSpinner('思考中')
   try {
-    const data = await wsSend('chat', { message }, 1800000)  // 30 分钟超时（与后端 timeouts.chat_request 默认对齐）
+    const data = await wsSend('chat', { message }, 14400000)  // 4 小时看门狗：需覆盖后端单轮 30min ×(1+自动续跑 3)+宽限的总时长；后端真死时 WS 关闭会立即报错，不会干等
     // 清除 spinner
     stopSpinner()
     flushMarkdown()
-    if (streamBuffer) {
+    // 错误优先：超时/中断等终止原因必须可见，不得被流式缓冲分支吞掉
+    // （旧顺序 if(streamBuffer) 优先 → 有流式文本时 error 永远不渲染，任务静默结束）
+    if (data.error) {
+      term!.writeln(`\x1b[91m  ✗ ${data.error}\x1b[0m`)
+    } else if (streamBuffer) {
       // 如果有流式增量，已经显示过了，只需换行
       term!.writeln('')
-    } else if (data.error) {
-      term!.writeln(`\x1b[91m  ✗ ${data.error}\x1b[0m`)
     } else if (data.response) {
       // chat_complete 应已兜底渲染；若因乱序未渲染，这里补上
       if (!finalRendered) {

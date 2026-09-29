@@ -76,9 +76,10 @@ def _detect_provider(config: TransportConfig) -> str:
     """根据 model 名称和 base_url 自动检测 Provider。
 
     检测优先级：
-    1. base_url 特征（如 api.anthropic.com → anthropic）
-    2. model 名称特征（如 claude-* → anthropic, gemini-* → gemini）
-    3. 默认回退到 openai
+    1. base_url 已知怪癖特征（如 api.anthropic.com → anthropic、gemini /openai 子路径）
+    2. 注册表 hostname 反查（profile.get_hostname() 精确匹配，泛化到所有 provider）
+    3. model 名称特征（如 claude-* → anthropic, gemini-* → gemini）
+    4. 默认回退到 openai
     """
     model = (config.model or "").lower().strip()
     base_url = (config.base_url or "").lower().strip()
@@ -93,6 +94,12 @@ def _detect_provider(config: TransportConfig) -> str:
         return "gemini"
     if "bedrock" in base_url or "aws" in base_url:
         return "bedrock"
+
+    # ── 注册表 hostname 反查（泛化到 minimax/alibaba/openrouter 等所有 profile）──
+    if base_url:
+        detected = _detect_by_registry_hostname(base_url)
+        if detected:
+            return detected
 
     # ── model 名称检测 ──
     # Anthropic Claude
@@ -156,6 +163,63 @@ def _ensure_registered() -> None:
         register_transport("bedrock", BedrockTransport)
     except ImportError:
         pass
+
+    # ── 注册表驱动：按 profile.api_mode 为每个 provider name+alias 注册 transport ──
+    # 根治 minimax 等未硬编码的 provider（此前 create_transport("minimax") 抛错）。
+    _register_from_profiles()
+
+
+# api_mode → transport 注册键（profile 的 api_mode 映射到具体 transport 类）
+_API_MODE_TO_KEY: Dict[str, str] = {
+    "chat_completions": "openai",
+    "anthropic_messages": "anthropic",
+    "anthropic": "anthropic",
+    "gemini": "gemini",
+    "bedrock": "bedrock",
+    "bedrock_converse": "bedrock",
+}
+
+
+def _register_from_profiles() -> None:
+    """遍历 ProviderProfile 注册表，按 api_mode→transport 类为每个 name+alias 注册。
+
+    这让「声明一个 profile」即自动获得 transport 路由，无需再改本文件。注册表不可用
+    时静默跳过（保留上方硬编码注册作为兜底）。
+    """
+    try:
+        from spirit.providers import list_providers as _registry_providers
+        profiles = _registry_providers()
+    except Exception:  # noqa: BLE001 - 注册表不可用绝不阻断 transport 注册
+        return
+    for prof in profiles:
+        cls = _REGISTRY.get(_API_MODE_TO_KEY.get(prof.api_mode, "openai"))
+        if cls is None:
+            continue
+        register_transport(prof.name, cls)
+        for alias in prof.aliases:
+            register_transport(alias, cls)
+
+
+def _detect_by_registry_hostname(base_url: str) -> Optional[str]:
+    """用 ProviderProfile 注册表的 hostname 反查 provider（对齐 Hermes model_metadata）。
+
+    解析 base_url 的主机名，与每个 profile 的 ``get_hostname()`` 精确匹配。命中返回
+    ``profile.name``；无注册表/无匹配返回 None（调用方继续走 model 启发式）。
+    """
+    try:
+        from urllib.parse import urlparse
+
+        from spirit.providers import list_providers as _registry_providers
+        host = (urlparse(base_url).hostname or "").lower()
+        if not host:
+            return None
+        for prof in _registry_providers():
+            ph = (prof.get_hostname() or "").lower()
+            if ph and ph == host:
+                return prof.name
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def list_providers() -> list:

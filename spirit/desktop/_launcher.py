@@ -23,6 +23,8 @@ def main():
     parser = argparse.ArgumentParser(description="Spirit Desktop Pet 后端")
     parser.add_argument("--ws-host", default="127.0.0.1", help="WebSocket 绑定地址")
     parser.add_argument("--ws-port", type=int, default=9877, help="WebSocket 端口")
+    parser.add_argument("--no-autonomy", action="store_true",
+                        help="禁用常驻自主探索循环（Phase 7）")
     args = parser.parse_args()
 
     # 确保项目根目录在 sys.path 中
@@ -85,6 +87,14 @@ def main():
     # 事件循环
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # 常驻自主探索循环（桌宠内置形态，Phase 7）：HITL 气泡询问 + 沙箱写笔记 + 常驻线程
+    if not args.no_autonomy:
+        try:
+            from spirit.autonomy.integration import make_llm_caller, start_autonomy
+            start_autonomy(server, loop, caller=make_llm_caller())
+        except Exception as exc:
+            logger.warning("自主循环挂载失败（桌宠继续运行）: %s", exc)
 
     # 优雅退出
     def shutdown():

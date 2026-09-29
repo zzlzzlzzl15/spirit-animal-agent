@@ -31,8 +31,16 @@ class TestLoadConfig:
         assert config.provider == "anthropic"
 
     def test_env_config(self):
+        """环境变量 SPIRIT_MODEL 应生效为 model。
+
+        必须隔离真实用户配置（~/.spirit/config.yaml）：否则其 failover provider
+        会在 _apply_failover 阶段覆盖掉环境变量设的 model（同 test_default_config）。
+        """
+        import spirit.config as spirit_config
         from spirit.agent.agent_init import load_config
-        with patch.dict(os.environ, {"SPIRIT_MODEL": "gpt-4-turbo"}):
+
+        with patch.object(spirit_config, "_load_yaml", lambda *a, **kw: {}), \
+             patch.dict(os.environ, {"SPIRIT_MODEL": "gpt-4-turbo"}):
             config = load_config()
             assert config.model == "gpt-4-turbo"
 

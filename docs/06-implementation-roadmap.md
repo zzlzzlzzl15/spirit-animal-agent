@@ -1,6 +1,8 @@
 # Spirit Agent 实施路线图
 
 > 分阶段实施计划，从最小可用产品到完整生态。
+>
+> ⚠️ **本文档为最初设计期路线图**（Phase 编号按早期规划）。**as-built 实况与最新阶段规划以 [07-development-checklist.md](./07-development-checklist.md) 为准**；两者 Phase 编号不完全一致（如自进化在 07 中登记为 Phase 6）。
 
 ---
 
@@ -24,6 +26,10 @@ Phase 5: 消息网关 (2-3 周)
 
 Phase 6: 打磨优化 (持续)
   └── 性能优化 + 插件系统 + 文档完善
+
+【2026-09 新增能力轨道】自进化 RSI (8-11 周 · 设计完成待开发)
+  └── 自主探索 + 自我构建任务 + 经验沉淀复用 + 可选人在环（HITL）
+  └── 已在 07-development-checklist.md 登记为 Phase 6；完整设计见 docs/13-self-evolution-rsi.md
 ```
 
 ---
@@ -460,6 +466,13 @@ class TelegramAdapter:
 | [04-technical-design.md](./04-technical-design.md) | 技术设计（工具/通信/存储） |
 | [05-vscode-extension-design.md](./05-vscode-extension-design.md) | VSCode 扩展设计 |
 | [06-implementation-roadmap.md](./06-implementation-roadmap.md) | 实施路线图（本文档） |
+| [07-development-checklist.md](./07-development-checklist.md) | **完整开发清单（as-built 活文档 · 阶段状态以此为准）** |
+| [08-conversation-loop-refactor.md](./08-conversation-loop-refactor.md) | 对话循环重构设计 |
+| [09-implementation-progress.md](./09-implementation-progress.md) | 对话循环重构进度 |
+| [10-completion-report.md](./10-completion-report.md) | Phase 1+2 完成报告 |
+| [11-final-completion-report.md](./11-final-completion-report.md) | Phase 1+2+3 完整实施报告 |
+| [12-system-architecture-asbuilt.md](./12-system-architecture-asbuilt.md) | 系统架构 as-built |
+| [13-self-evolution-rsi.md](./13-self-evolution-rsi.md) | **自进化能力设计（RSI · 对应 07-checklist Phase 6）** |
 
 ---
 

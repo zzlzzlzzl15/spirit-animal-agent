@@ -1,6 +1,6 @@
 # Spirit Agent — 桌宠形态的本地 AI Agent
 
-> v0.1.0 · Electron 桌面宠物 + Python Agent 后端 + 交互式 CLI 终端
+> v0.2.0 · Electron 桌面宠物 + Python Agent 后端 + 交互式 CLI 终端
 > 对话循环架构对标 [Hermes Agent](https://github.com/zzlzzlzzl15/spirit-animal-agent/tree/master) v0.18.2：单主循环 + 迭代预算 + 分支化响应处理。
 
 Spirit Agent 是一只住在你桌面上的小狐狸：它既是**桌面宠物**（会动、会说话、会感知 Agent 工作状态），也是一个**完整的本地 AI Agent**（工具调用、多轮循环、流式输出、知识库、语音）。所有能力通过一个 WebSocket 桥接层对多表面（桌宠窗口 / CLI 终端 / VSCode 扩展）统一开放。
@@ -136,7 +136,17 @@ python e2e_ws_event_test.py    # WS 事件层：tool_start/complete + stream_del
 
 ## 五、版本记录
 
-### v0.1.0（当前）
+### v0.2.0（当前）
+
+- **对话可靠性**：空结论自愈（收尾提示 + 兜底总结，杜绝静默结束）；截断自动续写；chat 超时 300s→800s 修正为 1800s + 超时自动续跑（≤3 轮、可见通知、`chat.*` 可配置）。
+- **跨 provider 模型切换**：`llm.failover.providers` fallback 链（Hermes 语义：零探活走链、turn 作用域恢复主家），超时/5xx/限流/计费等自动换"哪个能用用哪个"，切换对用户可见。
+- **前端收尾 error-first**：超时/错误必先显错误行（修复被流式文本吞掉）；WS 看门狗 4 小时。
+- **Transport 注册表化**：ProviderProfile 声明即自动获得 transport 路由（hostname 反查 + api_mode 映射）。
+- **任务工作流治理**：系统提示词禁止把跑测试套件/新建测试诊断脚本作为任务流程；planner 模板移除测试子任务。
+- **新能力**：CLI `/profile` 多实例隔离；桌宠常驻自主循环（`--no-autonomy` 可关）；checkpoint 重构为内容寻址存储（`spirit/checkpoint/`）。
+- 版本号全仓对齐 0.2.0。
+
+### v0.1.0
 
 - **Computer Use**：新增桌面应用控制能力（截图 → 视觉路由 → 点击/输入），带权限确认与安全护栏（`spirit/computer_use/` + `computer_use_tool`）。
 - **Ralph Loop 目标系统**：长程目标管理（goal_state / judge / loop / manager），支持目标分解与自评判收敛（`spirit/goals/`）。

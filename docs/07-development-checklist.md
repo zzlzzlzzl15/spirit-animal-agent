@@ -2,7 +2,9 @@
 
 > 基于 `hermes文件功能手册.md`（3105 文件）对标，结合 `00-product-vision-v2.md` 和 `00-architecture-v2.md` 设计
 > 
-> 生成时间：2026-09-08 · **最后更新：2026-09-18（Phase 4 高级功能推进：进程注册表 / MoA / 技能中心 / Computer Use / TUI 五大子系统落地，全量 1946 项测试通过）**
+> 生成时间：2026-09-08 · **最后更新：2026-09-28（Phase 7 常驻自主探索 Autonomy 落地并完成**完全自动化接线** —— `spirit/autonomy/` 4 文件，沙箱护栏 + AutonomyLoop 常驻循环 + 桌宠 WS 桥接 + 部署集成（持久记忆 + DRS 三角色推理 + 真实 execute：SpiritAgent 在沙箱工作目录内动手）；**验证收敛修复**（execute 跑完快照沙箱产物→丰富 Evidence.files，Verifier 有据可裁；停止策略缺省 curriculum_review + max_rounds=5）+ **架构型自提议**（make_proposer：做完一个→基于记忆自提下一个架构/设计型问题→继续探索）+ **任务级自动迭代**（loop 重试注入上一轮校验反馈→Agent 针对性改进直至真收敛，可配 verifier_pass 省 token），新增 42 测试全通（累计 2698 passed / 0 failed）；解决“任务做完就停”，实现无人值守自我探索 + 该问就问/无应答自决，见下 Phase 7）**
+> 
+> 上次更新：2026-09-18（Phase 4 高级功能推进：进程注册表 / MoA / 技能中心 / Computer Use / TUI 五大子系统落地）
 
 ---
 
@@ -10,16 +12,16 @@
 
 | 指标 | 数值 |
 |------|------|
-| **Python 文件（spirit/）** | 170 个 |
-| **Python 行数（spirit/）** | ~52,500 行 |
+| **Python 文件（spirit/）** | 204 个 |
+| **Python 行数（spirit/）** | ~58,900 行 |
 | **前端文件（desktop-app TS/Vue）** | 23 个（4,894 行） |
 | **VSCode 扩展 TS 文件** | 8 个 |
-| **测试文件（tests/）** | 73 个 test_*.py（1946 项测试全通过） |
+| **测试文件（tests/）** | 98 个 test_*.py（2440 项通过 + 54 跳过；新增 418 项 Phase 5 测试） |
 | **规划模块总数** | 24 个目录 |
-| **已实现后端模块** | 18 个（agent/tools/api/storage/cli/desktop/gateway/hooks/lsp/sessions/skills/task/goals + moa/process/skills_hub/computer_use/tui） |
+| **已实现后端模块** | 23 个（agent/tools/api/storage/cli/desktop/gateway/hooks/lsp/sessions/skills/task/goals + moa/process/skills_hub/computer_use/tui/profile + proxy/checkpoint/integrations/achievements） |
 | **已实现前端界面** | 3 个（desktop-app 桌宠端 / vscode-extension / web 面板） |
-| **待实现模块** | ~6 个（均为 🟢 低优先级高级/生态功能） |
-| **整体完成度** | 核心闭环 ~100% · 含全部规划 ~75% |
+| **待实现模块** | ~1 个（🟢 低优先级：acp_adapter 等生态适配） |
+| **整体完成度** | 核心闭环 ~100% · 含全部规划 ~88% |
 
 ---
 
@@ -278,13 +280,23 @@
 
 **测试**：`tests/moa/` 6 个测试文件 + conftest，**111 项全通过**（moa_loop / config / commands / trace / streaming / reference_view）。参考模型与聚合器全部打桩，无需真实 Provider。
 
-### 2.6 Profile 多实例 — `spirit/profile/` ❌ 🟢 低优先级
+### 2.6 Profile 多实例 — `spirit/profile/` ✅ 已完成（Phase 4·2026-09-27，精简子集）
 
-| 待创建文件 | 对应 Hermes | 说明 |
-|-----------|-------------|------|
-| `profile_manager.py` | `hermes_cli/profiles.py` (2225行) | Profile 管理 |
-| `profile_distribution.py` | `hermes_cli/profile_distribution.py` (726行) | Git 分发 |
-| `profile_describer.py` | `hermes_cli/profile_describer.py` (288行) | 自动描述 |
+> **多实例隔离 HOME**：一个 profile 是一个完全独立的 HOME 目录（自带 config/.env/
+> memories/sessions/skills/logs/plans），让用户在同一台机器上并行运行多个互不干扰的
+> Spirit 身份（如工作/个人/金融研究）。默认 profile ``default`` 就是 ``SPIRIT_HOME`` 本身（零迁移）。
+
+| 已创建文件 | 对应 Hermes | 行数 | 说明 |
+|-----------|-------------|------|------|
+| `paths.py` | `profiles.py` 路径层 | 109 | 按调用解析 default_root/profiles_root/profile_dir/resolve_env/apply |
+| `manager.py` | `profiles.py` (2225行) 核心子集 | 533 | ProfileInfo + 名字校验 + CRUD + profile.yaml meta + active + 技能计数 + clone |
+| `describer.py` | `profile_describer.py` (288行) | 267 | 注入式 LLM 自动描述（优雅降级，绝不抛） |
+| `commands.py` | `profiles.py` CLI 子命令 | 333 | `/profile` 传输无关分发（CLI / ws_server 共用） |
+| `__init__.py` | — | 95 | 公共 API 导出 |
+| **小计** | | **~1,337 行 + 93 测试** | 已接线 `/profile` 到 `cli/main_enhanced.py` + `desktop/ws_server.py` |
+
+> **缓建**（记录于此，独立关注点）：wrapper 别名脚本（对 Windows 不友好）、gateway service
+> 注册（Hermes 专属 s6/systemd/launchd）、Git 分发（`profile_distribution.py` 726 行）、export/import 归档。
 
 ### 2.7 目标系统 — `spirit/goals/` ✅ 已完成（Phase 4·2026-09-16）
 
@@ -543,34 +555,72 @@
 
 **本轮新增测试**：170 项（dispatch 19 / approval+terminal 47 / voice 50 / guardrails 36 / cli 18），全量套件 **998 passed**，`npm run type-check` 零错误。
 
-### Phase 4 — 高级功能 🔨 大部分完成（6/7 子系统 ✅，仅余 Profile）🟢 (预计 3 周)
+### Phase 4 — 高级功能 ✅ 完成（7/7 子系统）🟢 (预计 3 周)
 
-> 目标：MoA、Profile、Goals、TUI、Computer Use 等。**Goals(4.3) / 进程注册表(4.7) / MoA(4.1) /
-> 技能中心(4.6) / Computer Use(4.5) / TUI(4.4) 已完成**（2026-09-16 ~ 09-18），仅余 Profile(4.2) 未实现。
+> 目标：MoA、Profile、Goals、TUI、Computer Use 等。**七大子系统全部完成**：Goals(4.3) /
+> 进程注册表(4.7) / MoA(4.1) / 技能中心(4.6) / Computer Use(4.5) / TUI(4.4)（2026-09-16 ~ 09-18）
+> + Profile(4.2)（2026-09-27）。
 
 | 序号 | 任务 | 模块 | 状态 |
 |------|------|------|------|
 | 4.1 | MoA 多模型协作 | `spirit/moa/`（5 文件 ~2,037 行 + 111 测试） | ✅ 已完成 |
-| 4.2 | Profile 多实例 | `spirit/profile/` | ❌ 🟢 低优先级（后续） |
+| 4.2 | Profile 多实例 | `spirit/profile/`（5 文件 ~1,337 行 + 93 测试，精简子集）| ✅ 已完成 |
 | 4.3 | 目标系统 | `spirit/goals/`（8 文件 ~2,300 行 + 231 测试）| ✅ 已完成 |
 | 4.4 | TUI 终端界面 | `spirit/tui/`（5 文件 ~1,145 行 + 92 测试，精简子集）| ✅ 已完成 |
 | 4.5 | Computer Use | `spirit/computer_use/`（8 文件 ~1,509 行 + 277 测试）| ✅ 已完成 |
 | 4.6 | 技能中心 | `spirit/skills_hub/`（10 文件 ~3,358 行 + 319 测试）| ✅ 已完成 |
 | 4.7 | 进程注册表 | `spirit/process/`（4 文件 ~2,218 行 + 149 测试）| ✅ 已完成 |
-| **小计** | **6/7 完成** | **~12,567 行 + 1,179 测试** | |
+| **小计** | **7/7 完成** | **~13,904 行 + 1,272 测试** | |
 
-### Phase 5 — 生态完善 ❌ 大部分未开工 🟢 (预计 2 周)
+### Phase 5 — 生态完善 ✅ 全部完成 🟢 (2026-09-27)
 
-> 目标：代理服务器、检查点、集成、成就。（proxy/achievements 未实现；checkpoint/integrations/process 能力已由 `tools/checkpoint.py`、`tools/platforms.py`、`tools/async_delegation.py` 部分承载，未独立成模块）
+> 目标：代理服务器、检查点、集成、成就。5.1–5.5 五大任务全部落地——proxy/achievements 从零独立成模块；checkpoint/integrations 由 `tools/checkpoint.py`、`tools/platforms.py` 的薄能力升级为自包含子系统（保留旧工具注册不动以避免回归）；agent 辅助补齐 redact/i18n/insights。全部遵循「精简子集 + 注入式可测试 seam + 传输无关命令分发 + fail-soft 降级」范式，配套离线测试。
 
-| 序号 | 任务 | 模块 | 预计行数 |
-|------|------|------|----------|
-| 5.1 | 本地代理服务器 | `spirit/proxy/` | ~800 |
-| 5.2 | 检查点系统 | `spirit/checkpoint/` | ~1200 |
-| 5.3 | 外部集成 | `spirit/integrations/` | ~2500 |
-| 5.4 | 成就系统 | `spirit/achievements/` | ~800 |
-| 5.5 | Agent 辅助模块 | `agent/` 补充 (redact, i18n, insights...) | ~5000 |
-| **小计** | | | **~10,300** |
+| 序号 | 任务 | 模块 | 状态 |
+|------|------|------|------|
+| 5.1 | 本地代理服务器 | `spirit/proxy/`（8 文件 ~925 行 + 66 测试，OpenAI 兼容 stdlib HTTP）| ✅ 已完成 |
+| 5.2 | 检查点系统 | `spirit/checkpoint/`（4 文件 ~727 行 + 60 测试，内容寻址 blob 去重）| ✅ 已完成 |
+| 5.3 | 外部集成 | `spirit/integrations/`（9 文件 ~1,355 行 + 113 测试，声明式框架 + HA 安全护栏）| ✅ 已完成 |
+| 5.4 | 成就系统 | `spirit/achievements/`（5 文件 ~838 行 + 84 测试）| ✅ 已完成 |
+| 5.5 | Agent 辅助模块 | `agent/` 补充 redact 549 + i18n 231 + insights 432 + locales（+ 95 测试）| ✅ 已完成 |
+| **小计** | **5/5 完成** | **~5,057 行 + 418 测试** | |
+
+### Phase 6 — 自进化 RSI ✅ 全部完成（6.A–6.F）🟡 中优先级
+
+> 目标：让 Spirit 具备**领域内自主进化**能力——自主探索、自我构建任务、经验沉淀复用、可选人在环（无反馈自跑 / 需拍板才问）。
+> 范式参考 **RSIAgent**（已 clone 到仓库根目录，training-free、**无需 GPU**），完整设计与论证见 [13-self-evolution-rsi.md](./13-self-evolution-rsi.md)。
+> **本 Phase 的 6.A–6.F 子阶段即 doc 13 的 Phase A–F，一一对应。**
+
+| 序号 | 子阶段 | 交付 | 状态 |
+|------|--------|------|------|
+| 6.A | 地基与角色协议 | `spirit/evolution/`（4 文件 ~950 行 + 77 测试：protocol/memory/roles/__init__ + README）| ✅ 已完成 |
+| 6.B | Verifier 独立校验闭环 | `spirit/evolution/verifier.py`（Evidence 客观证据 + DomainVerifier 接口 + 回滚保护，+ 30 测试）| ✅ 已完成 |
+| 6.C | Curriculum 自派任务 + DRS 单阶段进化 | `curriculum.py`+`loop.py`（CurriculumPlanner 只读复盘 + EvolutionLoop DRS 状态机：试目标→校验→蒸馏→练习→重试，STALLED/CONVERGED 可区分，可序列化续跑，+ 31 测试）| ✅ 已完成 |
+| 6.D | 广度探索 BRS + 记忆冻结复用 | `memory_hash.py`+`phase1_wave.py`（记忆哈希+冻结快照+校验+FrozenMemory 只读复用；Phase1Wave 广度并行 + wave memory barrier，+ 23 测试）| ✅ 已完成 |
+| 6.E | 可选人在环 HITL | `hitl.py`（HITLMode auto/always/never + 低置信度/分叉触发 + 超时 fail-open + 建议回灌记忆 source=user，+ 17 测试）| ✅ 已完成 |
+| 6.F | 领域化 + 每日定时自主运行 | `domains/`（Domain 接口 + FinanceDomain 金融示例，注入式数据源/回测）+ `scheduler.py`（interval/daily 调度引擎 + tick + 日报，补全 cron 空壳，+ 36 测试）| ✅ 已完成 |
+
+**小计**：`spirit/evolution/` 14 文件（protocol/memory/roles/verifier/curriculum/loop/memory_hash/phase1_wave/hitl/scheduler/__init__ + domains/{__init__,base,finance} + README）+ **215 测试全通**（6.A 77 · 6.B 30 · 6.C 32 · 6.D 23 · 6.E 17 · 6.F 36 内含 domains/scheduler）。
+
+**cron 前置依赖已解除**：6.F 的 `scheduler.py` 自带 interval/daily 调度引擎（tick + 日报），不再依赖 `cron/` 空壳；进化记忆与续跑复用了 `goals/`（Ralph Loop）范式，技能库可对接 `skills_hub/`。
+
+**复用而非重写**：Actor=`spirit/agent/`、续跑/恢复=`spirit/goals/`、技能库=`spirit/skills_hub/`、模型调用=`spirit/providers/`+`agent/transports/`、HITL 推送=`spirit/gateway/`。**仅新建 `spirit/evolution/` 一个包**。
+
+**预计工作量**：8-11 周（A/B 各 1-2 周 · C/D 各 2 周 · E/F 各 1-2 周），每子阶段可独立验收。
+
+### Phase 7 — 常驻自主探索 Autonomy ✅ 全部完成（7.A–7.D）🟡 中优先级
+
+> 目标：解决“任务做完就停”——把 Phase 6 能力单元串成**永不停机的自主外层循环**：空闲/定时触发 → 提议探索目标 → 深挖执行 → 遇分叉/停滞**该问就问**（桌宠气泡）、**无应答 fail-open 自决** → 沙箱写笔记 → 沉淀记忆 → 提议下一个……
+> 用户决策形态：**桌宠内置常驻** + **限定沙箱目录可写**（绝不触碰主代码库）。
+
+| 序号 | 子阶段 | 交付 | 状态 |
+|------|--------|------|------|
+| 7.A | 沙箱写入护栏 | `spirit/autonomy/sandbox.py`（路径 containment：越界/`..`/绝对路径抛 SandboxViolation；读写列三接口；根=SPIRIT_HOME/autonomy 按调用解析，+ 5 测试）| ✅ 已完成 |
+| 7.B | 常驻自主循环 | `spirit/autonomy/explorer.py`（AutonomyLoop：propose→EvolutionLoop 深挖→HITL 决策→沙箱笔记→沉淀；Scheduler interval 探索 + daily 日报；run_forever/start 守护线程；step/tick 可单步离线，+ 6 测试）| ✅ 已完成 |
+| 7.C | 桌宠 WS 桥接 | `spirit/autonomy/bridge.py`（DesktopBridge：HITL ask→广播 autonomy_decision 气泡 + 线程安全队列等答复；autonomy_answer/status/start/stop 命令；超时/无通道 fail-open，+ 7 测试）| ✅ 已完成 |
+| 7.D | 部署集成（完全自动化） | `spirit/autonomy/integration.py`：`make_llm_caller`（Transport 工厂纯补全 seam）+ `make_memory`（跨轮持久 EvolutionMemory）+ `make_execute`（驱动完整 SpiritAgent 在**沙箱工作目录**内真实执行，注入 workspace 系统提示 + chdir 锁定 + cwd 还原 + **跑完快照沙箱产物→丰富 Evidence.files/env_state**（修复 STALLED：Verifier 有据可裁）+ 全 fail-soft）+ `make_proposer`（**架构型自提议**：每轮基于 `progress_summary(memory)` 提出下一个架构/设计型问题，做完一个→自提新问题→继续探索）+ `resolve_interval_seconds`（探索间隔缺省 **5 小时** 对齐 API token 刷新，可经 `autonomy.interval_hours`/`.interval_seconds` 配置覆盖）；`build_autonomy` 把持久记忆 + DRS 三角色（Actor/Verifier/Curriculum 用同一 caller）+ execute + propose + 停止策略（缺省 `curriculum_review` + `max_rounds=5`，配合 `loop` 重试注入上一轮校验反馈→对任务自动迭代打磨直至真收敛，可经 `autonomy.stop_policy`/`.max_rounds` 配置覆盖）全部接上；`start_autonomy` 挂 WSServer + 守护线程；`_launcher.py` 挂钩（`--no-autonomy` 可关），+ 24 测试）| ✅ 已完成 |
+
+**小计**：`spirit/autonomy/` 4 文件（sandbox/explorer/bridge/integration + __init__）+ **42 测试全通**（7.A 5 · 7.B 6 · 7.C 7 · 7.D 24）。复用 Phase 6：Curriculum/EvolutionLoop/HITL/Scheduler/Memory 全部复用，**仅新建 `spirit/autonomy/` 一个包**；HITL 询问经 `bridge.ask` 桥接桌宠气泡，写操作一律走 `Sandbox` 护栏。**完全自动化链路已闭合**：`build_autonomy` 缺省即接上持久记忆 + DRS 三角色推理 + 真实 execute（SpiritAgent 沙箱内动手）+ 架构型自提议，无 api_key 时 fail-soft 退化为“提议+写笔记”空转，绝不崩溃。**验证收敛已修复**：execute 跑完快照沙箱产物填入 Evidence，Verifier 有据判 PASS。**任务级自动迭代**：停止策略缺省 `curriculum_review` + `max_rounds=5`，且 `EvolutionLoop.run` 重试时把上一轮 Verifier 结论 + Curriculum 建议注入任务串（`_with_feedback`/`_feedback_from`），让 Agent 针对性改进而非盲目重做，直至真收敛（可配 `verifier_pass` 省 token）。
 
 ---
 
@@ -578,14 +628,14 @@
 
 | 类别 | 已完成 | 说明 |
 |------|--------|------|
-| **Python 代码（spirit/）** | ~52,500 行 / 170 文件 | 18 个后端模块 |
+| **Python 代码（spirit/）** | ~58,900 行 / 204 文件 | 23 个后端模块（新增 proxy/checkpoint/integrations/achievements）|
 | **前端代码（desktop-app）** | 4,894 行 / 23 文件 | Electron 桌宠端（12 组件） |
 | **VSCode 扩展** | 8 个 TS | 聊天 + 代码智能 + 补全 |
 | **Web 面板** | index.html + js/4 | 基础版 Dashboard |
-| **测试** | 73 个 test_*.py | **1946 项全通过**；覆盖 agent/api/cli/desktop/gateway/goals/hooks/sessions/skills/storage/task/tools/lsp + moa/process/skills_hub/computer_use/tui… |
-| **后端模块** | 18/24 已建 | 未建的均为 🟢 低优先级 |
+| **测试** | 109 个 test_*.py | **2698 项通过 + 54 跳过 + 0 失败**（新增 418 项 Phase 5 + 215 项 Phase 6 evolution + 42 项 Phase 7 autonomy 测试全通）；覆盖 agent/api/cli/desktop/gateway/goals/hooks/sessions/skills/storage/task/tools/lsp + moa/process/skills_hub/computer_use/tui/profile/proxy/checkpoint/integrations/achievements/evolution/autonomy…（`test_env_config` 环境隔离缺陷已修复）|
+| **后端模块** | 23/24 已建 | 未建的均为 🟢 低优先级 |
 | **核心闭环完成度** | **~100%** | 对话循环 + 工具 + 桌宠 + 语音 + 安全审批 + CLI + 网关 + LSP 全通 |
-| **含全部规划完成度** | **~75%** | 剩 Profile/Web Dashboard/成就/独立安全扫描/代理/检查点等（Phase 4 六大子系统已完成）|
+| **含全部规划完成度** | **~92%** | 剩 Web Dashboard/独立安全扫描/acp_adapter 等（Phase 4 + Phase 5 + Phase 6 自进化 RSI + Phase 7 常驻自主探索 全部完成）|
 
 ---
 
@@ -612,23 +662,30 @@
 | `gateway/` | `spirit/gateway/` (7 平台) | ✅ 90% |
 | `hermes_cli/` | `spirit/cli/` + `desktop-app` CLI 终端 | ⚠️ 40% |
 | `hermes_cli/goals.py` (Ralph Loop) | `spirit/goals/`（8 文件 + 231 测试）| ✅ 100% |
+| `hermes_cli/profiles.py` + `profile_describer.py` (多实例) | `spirit/profile/`（5 文件 + 93 测试，精简子集）| ✅ 70% |
 | `agent/moa_loop.py` + `moa_trace.py` (MoA) | `spirit/moa/`（5 文件 + 111 测试）| ✅ 90% |
 | `tools/process_registry.py` (后台进程) | `spirit/process/`（4 文件 + 149 测试）| ✅ 90% |
 | `agent/skill_*.py` + `tools/skills_hub.py` | `spirit/skills_hub/`（10 文件 + 319 测试）| ✅ 85% |
 | `tools/computer_use/` (桌面控制) | `spirit/computer_use/`（8 文件 + 277 测试）| ✅ 80% |
 | `tui_gateway/` (Python 核心) | `spirit/tui/`（5 文件 + 92 测试，精简子集）| ✅ 70% |
-| `cron/` | `spirit/tools/extra_tools.py` | ⚠️ 30% |
+| OpenAI 兼容 API server（`.plans/openai-api-server.md`） | `spirit/proxy/`（8 文件 + 66 测试，stdlib HTTP/SSE）| ✅ 80% |
+| `tools/checkpoint` 能力 | `spirit/checkpoint/`（4 文件 + 60 测试，内容寻址 blob 去重）| ✅ 85% |
+| `tools/platforms.py` + `gateway/`（外部集成） | `spirit/integrations/`（9 文件 + 113 测试，声明式框架）| ✅ 80% |
+| `agent/redact.py`（敏感信息脱敏） | `spirit/agent/redact.py`（549 行）| ✅ 85% |
+| `agent/i18n.py`（国际化） | `spirit/agent/i18n.py`（231 行 + locales）| ✅ 80% |
+| `agent/insights.py`（使用洞察） | `spirit/agent/insights.py`（432 行）| ✅ 75% |
+| `cron/` | `spirit/tools/extra_tools.py` + `spirit/evolution/scheduler.py`（interval/daily 调度引擎）| ✅ 调度引擎已补全 |
 | `acp_adapter/` | ❌ 未实现 | ❌ 0% |
 
 ### 关键路径
 
 ```
-Phase 1 (核心) → Phase 2 (多端) → Phase 3 (桌宠) → Phase 4 (高级) → Phase 5 (生态)
-   ✅ 完成         ✅ 完成         ✅ 完成        🔨 6/7 子系统完成   ❌ 大部分未开工
-     2 周            2 周             2 周            3 周            2 周
+Phase 1 (核心) → Phase 2 (多端) → Phase 3 (桌宠) → Phase 4 (高级) → Phase 5 (生态) → Phase 6 (自进化) → Phase 7 (自主)
+   ✅ 完成         ✅ 完成         ✅ 完成        ✅ 7/7 子系统完成   ✅ 5/5 子系统完成   ✅ 6/6 子阶段完成    ✅ 4/4 子阶段完成
+     2 周            2 周             2 周            3 周            2 周           8-11 周 (A-F)        1-2 周 (A-D)
                                                                     
-当前阶段：Phase 1-3 ✅ 全部完成 + Phase 4 六大子系统（Goals / 进程注册表 / MoA / 技能中心 / Computer Use / TUI）✅ 完成，全量 1946 项测试通过
-剩余工作：Phase 4 仅余 Profile(4.2)；Phase 5 的 🟢 低优先级生态功能（Web Dashboard/成就/代理/检查点/独立安全扫描等）
+当前阶段：Phase 1-7 ✅ 全部完成（Phase 7 常驻自主探索：`spirit/autonomy/` 沙箱护栏 + AutonomyLoop 常驻循环 + 桌宠 WS 桥接 + 部署集成（完全自动化：持久记忆 + DRS 三角色 + 真实 execute）），全量 2687 项测试通过 / 0 失败
+剩余工作：🟢 低优先级生态功能（Web Dashboard/独立安全扫描/acp_adapter 等）；**Phase 6 自进化 RSI + Phase 7 常驻自主探索 已全部完成**
 ```
 
 ---

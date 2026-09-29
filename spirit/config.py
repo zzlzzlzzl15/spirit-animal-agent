@@ -198,9 +198,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "memora_health": 5.0,                 # Memora 后端健康检查超时
         "memora_client_api": 60,              # Memora 客户端 API 调用超时（搜索/上传）
         "browser_dialog": 300.0,              # 浏览器对话框交互等待超时
-        "chat_request": 300.0,                # WebSocket 聊天请求超时（默认 5 分钟）
+        "chat_request": 1800.0,               # WebSocket 聊天请求超时（默认 30 分钟；多工具长任务 5 分钟会误杀）
         "stt_transcribe": 30.0,               # 语音识别（STT）超时（默认 30 秒）
         "tts_synthesize": 30.0,               # 语音合成（TTS）超时（默认 30 秒）
+    },
+    # ── 聊天超时自动续跑（超时≠结束） ────────────────────
+    "chat": {
+        "auto_resume_on_timeout": True,       # 超时中断当前轮后自动注入续跑指令重进循环，继续完成未完成任务
+        "max_auto_resumes": 3,                # 单次聊天请求最多自动续跑轮数（防无限续跑烧 token）
+        "resume_grace_seconds": 120,          # 超时后等旧对话循环退出的宽限秒数；逾放弃续跑（防双 chat 并行）
     },
     # ── 错误恢复退避（秒） ────────────────────────────────────
     "backoff": {
@@ -403,7 +409,10 @@ def load_config(
     if overrides:
         _deep_merge(config, overrides)
 
-    # 5. 自动解析 provider → base_url / api_key
+    # 5. 多 provider failover：探测选中“有 token”的 provider（若启用）
+    _apply_failover(config)
+
+    # 6. 自动解析 provider → base_url / api_key
     _resolve_provider(config)
 
     return config
@@ -463,10 +472,41 @@ def _load_env_config() -> Dict[str, Any]:
     return config
 
 
+def _apply_failover(config: Dict[str, Any]) -> None:
+    """若启用多 provider failover，探测选中“有 token”的 provider 覆盖 llm 连接字段。
+
+    “哪个有 token 用哪个”：按 llm.failover.providers 优先级顺序探测，用第一个健康的。
+    非致命：选择器缺失/异常/无健康 provider 时保持配置原样（回退 llm 顶层默认）。
+    探测结果被 llm_pool 缓存 CACHE_TTL 秒，热路径反复 load_config 不会重复发请求。
+    """
+    llm = config.get("llm", {})
+    fo = llm.get("failover", {}) or {}
+    if not fo.get("enabled", False):
+        return
+    try:
+        from spirit.llm_pool import pick_provider
+        picked = pick_provider()
+    except Exception as exc:  # noqa: BLE001 - failover 不可用绝不阻断配置加载
+        logger.debug("[failover] 选择器不可用，保持默认: %s", exc)
+        return
+    if not picked:
+        return
+    # 用选中的健康 provider 覆盖连接字段
+    llm["model"] = picked.get("model") or llm.get("model")
+    llm["provider"] = picked.get("provider") or llm.get("provider")
+    llm["api_key"] = picked.get("api_key") or llm.get("api_key")
+    llm["base_url"] = picked.get("base_url") or llm.get("base_url")
+    logger.info("[failover] 生效 provider=%s model=%s", picked.get("name"), llm.get("model"))
+
+
 def _resolve_provider(config: Dict[str, Any]) -> None:
     """根据 provider 自动解析 base_url 和 api_key。
 
-    仅在用户未显式设置时填充，不覆盖已有值。
+    主路径走 ProviderProfile 注册表（``spirit.providers``）——base_url 取
+    ``profile.base_url``、api_key 按 ``profile.env_vars`` 顺序查环境变量。注册表无
+    profile 时回退到模块级 ``PROVIDER_BASE_URLS`` / ``PROVIDER_KEY_ENV`` 字典（如
+    ollama/lmstudio 等本地端点的默认 URL 仍在字典里）。仅在用户未显式设置时填充，
+    不覆盖已有值。
     """
     llm = config.get("llm", {})
     provider = (llm.get("provider") or "auto").strip().lower()
@@ -474,13 +514,26 @@ def _resolve_provider(config: Dict[str, Any]) -> None:
     if provider in ("auto", ""):
         return
 
-    # 自动填充 base_url
-    if not llm.get("base_url") and provider in PROVIDER_BASE_URLS:
-        llm["base_url"] = PROVIDER_BASE_URLS[provider]
+    # 从注册表取 profile（不可用则回退字典，绝不阻断配置加载）
+    profile = None
+    try:
+        from spirit.providers import get_provider_profile
+        profile = get_provider_profile(provider)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[provider] 注册表不可用，回退字典: %s", exc)
 
-    # 自动查找 api_key
+    # 自动填充 base_url：profile 优先，字典兜底
+    if not llm.get("base_url"):
+        if profile and profile.base_url:
+            llm["base_url"] = profile.base_url
+        elif provider in PROVIDER_BASE_URLS:
+            llm["base_url"] = PROVIDER_BASE_URLS[provider]
+
+    # 自动查找 api_key：profile.env_vars 优先，字典兜底（按序取首个非空环境变量）
     if not llm.get("api_key"):
-        for env_name in PROVIDER_KEY_ENV.get(provider, []):
+        env_names = list(profile.env_vars) if profile else []
+        env_names += [e for e in PROVIDER_KEY_ENV.get(provider, []) if e not in env_names]
+        for env_name in env_names:
             key = os.environ.get(env_name, "")
             if key:
                 llm["api_key"] = key

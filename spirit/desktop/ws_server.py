@@ -27,6 +27,14 @@ from spirit.desktop.voice_engine import VoiceEngine, VoiceConfig
 
 logger = logging.getLogger(__name__)
 
+# 超时自动续跑时注入的续跑指令：让 Agent 从断点继续完成未完成任务，
+# 而非重头再来或直接结束（用户要求：超时不能就算了，得继续做完）。
+_RESUME_CONTINUATION_PROMPT = (
+    "[系统自动续跑] 上一轮因请求超时被中断，任务尚未完成。"
+    "请查看上面的对话历史，定位你中断在哪个步骤，从该处继续完成剩余工作："
+    "不要重做已完成的步骤，不要复述背景，不要向我确认，直接执行并给出最终结论。"
+)
+
 # 尝试导入 websockets（可选依赖）
 try:
     import websockets
@@ -404,6 +412,11 @@ class WSServer:
             # 多工具聚合的长任务 5 分钟远远不够，过早超时会误杀正常任务）
             from spirit.config import get_config_value
             chat_timeout = get_config_value("timeouts.chat_request", 1800.0)
+            # 超时自动续跑（超时≠结束）：中断当前轮后注入续跑指令重进对话循环，
+            # 继续完成未完成的任务；轮数封顶防无限续跑烧 token。
+            auto_resume = bool(get_config_value("chat.auto_resume_on_timeout", True))
+            max_resumes = int(get_config_value("chat.max_auto_resumes", 3))
+            resume_grace = float(get_config_value("chat.resume_grace_seconds", 120))
             
             try:
                 # 注册临时回调用于进度推送
@@ -464,29 +477,93 @@ class WSServer:
                 # 单一路径：流式作为传输层集成在主循环内（chat + stream_callback）
                 deltas_sent = {"v": False}
 
-                if self.agent.config.streaming_enabled:
-                    def _sync_delta_callback(text):
-                        """同步回调 → 线程安全推送，并阻塞等待发送完成。
+                def _sync_delta_callback(text):
+                    """同步回调 → 线程安全推送，并阻塞等待发送完成。
 
-                        必须 .result() 等待：否则主循环返回后
-                        chat_complete/命令响应可能先于 delta 到达前端，
-                        导致最终文本乱序或丢失。
-                        """
-                        deltas_sent["v"] = True
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                _push_stream_delta(text), loop
-                            ).result(timeout=10)
-                        except Exception:
-                            pass
+                    必须 .result() 等待：否则主循环返回后
+                    chat_complete/命令响应可能先于 delta 到达前端，
+                    导致最终文本乱序或丢失。
+                    """
+                    deltas_sent["v"] = True
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _push_stream_delta(text), loop
+                        ).result(timeout=10)
+                    except Exception:
+                        pass
 
-                    future = loop.run_in_executor(
-                        None, self.agent.chat, message, _sync_delta_callback
-                    )
-                else:
+                def _dispatch(text):
+                    """把一轮对话派发到执行器线程（流式/非流式单一路径）。"""
+                    if self.agent.config.streaming_enabled:
+                        return loop.run_in_executor(
+                            None, self.agent.chat, text, _sync_delta_callback
+                        )
                     # 非流式模式：等待完整响应
-                    future = loop.run_in_executor(None, self.agent.chat, message)
-                response = await asyncio.wait_for(future, timeout=chat_timeout)
+                    return loop.run_in_executor(None, self.agent.chat, text)
+
+                # ── 超时自动续跑主循环 ───────────────────────
+                # 正常完成 → break 走收尾；超时 → 中断当前轮 + 等旧循环退出 +
+                # 注入续跑指令重进循环，直到完成或续跑轮数封顶。
+                current_message = message
+                resumes_used = 0
+                while True:
+                    future = _dispatch(current_message)
+                    try:
+                        response = await asyncio.wait_for(future, timeout=chat_timeout)
+                        break
+                    except asyncio.TimeoutError:
+                        logger.warning("聊天请求超时 (%.1f 秒)，中断 Agent", chat_timeout)
+                        self.agent.interrupt()
+                        if not auto_resume or resumes_used >= max_resumes:
+                            reason = (
+                                f"请求超时（{chat_timeout:.0f} 秒），自动续跑"
+                                f"{resumes_used} 轮后仍未完成，已中断"
+                                if resumes_used else
+                                f"请求超时（{chat_timeout:.0f} 秒），已中断处理"
+                            )
+                            return {"error": reason, "timeout": True}
+                        resumes_used += 1
+                        logger.warning(
+                            "超时自动续跑第 %d/%d 轮：注入续跑指令重进对话循环",
+                            resumes_used, max_resumes,
+                        )
+                        await _push_stream_delta(
+                            f"\n⏳ 请求超时（{chat_timeout:.0f} 秒），自动续跑未完成"
+                            f"任务（第 {resumes_used}/{max_resumes} 轮）…\n"
+                        )
+                        # 旧对话循环见到中断标志才会退出（可能正卡在 LLM 调用/
+                        # 工具调用里），必须等它落定再开新一轮，避免两个 chat
+                        # 并行改会话消息。用轮询而非 wait_for/shield：嵌套
+                        # wait_for 在同一任务上的取消记账会污染后续轮（3.12
+                        # 曾致 CancelledError 逸出），轮询免疫且语义直观。
+                        deadline = loop.time() + resume_grace
+                        while not future.done() and loop.time() < deadline:
+                            await asyncio.sleep(0.2)
+                        if not future.done():
+                            logger.warning(
+                                "旧对话循环 %ss 宽限后仍未退出，放弃自动续跑",
+                                resume_grace,
+                            )
+                            return {
+                                "error": (
+                                    f"请求超时且旧任务 {resume_grace:.0f} 秒内未退出，"
+                                    "已放弃自动续跑"
+                                ),
+                                "timeout": True,
+                            }
+                        # 旧循环已落定（[已中断]/异常/结果均可），会话状态可用
+                        self.agent.clear_interrupt()
+                        current_message = _RESUME_CONTINUATION_PROMPT
+                    except asyncio.CancelledError:
+                        # 外部取消（断连/关停）或 asyncio 取消记账异常：
+                        # 不续跑、立即收敛，避免孤儿任务与状态污染
+                        logger.warning("对话循环被取消（CancelledError），不续跑直接收敛")
+                        if self.agent:
+                            self.agent.interrupt()
+                        return {
+                            "error": f"请求被取消（超时或连接断开），已中断处理",
+                            "timeout": True,
+                        }
 
                 # 恢复原始回调
                 self.agent.on_tool_start = original_on_tool_start
@@ -528,22 +605,20 @@ class WSServer:
                     "tool_calls_formatted": formatted_tools,
                 }
             except asyncio.TimeoutError:
-                # 超时处理：中断 Agent 并恢复回调
-                logger.warning("聊天请求超时 (%.1f 秒)，中断 Agent", chat_timeout)
+                # 防御分支：超时已在续跑循环内逐轮处理，到这里属意外路径
+                logger.warning("聊天请求超时（意外路径, %.1f 秒）", chat_timeout)
                 if self.agent:
                     self.agent.interrupt()
-                    self.agent.on_tool_start = original_on_tool_start
-                    self.agent.on_tool_complete = original_on_tool_complete
                 return {
                     "error": f"请求超时（{chat_timeout:.0f} 秒），已中断处理",
                     "timeout": True,
                 }
             except Exception as exc:
-                # 恢复原始回调
-                if self.agent:
-                    self.agent.on_tool_start = getattr(self, '_orig_tool_start', None)
-                    self.agent.on_tool_complete = getattr(self, '_orig_tool_complete', None)
                 return {"error": str(exc)}
+            finally:
+                # 恢复原始回调（覆盖正常/超时续跑封顶/异常全部退出路径）
+                self.agent.on_tool_start = original_on_tool_start
+                self.agent.on_tool_complete = original_on_tool_complete
         reg("chat", cmd_chat)
 
         async def cmd_transcribe_audio(client, data):
@@ -858,6 +933,36 @@ class WSServer:
                 logger.warning("subgoal 命令失败: %s", exc)
                 return {"ok": False, "error": str(exc)}
         reg("subgoal", cmd_subgoal)
+
+        async def cmd_profile(client, data):
+            """多实例 Profile 隔离管理（/profile 子命令，Phase 4.2）。
+
+            data: {"args": "</profile 之后的整段参数>"}，如 "list" / "current" /
+            "create work --clone-config" / "use work" / "delete work" /
+            "rename work job" / "describe work" / "info work"。多为本地快速操作；
+            describe 走一次辅助 LLM side call，故在 executor 中运行不卡事件循环。
+            结果 dict 带 ok/action/message/lines/active/restart_hint，前端自行渲染。
+            """
+            args = data.get("args", "") or data.get("command", "")
+            from spirit.config import get_config_value
+
+            loop = asyncio.get_event_loop()
+
+            def _run():
+                from spirit.profile import handle_profile_command
+                return handle_profile_command(self.agent, args)
+
+            timeout = float(get_config_value("timeouts.chat_request", 300.0))
+            try:
+                future = loop.run_in_executor(None, _run)
+                return await asyncio.wait_for(future, timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("profile 命令超时 (%.0f 秒)", timeout)
+                return {"ok": False, "error": f"profile 命令超时（{timeout:.0f} 秒）", "timeout": True}
+            except Exception as exc:
+                logger.warning("profile 命令失败: %s", exc)
+                return {"ok": False, "error": str(exc)}
+        reg("profile", cmd_profile)
 
         async def cmd_moa(client, data):
             """MoA（Mixture of Agents）预设管理 + 一次性 prompt。

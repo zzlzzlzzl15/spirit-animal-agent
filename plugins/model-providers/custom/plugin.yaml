@@ -1,0 +1,5 @@
+name: custom-provider
+kind: model-provider
+version: 1.0.0
+description: Custom OpenAI-compatible endpoint (Ollama/vLLM/llama.cpp/LM Studio/Azure)
+author: Spirit Agent

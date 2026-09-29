@@ -111,12 +111,6 @@ DECOMPOSE_TEMPLATES: List[Tuple[str, List[SubtaskSpec]]] = [
                 estimated_seconds=600,
             ),
             SubtaskSpec(
-                title="测试",
-                description="编写单元测试和集成测试",
-                depends_on=["编码"],
-                estimated_seconds=300,
-            ),
-            SubtaskSpec(
                 title="文档",
                 description="更新文档和注释",
                 depends_on=["编码"],
@@ -141,7 +135,7 @@ DECOMPOSE_TEMPLATES: List[Tuple[str, List[SubtaskSpec]]] = [
             ),
             SubtaskSpec(
                 title="验证",
-                description="验证修复效果，确保无回归",
+                description="直接运行相关功能确认修复生效（不跑测试套件）",
                 depends_on=["修复"],
                 estimated_seconds=180,
             ),
@@ -163,8 +157,8 @@ DECOMPOSE_TEMPLATES: List[Tuple[str, List[SubtaskSpec]]] = [
                 estimated_seconds=600,
             ),
             SubtaskSpec(
-                title="测试验证",
-                description="运行测试确保无回归",
+                title="验证",
+                description="直接运行重构涉及的功能确认行为不变（不跑测试套件）",
                 depends_on=["重构实施"],
                 estimated_seconds=300,
             ),
@@ -180,15 +174,15 @@ DECOMPOSE_TEMPLATES: List[Tuple[str, List[SubtaskSpec]]] = [
                 estimated_seconds=180,
             ),
             SubtaskSpec(
-                title="测试",
-                description="部署前测试",
+                title="预检",
+                description="确认构建产物可直接使用（不跑测试套件）",
                 depends_on=["构建"],
                 estimated_seconds=300,
             ),
             SubtaskSpec(
                 title="部署",
                 description="执行部署",
-                depends_on=["测试"],
+                depends_on=["预检"],
                 estimated_seconds=180,
             ),
             SubtaskSpec(

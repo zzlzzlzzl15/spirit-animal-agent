@@ -1,0 +1,32 @@
+# Spirit Agent —— 简体中文 catalog
+# 与 en.yaml 保持相同的点分 key 空间；缺失 key 会自动回退英文。
+common:
+  ok: "好的"
+  cancel: "取消"
+  confirm: "确认"
+  yes: "是"
+  no: "否"
+  error: "错误"
+  done: "完成"
+
+approval:
+  title: "需要命令审批"
+  choose_long: "该命令需要你批准后才会执行。"
+  allow_once: "仅此次允许"
+  allow_always: "始终允许"
+  deny: "拒绝"
+
+profile:
+  switched: "已切换到 profile '{name}'。重启后生效。"
+  created: "已创建 profile '{name}'。"
+  deleted: "已删除 profile '{name}'。"
+  active: "当前活跃 profile：{name}"
+
+goal:
+  started: "目标已启动：{title}"
+  completed: "目标已完成：{title}"
+  failed: "目标失败：{title}"
+
+gateway:
+  drain: "正在排空 {count} 条待处理消息……"
+  connected: "已连接到 {platform}。"
