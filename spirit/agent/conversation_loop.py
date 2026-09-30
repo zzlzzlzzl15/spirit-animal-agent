@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
@@ -44,6 +45,10 @@ from spirit.config import get_config_value
 
 logger = logging.getLogger(__name__)
 
+
+class StreamStaleTimeoutError(TimeoutError):
+    """流看门狗超时：首字节或 chunk 间隔长期断供，判流死亡并已关闭。"""
+
 # 流式门控：检测到这些标签开头时停止实时推送（避免 think/工具调用 JSON 泄露到终端）
 _STREAM_OPENER_RE = re.compile(
     r'<(?:think|thinking|reasoning|tool_call|invoke)\b', re.IGNORECASE,
@@ -63,6 +68,19 @@ _MAX_TRUNCATION_CONTINUATIONS = 2
 
 # 单轮内"最终回复为空"时注入收尾提示的最大次数（保证任务不以无结论静默结束）
 _MAX_EMPTY_FINAL_NUDGES = 2
+
+# 额度耗尽型失败指纹：月配额/总额度耗尽属于"恢复期以天计的必败"，与瞬时限流
+# 不同——退避重试无意义，每轮恢复主 provider 也只是白打一次必败调用。
+_QUOTA_EXHAUSTED_RE = re.compile(
+    r"insufficient_quota|quota\s+(?:has\s+been\s+)?exhausted|quota\s+exceeded"
+    r"|insufficient\s+balance|balance\s+insufficient|credits?\s+exhausted",
+    re.IGNORECASE,
+)
+
+# 主 provider 额度耗尽冷却（秒）：冷却期内新一轮不恢复主 provider，直接沿用
+# 上一轮的 fallback 运行时（避免每条消息都先打一次必败 429 + 刷一条切换通知）；
+# 冷却到期后主 provider 再获得一次探活机会（保留 Hermes turn 作用域语义，仅节流）。
+_PRIMARY_QUOTA_COOLDOWN_SECONDS = 24 * 3600.0
 
 # 值得跨 provider 故障转移的失败原因（provider 侧不可用，换一家可能就能用）。
 # 不含自身载荷问题（context_overflow/payload_too_large/image_too_large/
@@ -176,7 +194,12 @@ def run_conversation(
     from spirit.config import get_config_value
     max_retries = get_config_value("agent.max_retries", 3)
     compression_attempts = 0
-    
+
+    # fallback 切换等过程通知走独立回调（如有）：前端把该通道当"过程通知"，
+    # 不计入流式增量——通知若混进 stream_delta 会让 streamBuffer 非空，
+    # 轮末错误结论的兜底渲染会被"已流式送达"判定吞掉，失败轮静默结束。
+    notice_callback = kwargs.pop("notice_callback", None) or stream_callback
+
     # 本轮工具调用列表（用于返回给 CLI 显示）
     tool_calls_in_turn = []
 
@@ -276,12 +299,24 @@ def run_conversation(
                     classified.reason.value, plan.message,
                 )
 
+                # 额度耗尽型失败（月配额重置以天计）且当前还跑在主 provider 上：
+                # 标记冷却，冷却期内新一轮直接走 fallback，不再"每轮给主家一次机会"
+                if (
+                    classified.reason in _PROVIDER_FAILOVER_REASONS
+                    and not getattr(agent, "_fallback_activated", False)
+                    and (
+                        classified.reason == FailoverReason.billing
+                        or _QUOTA_EXHAUSTED_RE.search(str(exc))
+                    )
+                ):
+                    _mark_primary_quota_cooldown(agent)
+
                 # 跨 provider 切换（Hermes try_activate_fallback 语义）：这家不可用
                 # 时沿 fallback 链换下一家，重试计数清零、按新 provider 重建请求
                 # 上下文，本轮内继续重试。放在 abort 判定之前：billing 类 plan 会
                 # 直接 abort，但换一家还能救。
                 if classified.reason in _PROVIDER_FAILOVER_REASONS:
-                    if _try_activate_fallback(agent, classified.reason, stream_callback):
+                    if _try_activate_fallback(agent, classified.reason, notice_callback):
                         retry_count = 0
                         use_cache, native_layout = should_use_prompt_caching(
                             provider=agent.provider, model=agent.model,
@@ -640,6 +675,7 @@ def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callabl
     if unavailable is None:
         unavailable = set()
         agent._unavailable_fallback_keys = unavailable
+    cooldowns = getattr(agent, "_cooldown_keys", None) or {}
     current_base = (getattr(agent, "base_url", "") or "").rstrip("/")
 
     while getattr(agent, "_fallback_index", 0) < len(chain):
@@ -649,6 +685,10 @@ def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callabl
         key = f"{fb.get('provider')}/{fb.get('model')}"
         if key in unavailable:
             logger.debug("fallback 跳过：%s 曾标记不可用", key)
+            continue
+        cd_until = cooldowns.get(key)
+        if cd_until and cd_until > time.time():
+            logger.debug("fallback 跳过：%s 额度冷却中", key)
             continue
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
@@ -693,13 +733,45 @@ def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callabl
     return False
 
 
+def _mark_primary_quota_cooldown(agent) -> None:
+    """把当前在跑的主 provider 标记为额度耗尽冷却。
+
+    冷却作用于两处：``_restore_primary_runtime`` 冷却期内新一轮不恢复主
+    provider；``_try_activate_fallback`` 跳过冷却期内与主家同名的链条目
+    （防止链走回刚失败的必败后端）。
+    """
+    until = time.time() + _PRIMARY_QUOTA_COOLDOWN_SECONDS
+    agent._primary_cooldown_until = until
+    key = f"{getattr(agent, 'provider', '')}/{getattr(agent, 'model', '')}"
+    cooldowns = getattr(agent, "_cooldown_keys", None)
+    if cooldowns is None:
+        cooldowns = {}
+        agent._cooldown_keys = cooldowns
+    cooldowns[key] = until
+    logger.warning(
+        "[fallback] 主 provider %s 额度耗尽，进入 %.0f 小时冷却（冷却期内直接用 fallback）",
+        key, _PRIMARY_QUOTA_COOLDOWN_SECONDS / 3600.0,
+    )
+
+
 def _restore_primary_runtime(agent) -> None:
     """新一轮开始时恢复主 provider（Hermes：fallback 是 turn 作用域）。
 
     主家持续不可用期间，每轮先给它一次机会，失败则链会按消息重新激活；
     无论上一轮是否切换过都重置索引，防止索引搁浅后永久阻断后续
     fallback（Hermes #20465 语义）。曾标记不可用的条目集合跨轮保留。
+    额度耗尽冷却期内例外：主家是"恢复期以天计的必败"，不恢复、沿用
+    上一轮 fallback 运行时，避免每条消息白打一次必败调用 + 刷通知。
     """
+    if (getattr(agent, "_primary_cooldown_until", 0) or 0) > time.time():
+        agent._fallback_activated = True
+        agent._fallback_index = 0
+        logger.info(
+            "[fallback] 主 provider 额度冷却中，本轮沿用 fallback provider=%s model=%s",
+            agent.provider, agent.model,
+        )
+        return
+    agent._primary_cooldown_until = 0
     primary = getattr(agent, "_primary_runtime", None)
     if getattr(agent, "_fallback_activated", False) and primary:
         agent.provider = primary["provider"]
@@ -797,6 +869,55 @@ def _call_llm(
     request_kwargs["stream"] = True
     stream = agent.client.chat.completions.create(**request_kwargs)
 
+    # ── 流看门狗：首字节 TTFB + chunk 间隔停滞检测 ────────────
+    # 半开连接/停滞流会让下面的 chunk 循环永久阻塞（socket 读无超时）。
+    # 看门狗超限时从另一线程 close 流解锁（Python 打断不了 C 层 socket
+    # read，只能关连接），抛 timeout 类异常进外层重试循环重连。
+    ttfb_lim = float(get_config_value("timeouts.stream_ttfb_seconds", 90.0))
+    stale_lim = float(get_config_value("timeouts.stream_chunk_stale_seconds", 120.0))
+    wd: Dict[str, Any] = {
+        "last": time.monotonic(), "first": False, "kill": "",
+        "stop": threading.Event(),
+    }
+
+    def _watchdog() -> None:
+        while not wd["stop"].wait(5.0):
+            gap = time.monotonic() - wd["last"]
+            if not wd["first"]:
+                if ttfb_lim > 0 and gap > ttfb_lim:
+                    wd["kill"] = (
+                        f"流看门狗 timeout：{gap:.0f}s 无首字节"
+                        f"（限 {ttfb_lim:.0f}s）"
+                    )
+                    break
+            elif stale_lim > 0 and gap > stale_lim:
+                wd["kill"] = (
+                    f"流看门狗 timeout：{gap:.0f}s 无新 chunk"
+                    f"（限 {stale_lim:.0f}s）"
+                )
+                break
+        if wd["kill"]:
+            try:
+                stream.close()
+            except Exception:
+                logger.debug("看门狗关流失败", exc_info=True)
+
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+    def _watched_chunks():
+        try:
+            for chunk in stream:
+                wd["last"] = time.monotonic()
+                wd["first"] = True
+                yield chunk
+        except Exception as exc:
+            wd["stop"].set()
+            if wd["kill"]:
+                raise StreamStaleTimeoutError(wd["kill"]) from exc
+            raise
+        finally:
+            wd["stop"].set()
+
     content_parts: List[str] = []
     pushed_parts: List[str] = []
     tc_buffers: Dict[int, Dict[str, str]] = {}
@@ -804,7 +925,7 @@ def _call_llm(
     usage = None
     gate_open = True
 
-    for chunk in stream:
+    for chunk in _watched_chunks():
         u = getattr(chunk, "usage", None)
         if u:
             usage = u
@@ -843,6 +964,10 @@ def _call_llm(
                         buf["name"] += tc.function.name
                     if tc.function.arguments:
                         buf["arguments"] += tc.function.arguments
+
+    if wd["kill"]:
+        # 流被 close 静默结束（未抛异常）：同样抛超时进重试循环
+        raise StreamStaleTimeoutError(wd["kill"])
 
     # 组装为与非流式一致的响应结构
     tool_calls_objs = [

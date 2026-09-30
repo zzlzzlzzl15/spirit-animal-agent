@@ -96,6 +96,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.send('resize-window', { width, height })
   },
 
+  /** 交互态捕获开关：菜单/面板/拖拽期间整窗收回鼠标捕获 */
+  setForceCapture: (force: boolean): void => {
+    ipcRenderer.send('pet-set-force-capture', { force })
+  },
+
   // ── 事件监听 ──────────────────────────────────────────────
 
   /** 监听主进程发来的切换宠物事件 */
@@ -139,6 +144,7 @@ declare global {
       saveScale: (scale: number) => void
       moveWindow: (deltaX: number, deltaY: number) => void
       resizeWindow: (width: number, height: number) => void
+      setForceCapture: (force: boolean) => void
       onSwitchPet: (callback: (data: { slug: string }) => void) => void
       removeAllListeners: (channel: string) => void
     }

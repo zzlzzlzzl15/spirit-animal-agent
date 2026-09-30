@@ -420,12 +420,16 @@ class SpiritAgent:
         self,
         message: str,
         stream_callback: Optional[Callable[[str], None]] = None,
+        notice_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         """对话接口 — 返回完整响应（含工具调用）。
 
         Args:
             message: 用户消息
             stream_callback: 可选的流式文本增量回调（集成在主循环内）
+            notice_callback: 可选的过程通知回调（fallback 切换等；缺省复用
+                stream_callback）。桌面链路用它把通知与流式增量分通道推送，
+                避免通知占用 streamBuffer 吞掉轮末错误结论的兜底渲染。
 
         Returns:
             dict: {
@@ -435,7 +439,11 @@ class SpiritAgent:
                 'iterations': int - 迭代次数
             }
         """
-        result = self.run_conversation(message, stream_callback=stream_callback)
+        result = self.run_conversation(
+            message,
+            stream_callback=stream_callback,
+            notice_callback=notice_callback,
+        )
         return {
             'response': result.response,
             'tool_calls': result.tool_calls,

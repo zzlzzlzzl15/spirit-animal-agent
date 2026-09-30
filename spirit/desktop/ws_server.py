@@ -207,6 +207,8 @@ class WSServer:
         self.host = host
         self.port = port
         self.agent = agent
+        if agent is not None:
+            self._install_incremental_persist_hook(agent)
 
         # 语音引擎（延迟初始化）
         self._voice_engine: Optional[VoiceEngine] = None
@@ -231,6 +233,8 @@ class WSServer:
         # 会话起始时间（弹窗会话行显示 开始时刻+历时，不裸显 UUID）
         self._session_track_id: Optional[str] = None
         self._session_started_at: float = 0.0
+        # 会话增量落库游标（每轮 chat 后只补写新消息；resume/new 时重置）
+        self._persisted_msg_count: int = 0
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -244,6 +248,26 @@ class WSServer:
             )
 
         self._running = True
+
+        # 子 Agent 进度事件 → 广播给所有 CLI 客户端。
+        # delegate_tool 在子 Agent 线程内回调 sink，这里桥接到事件循环。
+        try:
+            from spirit.tools.delegate_tool import set_delegate_progress_sink
+
+            loop = asyncio.get_running_loop()
+
+            def _delegate_progress_sink(evt: Dict[str, Any]) -> None:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.broadcast("delegate_event", evt), loop
+                    )
+                except Exception:
+                    pass
+
+            set_delegate_progress_sink(_delegate_progress_sink)
+        except Exception as exc:
+            logger.debug("委派进度 sink 注册失败 (非致命): %s", exc)
+
         self._server = await websockets.server.serve(
             self._handle_client,
             self.host,
@@ -391,7 +415,7 @@ class WSServer:
             if not key or (base, key[:12]) in seen:
                 continue
             seen.add((base, key[:12]))
-            targets.append((entry.get("name") or entry.get("model") or "provider",
+            targets.append((entry.get("model") or entry.get("name") or "provider",
                             entry.get("provider") or "", base, key))
         return targets
 
@@ -420,6 +444,86 @@ class WSServer:
                 loop.run_in_executor(None, self._usage_sync, False)
         except RuntimeError:
             pass
+
+    # ------------------------------------------------------------------
+    # 会话持久化 / 最近任务列表 / 会话恢复
+    # ------------------------------------------------------------------
+
+    def _install_incremental_persist_hook(self, agent) -> None:
+        """桌面链路落库去重：把生命周期钩子的整批落库换成水位增量落库。
+
+        lifecycle_hooks 的 _on_session_end/_on_agent_destroy 会
+        save_messages(全量)，与 _persist_session 的每轮增量落库叠加 →
+        messages 表出现重复行（任务列表重复行、resume 重复上下文）。
+        桌面侧统一走增量；CLI 链路不经 ws_server，保留整批落库不受影响。
+        """
+        hm = getattr(agent, "hook_manager", None)
+        if hm is None:
+            return
+        for _prio, handler in list(getattr(hm, "_hooks", {}).get("on_session_end", [])):
+            if getattr(handler, "__name__", "") == "_on_session_end":
+                hm.unregister("on_session_end", handler)
+        for _prio, handler in list(getattr(hm, "_hooks", {}).get("on_agent_destroy", [])):
+            if getattr(handler, "__name__", "") == "_on_agent_destroy":
+                hm.unregister("on_agent_destroy", handler)
+
+        def _on_session_end_persist(session_id: str = "", **_kwargs):
+            # 钩子在清空 _messages 之前触发，此时水位仍对应旧会话，补写尾部即可
+            self._persist_session()
+
+        hm.register("on_session_end", _on_session_end_persist)
+        hm.register("on_agent_destroy", _on_session_end_persist)
+        logger.info("桌面落库钩子已切换为增量模式")
+
+    def _ensure_session_row(self) -> None:
+        """确保当前会话在 DB 有记录（桌面链路构造 Agent 时不建会话行）。"""
+        db = getattr(self.agent, "_session_db", None)
+        if db is None or not self.agent.session_id:
+            return
+        try:
+            if db.get_session(self.agent.session_id) is None:
+                db.create_session(
+                    session_id=self.agent.session_id,
+                    source=getattr(self.agent, "platform", "cli") or "cli",
+                    model=self.agent.model or "",
+                )
+        except Exception as exc:
+            logger.debug("创建会话记录失败 (非致命): %s", exc)
+
+    def _persist_session(self) -> None:
+        """增量持久化当前会话消息（每轮 chat 结束后调用）。
+
+        落库时机原本只有 on_session_end/on_agent_destroy 钩子——桌面后端
+        被强杀时消息全丢（state.db 的 messages 表长期为空）。这里在每轮
+        chat 收尾时补写新消息，保证进程被杀也不丢历史。
+        """
+        agent = self.agent
+        db = getattr(agent, "_session_db", None) if agent is not None else None
+        if db is None:
+            return
+        try:
+            self._ensure_session_row()
+            msgs = agent.messages
+            if self._persisted_msg_count > len(msgs):
+                self._persisted_msg_count = 0  # 会话被外部切换，游标失效重计
+            if len(msgs) > self._persisted_msg_count:
+                db.save_messages(agent.session_id, msgs[self._persisted_msg_count:])
+                self._persisted_msg_count = len(msgs)
+        except Exception as exc:
+            logger.debug("会话持久化失败 (非致命): %s", exc)
+
+    @staticmethod
+    def _summarize_question(text: Any) -> str:
+        """用户问题的一行总结：折叠空白、取首句、截断 40 字。"""
+        t = " ".join(str(text or "").split())
+        if not t:
+            return ""
+        for sep in ("。", "！", "？", "!", "?", "；", ";"):
+            idx = t.find(sep)
+            if 0 < idx < len(t) - 1:
+                t = t[: idx + 1]
+                break
+        return t[:40] + ("…" if len(t) > 40 else "")
 
     def _status_with_agent(self) -> Dict[str, Any]:
         """PetEngine 全量状态 + Agent 运行字段（扁平合并）。
@@ -638,14 +742,41 @@ class WSServer:
                     except Exception:
                         pass
 
+                async def _push_stream_notice(text):
+                    try:
+                        if text:
+                            await client.send_event("stream_notice", {"text": text})
+                    except Exception:
+                        pass
+
+                def _sync_notice_callback(text):
+                    """fallback 切换等过程通知：独立通道，不计入流式增量。
+
+                    通知若混进 stream_delta，前端 streamBuffer 非空 → 轮末
+                    错误结论（如 [API 调用失败]）的兜底渲染被"已流式送达"
+                    判定吞掉，失败轮对用户完全静默（静默事故根因）。
+                    """
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            _push_stream_notice(text), loop
+                        ).result(timeout=10)
+                    except Exception:
+                        pass
+
                 def _dispatch(text):
                     """把一轮对话派发到执行器线程（流式/非流式单一路径）。"""
                     if self.agent.config.streaming_enabled:
                         return loop.run_in_executor(
-                            None, self.agent.chat, text, _sync_delta_callback
+                            None, lambda: self.agent.chat(
+                                text, _sync_delta_callback, _sync_notice_callback
+                            )
                         )
-                    # 非流式模式：等待完整响应
-                    return loop.run_in_executor(None, self.agent.chat, text)
+                    # 非流式模式：等待完整响应（通知仍走独立通道保证可见）
+                    return loop.run_in_executor(
+                        None, lambda: self.agent.chat(
+                            text, None, _sync_notice_callback
+                        )
+                    )
 
                 # ── 超时自动续跑主循环 ───────────────────────
                 # 正常完成 → break 走收尾；超时 → 中断当前轮 + 等旧循环退出 +
@@ -660,6 +791,17 @@ class WSServer:
                     except asyncio.TimeoutError:
                         logger.warning("聊天请求超时 (%.1f 秒)，中断 Agent", chat_timeout)
                         self.agent.interrupt()
+                        # 点杀委派中仍在跑的子 Agent：否则旧 delegate_task 线程
+                        # 会一直 join 子线程，宽限期内落不定、续跑轮还可能双跑
+                        try:
+                            from spirit.tools.delegate_tool import interrupt_live_children
+                            n_killed = interrupt_live_children("chat 超时自动续跑")
+                            if n_killed:
+                                logger.warning(
+                                    "chat 超时：已中断 %d 个运行中子 Agent", n_killed,
+                                )
+                        except Exception:
+                            logger.debug("中断活跃子 Agent 失败", exc_info=True)
                         if not auto_resume or resumes_used >= max_resumes:
                             reason = (
                                 f"请求超时（{chat_timeout:.0f} 秒），自动续跑"
@@ -677,6 +819,36 @@ class WSServer:
                             f"\n⏳ 请求超时（{chat_timeout:.0f} 秒），自动续跑未完成"
                             f"任务（第 {resumes_used}/{max_resumes} 轮）…\n"
                         )
+                        # 结构化续跑边界事件：前端据此清空工具计时 FIFO，
+                        # 避免续跑轮的工具完成行配对到上一轮的起始时间戳
+                        try:
+                            await self.broadcast("resume_round", {
+                                "round": resumes_used, "max": max_resumes,
+                            })
+                        except Exception:
+                            logger.debug("resume_round 广播失败", exc_info=True)
+                        # 续跑指令 + 未完成委派子任务清单：让新一轮直接
+                        # 重新委派中断的子任务，而不是自己漫游重规划
+                        current_message = _RESUME_CONTINUATION_PROMPT
+                        try:
+                            from spirit.tools.delegate_tool import (
+                                get_unfinished_delegate_tasks,
+                            )
+                            unfinished = get_unfinished_delegate_tasks()
+                        except Exception:
+                            unfinished = []
+                        if unfinished:
+                            lines = "\n".join(
+                                f"- [{u.get('name', '?')}]（{u.get('status', '?')}）"
+                                f"{u.get('goal', '')}"
+                                + (f"\n  上下文: {u['context'][:500]}" if u.get('context') else "")
+                                for u in unfinished[:5]
+                            )
+                            current_message += (
+                                "\n[未完成子任务] 上一轮 delegate_task 被超时中断，"
+                                "以下子任务未成功，请用 delegate_task 重新委派启动它们"
+                                "（已成功的不要重做）：\n" + lines
+                            )
                         # 旧对话循环见到中断标志才会退出（可能正卡在 LLM 调用/
                         # 工具调用里），必须等它落定再开新一轮，避免两个 chat
                         # 并行改会话消息。用轮询而非 wait_for/shield：嵌套
@@ -699,7 +871,6 @@ class WSServer:
                             }
                         # 旧循环已落定（[已中断]/异常/结果均可），会话状态可用
                         self.agent.clear_interrupt()
-                        current_message = _RESUME_CONTINUATION_PROMPT
                     except asyncio.CancelledError:
                         # 外部取消（断连/关停）或 asyncio 取消记账异常：
                         # 不续跑、立即收敛，避免孤儿任务与状态污染
@@ -766,6 +937,8 @@ class WSServer:
                 self.agent.on_tool_start = original_on_tool_start
                 self.agent.on_tool_complete = original_on_tool_complete
                 self._active_chats -= 1
+                # 每轮结束增量落库：进程被强杀也不丢会话历史
+                self._persist_session()
         reg("chat", cmd_chat)
 
         async def cmd_transcribe_audio(client, data):
@@ -996,10 +1169,152 @@ class WSServer:
                 return {"error": "Agent 未连接"}
             try:
                 self.agent.reset_session()
+                self._persisted_msg_count = 0  # 新会话重新计数
                 return {"message": "新会话已开始", "session_id": self.agent.session_id}
             except Exception as exc:
                 return {"error": str(exc)}
         reg("new_session", cmd_new_session)
+
+        async def cmd_list_sessions(client, data):
+            """最近用户问题列表（CLI 启动展示最新 5 条，点击编号恢复其会话）。
+
+            粒度是“用户问题”而非“会话”：同一会话里的多次提问各占一行；
+            摘要取问题首句截断 40 字，不把多行原文铺在列表里。
+            """
+            if self.agent is None:
+                return {"tasks": [], "error": "Agent 未连接"}
+            try:
+                limit = int(data.get("limit", 5))
+            except (TypeError, ValueError):
+                limit = 5
+            tasks: List[Dict[str, Any]] = []
+
+            def _is_injected(content: Any) -> bool:
+                # 跳过系统注入消息（截断续写/超时续跑提示），它们不是用户提问
+                return str(content or "").lstrip().startswith("[系统")
+
+            def _push(sid: str, content: Any, current: bool, created: str = "") -> None:
+                if isinstance(content, list):
+                    content = " ".join(
+                        p.get("text", "") for p in content if isinstance(p, dict)
+                    )
+                text = self._summarize_question(content)
+                if not text:
+                    return
+                tasks.append({
+                    "session_id": sid,
+                    "question": text,
+                    "current": current,
+                    "created_at": created,
+                })
+
+            # 当前会话（内存中，可能尚未落库）：倒序扫用户问题
+            cur_sid = self.agent.session_id
+            for m in reversed(self.agent.messages):
+                if m.get("role") != "user" or _is_injected(m.get("content")):
+                    continue
+                _push(cur_sid, m.get("content"), True)
+                if len(tasks) >= limit:
+                    break
+            # 历史会话：按开始时间倒序补齐名额
+            db = getattr(self.agent, "_session_db", None)
+            if db is not None and len(tasks) < limit:
+                for row in db.list_sessions(limit=30):
+                    sid = row.get("id")
+                    if sid == cur_sid:
+                        continue
+                    for m in reversed(db.get_messages(sid)):
+                        if m.get("role") != "user" or _is_injected(m.get("content")):
+                            continue
+                        _push(sid, m.get("content"), False, m.get("created_at") or "")
+                        if len(tasks) >= limit:
+                            break
+                    if len(tasks) >= limit:
+                        break
+            return {"tasks": tasks[:limit]}
+        reg("list_sessions", cmd_list_sessions)
+
+        async def cmd_resume_session(client, data):
+            """恢复历史会话：切换 Agent 会话并返回历史供 CLI 回放，之后可继续对话。"""
+            if self.agent is None:
+                return {"error": "Agent 未连接"}
+            session_id = str(data.get("session_id") or "").strip()
+            if not session_id:
+                return {"error": "缺少 session_id 参数"}
+            if self._active_chats > 0:
+                return {"error": "有任务正在运行，请先等待完成再切换会话"}
+            try:
+                # 1. 当前会话先落库（不丢正在进行的上下文）
+                self._persist_session()
+                db = getattr(self.agent, "_session_db", None)
+                if db is None:
+                    return {"error": "会话数据库不可用"}
+                if db.get_session(session_id) is None:
+                    return {"error": "目标会话不存在"}
+                rows = db.get_messages(session_id)
+                if not rows:
+                    return {"error": "目标会话没有历史消息"}
+
+                # 2. 重建内存消息（跳过 system：主循环在消息为空时会自动重建；
+                #    还原 tool_calls 保证 assistant/tool 消息对 LLM 合法）
+                rebuilt = []
+                for r in rows:
+                    role = r.get("role") or ""
+                    if role == "system":
+                        continue
+                    msg: Dict[str, Any] = {"role": role, "content": r.get("content") or ""}
+                    tc_raw = r.get("tool_calls")
+                    if tc_raw:
+                        try:
+                            msg["tool_calls"] = json.loads(tc_raw)
+                        except Exception:
+                            pass
+                    if r.get("tool_call_id"):
+                        msg["tool_call_id"] = r["tool_call_id"]
+                    rebuilt.append(msg)
+                if not rebuilt:
+                    return {"error": "目标会话没有可恢复的消息"}
+
+                # 3. 切换会话（对齐 reset_session 的状态清理，但保留历史）
+                self.agent._messages.clear()
+                self.agent._messages.extend(rebuilt)
+                self.agent.session_id = session_id
+                self.agent._api_call_count = 0
+                self.agent._interrupt_requested = False
+                self.agent._cached_system_prompt = None
+                self.agent._goal_manager = None
+                try:
+                    db.reopen_session(session_id)
+                except Exception as exc:
+                    logger.debug("重开会话失败 (非致命): %s", exc)
+                self._persisted_msg_count = len(rebuilt)
+                # 弹窗会话行打点归零：get_status 检测到 session_id 变化会重记起始时间
+                self._session_track_id = None
+                self._session_started_at = 0.0
+
+                # 4. 历史视图（user/assistant，截断后供 CLI 回放）
+                history = []
+                for m in rebuilt:
+                    if m["role"] not in ("user", "assistant"):
+                        continue
+                    text = m.get("content")
+                    if isinstance(text, list):
+                        text = " ".join(
+                            p.get("text", "") for p in text if isinstance(p, dict)
+                        )
+                    text = " ".join(str(text or "").split())
+                    if not text:
+                        continue
+                    history.append({"role": m["role"], "content": text[:800]})
+                return {
+                    "session_id": session_id,
+                    "message_count": len(rebuilt),
+                    "history": history[-40:],
+                    "total_history": len(history),
+                }
+            except Exception as exc:
+                return {"error": f"恢复会话失败: {exc}"}
+        reg("resume_session", cmd_resume_session)
 
         async def cmd_get_history(client, data):
             """获取对话历史。"""

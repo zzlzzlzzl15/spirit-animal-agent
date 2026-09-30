@@ -60,6 +60,147 @@ TARGET_TOOLS: Set[str] = {
 _saved_paths: Set[str] = set()
 _saved_lock = threading.Lock()
 
+# 上传成功但索引（embedding）待验证的文档：document_id -> 元信息
+# 用于「写入即验证」：create_text 返回 success 只代表文档入库，
+# 向量索引是服务端异步处理的，失败时内容存在但搜不到（静默丢失）。
+_pending_verify: Dict[str, Dict[str, Any]] = {}
+_verify_lock = threading.Lock()
+
+# 索引验证的等待与重试参数
+VERIFY_DELAY_SECONDS = get_config_value("memora.verify_delay", 90)
+VERIFY_POLL_INTERVAL = get_config_value("memora.verify_poll_interval", 20)
+VERIFY_MAX_WAIT = get_config_value("memora.verify_max_wait", 420)
+MAX_AUTO_REPROCESS = get_config_value("memora.max_auto_reprocess", 1)
+
+
+def _claim_path(file_path: str) -> bool:
+    """尝试占用路径（已占用则返回 False）。
+
+    上传**前**占位，避免同一文件并发写入时重复上传；
+    若上传失败，必须调用 `_release_path()` 释放，否则该文件
+    在本进程生命周期内永远不会被重试（静默丢失）。
+    """
+    with _saved_lock:
+        resolved = str(Path(file_path).resolve())
+        if resolved in _saved_paths:
+            return False
+        _saved_paths.add(resolved)
+        return True
+
+
+def _release_path(file_path: str) -> None:
+    """释放路径占位（上传失败时调用，使后续重试成为可能）。"""
+    with _saved_lock:
+        _saved_paths.discard(str(Path(file_path).resolve()))
+
+
+# ---------------------------------------------------------------------------
+# 索引（embedding）验证与自愈
+# ---------------------------------------------------------------------------
+
+def _schedule_verify(document_id: str, file_path: str, title: str) -> None:
+    """调度后台线程验证文档的 embedding 是否真正建成。
+
+    失败时：记录显著告警 + 尝试自动 reprocess（最多 MAX_AUTO_REPROCESS 次）
+    + 仍失败则释放路径占位，使后续写入可重新触发上传。
+
+    设计约束：
+    · 全程在 daemon 线程，绝不阻塞主对话流程
+    · 任何异常都被吞掉并降级为 debug 日志（钩子不得影响主功能）
+    """
+    with _verify_lock:
+        _pending_verify[document_id] = {
+            "file_path": file_path,
+            "title": title,
+            "reprocessed": 0,
+        }
+
+    def _worker():
+        try:
+            asyncio.run(_verify_and_heal(document_id))
+        except Exception as e:
+            logger.debug("索引验证线程异常: %s", e)
+
+    threading.Thread(
+        target=_worker,
+        name=f"memora-verify-{title[:16]}",
+        daemon=True,
+    ).start()
+
+
+async def _verify_and_heal(document_id: str) -> None:
+    """轮询文档索引状态；失败则自动 reprocess 并再次确认。"""
+    from spirit.skills.memora_client import get_memora_client
+
+    client = get_memora_client()
+
+    with _verify_lock:
+        meta = dict(_pending_verify.get(document_id) or {})
+    file_path = meta.get("file_path", "")
+    title = meta.get("title", document_id)
+
+    await asyncio.sleep(VERIFY_DELAY_SECONDS)
+
+    deadline = VERIFY_DELAY_SECONDS + VERIFY_MAX_WAIT
+    waited = VERIFY_DELAY_SECONDS
+    status = None
+
+    while waited <= deadline:
+        status = await client.get_document_status(document_id)
+        state = status.get("status")
+        if state == "completed":
+            logger.debug("知识库索引已建成: %s", title)
+            _forget_pending(document_id)
+            return
+        if state == "failed":
+            break
+        # pending / chunking / embedding —— 继续等
+        await asyncio.sleep(VERIFY_POLL_INTERVAL)
+        waited += VERIFY_POLL_INTERVAL
+
+    err = (status or {}).get("error_message") or "未知错误"
+
+    # 尝试自动重建索引
+    if meta.get("reprocessed", 0) < MAX_AUTO_REPROCESS:
+        logger.warning(
+            "知识库索引失败，尝试自动重建: %s — %s", title, err,
+        )
+        with _verify_lock:
+            if document_id in _pending_verify:
+                _pending_verify[document_id]["reprocessed"] = \
+                    _pending_verify[document_id].get("reprocessed", 0) + 1
+        try:
+            result = await client.reprocess_document(document_id)
+            doc_status = (result.get("document_status") or {}).get("status")
+            if result.get("status") == "success" and doc_status != "failed":
+                logger.info("知识库索引重建成功: %s", title)
+                _forget_pending(document_id)
+                return
+        except Exception as e:
+            logger.warning("知识库索引重建异常: %s — %s", title, e)
+
+    # 仍然失败：显著告警 + 释放占位以便重试
+    logger.warning(
+        "⚠ 文档已入库但无法被语义搜索命中（embedding 失败）: %s — %s；"
+        "常见原因为 LLM/embedding 服务欠费或限流，"
+        "恢复后可用 MemoraClient.reprocess_document() 重建索引",
+        title, err,
+    )
+    _forget_pending(document_id)
+    if file_path:
+        _release_path(file_path)
+
+
+def _forget_pending(document_id: str) -> None:
+    with _verify_lock:
+        _pending_verify.pop(document_id, None)
+
+
+def get_pending_verify() -> Dict[str, Dict[str, Any]]:
+    """返回当前正在验证索引的文档（供测试/诊断使用）。"""
+    with _verify_lock:
+        return dict(_pending_verify)
+
 
 # ---------------------------------------------------------------------------
 # 自动保存逻辑
@@ -93,13 +234,6 @@ def _should_save_file(file_path: str) -> bool:
     for pattern in EXCLUDED_DIR_PATTERNS:
         if pattern.lower() in path_str:
             return False
-
-    # 去重检查
-    with _saved_lock:
-        resolved = str(path.resolve())
-        if resolved in _saved_paths:
-            return False
-        _saved_paths.add(resolved)
 
     return True
 
@@ -195,12 +329,21 @@ def on_tool_complete(
     if not _should_save_file(file_path):
         return
 
+    # 去重：占用路径（失败时会在上传线程里释放）
+    if not _claim_path(file_path):
+        return
+
     # 异步上传（不阻塞主流程）
     _schedule_upload(file_path)
 
 
 def _schedule_upload(file_path: str) -> None:
-    """调度异步上传到 Memora。"""
+    """调度异步上传到 Memora。
+
+    上传失败时（服务不可用、网络错误、API 报错）会释放路径占位，
+    使下一次对同一文件的写入能重新触发上传——避免因一次偶发失败
+    而永久丢失文档。
+    """
     def _upload_worker():
         """在后台线程中执行上传。"""
         try:
@@ -210,6 +353,7 @@ def _schedule_upload(file_path: str) -> None:
                 client = get_memora_client()
                 if not await client.health_check():
                     logger.debug("Memora 不可用，跳过自动保存: %s", file_path)
+                    _release_path(file_path)  # 释放占位，便于后续重试
                     return
 
                 path = Path(file_path)
@@ -223,6 +367,7 @@ def _schedule_upload(file_path: str) -> None:
                         result = await client.create_text(title, content, tags=tags)
                     except Exception as e:
                         logger.warning("自动保存文本失败: %s — %s", file_path, e)
+                        _release_path(file_path)
                         return
                 else:
                     # 二进制文件（HTML 等）上传文件
@@ -233,15 +378,21 @@ def _schedule_upload(file_path: str) -> None:
                         "自动保存到知识库: %s → %s",
                         file_path, result.get("document_id", "?"),
                     )
+                    doc_id = result.get("document_id", "")
+                    if doc_id:
+                        # 入库 ≠ 可搜索：异步验证 embedding 是否真正建成
+                        _schedule_verify(doc_id, file_path, title)
                 else:
                     logger.warning(
                         "自动保存失败: %s — %s",
                         file_path, result.get("error", "未知错误"),
                     )
+                    _release_path(file_path)
 
             asyncio.run(_do_upload())
         except Exception as e:
             logger.debug("自动保存线程异常: %s", e)
+            _release_path(file_path)
 
     thread = threading.Thread(
         target=_upload_worker,

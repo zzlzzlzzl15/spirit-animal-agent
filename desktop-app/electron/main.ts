@@ -9,7 +9,7 @@
  */
 
 import { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, powerMonitor } from 'electron'
-import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow, showPetWindow, hidePetWindow, forceRedrawPetWindow, startPetWatchdog, stopPetWatchdog, movePetWindow } from './window'
+import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow, showPetWindow, hidePetWindow, forceRedrawPetWindow, startPetWatchdog, stopPetWatchdog, movePetWindow, setPetForceCapture } from './window'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 
@@ -50,8 +50,9 @@ app.whenReady().then(async () => {
   const savedX = store.get('windowX') as number
   const savedY = store.get('windowY') as number
   let savedScale = store.get('petScale') as number
-  // 强制使用新的默认缩放（旧值太小）
-  if (savedScale < 0.75 || savedScale > 3.0) {
+  // 越界保护（与滚轮缩放同界）；不再抬高下限——用户保存的小缩放被强制
+  // 放大后窗口矩形随之变大，透明边距吞点击的范围也会变大
+  if (savedScale < 0.2 || savedScale > 3.0) {
     savedScale = 0.75
     store.set('petScale', savedScale)
   }
@@ -210,6 +211,11 @@ function registerIPC(): void {
       activePetSlug: store.get('activePetSlug'),
       wsPort: WS_PORT,
     }
+  })
+
+  // 渲染层交互态（菜单/面板/拖拽）→ 整窗收回捕获；平时由主进程命中轮询接管
+  ipcMain.on('pet-set-force-capture', (_event, { force }: { force: boolean }) => {
+    setPetForceCapture(force)
   })
 
   // 窗口拖拽移动（走 movePetWindow 统一入口，坐标经屏幕边界钳制，防止拖出屏幕）

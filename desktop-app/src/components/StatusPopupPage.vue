@@ -78,8 +78,8 @@ function fmtReset(s: number): string {
   return h > 0 ? `${h}h${m}m` : `${m}m`
 }
 
-// 额度行：有官方查询 API 的 provider 显示 5h 已用百分比+重置倒计时，
-// 无 API 的（如阿里云 Token Plan 月度 Credits）如实标注
+// 额度行：每行一个模型 → 它的额度（极简，不堆文案）；
+// 5h 窗口显示已用% + 重置倒计时，月度 Credits（无查询 API）只标去向
 const usageRows = computed(() => {
   if (usagePending.value) return [{ label: '额度', value: '查询中…', dim: true }]
   const providers = status.value.usage?.providers || []
@@ -87,12 +87,11 @@ const usageRows = computed(() => {
   for (const p of providers) {
     if (p.available && p.window === '5h') {
       const reset = fmtReset(p.reset_seconds || 0)
-      rows.push({
-        label: `5h额度·${p.name}`,
-        value: `已用 ${p.used_percent}%${reset ? ` · ${reset}重置` : ''}`,
-      })
+      rows.push({ label: p.name, value: `5h已用${p.used_percent}%${reset ? ` · ${reset}重置` : ''}` })
+    } else if (p.window === 'month') {
+      rows.push({ label: p.name, value: '月度·控制台查' })
     } else {
-      rows.push({ label: `额度·${p.name}`, value: p.reason || '无查询接口', dim: true })
+      rows.push({ label: p.name, value: p.reason || '-', dim: true })
     }
   }
   if (!rows.length) rows.push({ label: '额度', value: '-', dim: true })

@@ -198,6 +198,29 @@ function handleEvent(msg: any) {
       }
       break
 
+    case 'delegate_event':
+      // 子 Agent 进度（后端 delegate_tool sink 广播）：流内树状行 + 状态块
+      handleDelegateEvent(data)
+      break
+
+    case 'resume_round':
+      // 超时续跑边界：清空工具计时 FIFO，防续跑轮工具完成行
+      // 配对到上一轮的起始时间戳（曾现 list_dir 1356s 假耗时）
+      pendingToolStarts.length = 0
+      break
+
+    case 'stream_notice':
+      // 过程通知（fallback 切换等）：可见但不计入 streamBuffer ——
+      // 若计入，失败轮轮末 chat_complete 携带的错误结论兜底渲染会被
+      // "已流式送达"判定吞掉，整轮对用户完全静默（静默事故根因）。
+      console.log('[cli] stream_notice len=', (data.text || '').length)
+      if (term && isStreaming && data.text) {
+        stopSpinner()
+        feedMarkdown(data.text)
+        startSpinner('思考中')  // 通知后是退避重试空档，继续转
+      }
+      break
+
     case 'stream_delta':
       // 流式文本增量 — 逐行缓冲 + Markdown 格式化渲染
       // （不能直接 term.write：裸 \n 在 xterm 中不换列，会导致阶梯状错行）
@@ -256,6 +279,15 @@ interface SlashCommand {
 
 const SLASH_COMMANDS: Record<string, SlashCommand> = {
   // ═══ 会话 Session ═══
+  dlog: {
+    desc: '回看最近一次 delegate_task 子Agent 完整执行过程',
+    category: 'Info',
+    usage: '/dlog [子Agent序号，如 1]',
+    handler: async (args) => {
+      const n = args.trim()
+      dumpDlgLog(n ? `子Agent-${n}` : undefined)
+    },
+  },
   help: {
     desc: '显示帮助信息',
     category: 'Info',
@@ -314,6 +346,14 @@ const SLASH_COMMANDS: Record<string, SlashCommand> = {
       } catch (e: any) {
         term!.writeln(`\x1b[91m  ${e.message}\x1b[0m`)
       }
+    },
+  },
+  tasks: {
+    desc: '显示最近 5 个任务会话（点击可恢复并继续）',
+    category: 'Session',
+    usage: '/tasks',
+    handler: async () => {
+      await showRecentSessions()
     },
   },
   history: {
@@ -737,6 +777,209 @@ function stopSpinner() {
   }
 }
 
+// ── 子 Agent 实时视图（delegate_task 流内树状行 + 底部状态块）──────────
+// 参考 Hermes delegate_tool 的 spinner.print_above 树状行与 Claude Code 的
+// condensed/transcript 双档密度：默认把子 Agent 工具/思考树状行流式打进
+// scrollback（带子 Agent 名称前缀），Ctrl+D 收起为仅状态块，/dlog 回看全程。
+interface DChild {
+  id: string
+  name: string
+  goal: string
+  status: 'running' | 'done' | 'error'
+  turn: number
+  toolCount: number
+  genChars: number
+  cur: string
+  curSince: number
+  doneLine: string
+  attempt: number
+}
+const dlg = reactive({ active: false, expanded: true, startedAt: 0, children: [] as DChild[] })
+let dlgLog: { name: string; line: string }[] = []
+let dlgBlockLines = 0
+let dlgTimer: ReturnType<typeof setInterval> | null = null
+
+function dlgChild(id: string): DChild | undefined {
+  return dlg.children.find(c => c.id === id)
+}
+
+function dlgFmtAge(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  return `${Math.floor(s / 60)}m${s % 60}s`
+}
+
+// 擦除底部状态块（光标回到块下方原位）
+function dlgClearBlock() {
+  if (!term || dlgBlockLines <= 0) return
+  term.write(`\x1b[${dlgBlockLines}A`)
+  for (let i = 0; i < dlgBlockLines; i++) term.write('\r\x1b[K\r\n')
+  dlgBlockLines = 0
+}
+
+// 原地重绘状态块：头行 + 每子 Agent 一行（行数固定，无残留问题）
+function dlgRenderBlock() {
+  if (!term || !dlg.active) return
+  const running = dlg.children.filter(c => c.status === 'running').length
+  const done = dlg.children.length - running
+  const lines: string[] = []
+  lines.push(
+    `\x1b[36m🔀 子Agent ×${dlg.children.length} · 运行 ${running} · 完成 ${done} · 总耗时 ${dlgFmtAge(Date.now() - dlg.startedAt)} · Ctrl+D ${dlg.expanded ? '收起' : '展开'}\x1b[0m`
+  )
+  for (const c of dlg.children) {
+    if (c.status === 'running') {
+      const step = c.cur ? ` · ${c.cur} (${dlgFmtAge(Date.now() - c.curSince)})` : ''
+      const gen = c.genChars > 0 ? ` · 生成 ${(c.genChars / 1000).toFixed(1)}k 字` : ''
+      const att = c.attempt > 1 ? ` · 尝试 ${c.attempt}` : ''
+      lines.push(`\x1b[90m [${c.name}] ⏳ 轮 ${c.turn} · 工具 ${c.toolCount}${att}${step}${gen}\x1b[0m`)
+    } else if (c.status === 'done') {
+      lines.push(`\x1b[92m [${c.name}] ${c.doneLine}\x1b[0m`)
+    } else {
+      lines.push(`\x1b[91m [${c.name}] ${c.doneLine}\x1b[0m`)
+    }
+  }
+  if (dlgBlockLines > 0) term.write(`\x1b[${dlgBlockLines}A`)
+  lines.forEach(ln => term!.write(`\r\x1b[K${ln}\r\n`))
+  dlgBlockLines = lines.length
+}
+
+// 永久行：状态块在底部时先擦块、写行、再重绘块
+function dlgPrint(line: string) {
+  if (!term) return
+  flushMarkdown()
+  if (dlg.active) {
+    dlgClearBlock()
+    term.writeln(line)
+    dlgRenderBlock()
+  } else {
+    term.writeln(line)
+  }
+}
+
+function dumpDlgLog(filterName?: string) {
+  if (!term) return
+  if (!dlgLog.length) {
+    term.writeln('\x1b[90m（暂无 delegate_task 执行记录）\x1b[0m')
+    return
+  }
+  term.writeln(`\x1b[36m── delegate_task 完整执行过程${filterName ? `（${filterName}）` : ''} ──\x1b[0m`)
+  for (const e of dlgLog) {
+    if (filterName && e.name !== filterName) continue
+    term.writeln(e.line)
+  }
+  term.writeln('\x1b[36m── 回看结束 ──\x1b[0m')
+}
+
+function handleDelegateEvent(data: any) {
+  if (!data || !data.phase) return
+  const c = data.id ? dlgChild(data.id) : undefined
+  switch (data.phase) {
+    case 'start': {
+      dlg.active = true
+      dlg.expanded = true
+      dlg.startedAt = Date.now()
+      dlg.children = (data.children || []).map((ch: any) => ({
+        id: ch.id, name: ch.name, goal: ch.goal || '',
+        status: 'running' as const, turn: 0, toolCount: 0, genChars: 0,
+        cur: '', curSince: Date.now(), doneLine: '', attempt: 1,
+      }))
+      dlgLog = []
+      stopSpinner()
+      setRunning('委派子Agent')
+      dlgPrint(`\x1b[36m🔀 delegate_task · ${dlg.children.length} 个子Agent 已派发\x1b[0m\x1b[90m（树状行直播中 · Ctrl+D 收起 · /dlog 回看）\x1b[0m`)
+      for (const ch of dlg.children) {
+        dlgPrint(`\x1b[90m ├─ \x1b[36m[${ch.name}]\x1b[0m\x1b[90m 🔀 ${ch.goal}\x1b[0m`)
+      }
+      if (dlgTimer) clearInterval(dlgTimer)
+      dlgTimer = setInterval(() => dlgRenderBlock(), 1000)
+      dlgRenderBlock()
+      break
+    }
+    case 'child_turn':
+      if (c) { c.turn = data.turn || c.turn + 1; c.cur = '💭 思考/生成中'; c.curSince = Date.now(); c.genChars = 0 }
+      dlgRenderBlock()
+      break
+    case 'child_think': {
+      if (!c) break
+      c.cur = `💭 "${data.text || ''}"`
+      c.curSince = Date.now()
+      const thinkLine = `\x1b[90m [${c.name}] ├─ 💭 "${data.text || ''}"\x1b[0m`
+      dlgLog.push({ name: c.name, line: thinkLine })
+      if (dlg.expanded) dlgPrint(thinkLine)
+      else dlgRenderBlock()
+      break
+    }
+    case 'child_tool': {
+      if (!c) break
+      c.toolCount++
+      c.cur = `🔧 ${data.tool}`
+      c.curSince = Date.now()
+      const prev = data.preview ? ` "${data.preview}"` : ''
+      const toolLine = `\x1b[90m [${c.name}] ├─ 🔧 ${data.tool}\x1b[0m\x1b[90m${prev}\x1b[0m`
+      dlgLog.push({ name: c.name, line: toolLine })
+      if (dlg.expanded) dlgPrint(toolLine)
+      else dlgRenderBlock()
+      break
+    }
+    case 'child_tool_done': {
+      if (!c) break
+      const icon = data.ok ? '✓' : '✗'
+      const doneToolLine = ` [${c.name}] ├─ \x1b[${data.ok ? 92 : 91}m${icon} ${data.tool} 完成\x1b[0m\x1b[90m (${data.duration ?? '?'}s)\x1b[0m`
+      dlgLog.push({ name: c.name, line: doneToolLine })
+      c.cur = `${icon} ${data.tool}`
+      c.curSince = Date.now()
+      if (dlg.expanded) dlgPrint(doneToolLine)
+      else dlgRenderBlock()
+      break
+    }
+    case 'child_gen':
+      if (c) { c.genChars = data.chars || 0; if (data.turn) c.turn = data.turn }
+      dlgRenderBlock()
+      break
+    case 'child_restart': {
+      // 子任务停滞/单次超时/异常 → 后端自动重启：重置计数并打生命周期行
+      if (c) {
+        c.attempt = data.attempt || c.attempt + 1
+        c.status = 'running'
+        c.turn = 0; c.toolCount = 0; c.genChars = 0
+        c.cur = '♻ 重启中'; c.curSince = Date.now()
+      }
+      const name = c?.name || data.name || '?'
+      const rstLine = `\x1b[93m [${name}] ♻ 重启子任务 · 第 ${data.attempt ?? '?'} 次尝试\x1b[0m\x1b[90m · ${String(data.reason || '').substring(0, 60)}\x1b[0m`
+      dlgLog.push({ name, line: rstLine })
+      dlgPrint(rstLine)
+      break
+    }
+    case 'child_done': {
+      if (c) {
+        c.status = data.success ? 'done' : 'error'
+        const att = (data.attempts || 1) > 1 ? ` · 尝试 ${data.attempts} 次` : ''
+        c.doneLine = data.success
+          ? `└─ ✓ 完成 · ${data.iterations ?? '?'} 轮 · ${dlgFmtAge((data.duration || 0) * 1000)}${att}`
+          : `└─ ✗ 失败: ${String(data.error || '未知错误').substring(0, 60)}${att}`
+      }
+      const name = c?.name || data.name || '?'
+      const lifeLine = c
+        ? `\x1b[${c.status === 'done' ? 92 : 91}m [${name}] ${c.doneLine}\x1b[0m`
+        : ` [${name}] └─ ${data.success ? '✓' : '✗'}`
+      dlgLog.push({ name, line: lifeLine })
+      dlgPrint(lifeLine)  // 生命周期行：收起时也始终可见
+      break
+    }
+    case 'end': {
+      const wasActive = dlg.active
+      dlg.active = false
+      if (dlgTimer) { clearInterval(dlgTimer); dlgTimer = null }
+      if (wasActive) dlgClearBlock()
+      const total = (data.succeeded ?? 0) + (data.failed ?? 0)
+      const head = (data.failed || 0) === 0 ? '\x1b[92m✓' : '\x1b[93m✓'
+      const rst = (data.restarted || 0) > 0 ? `\x1b[93m · 重启 ${data.restarted} 次\x1b[0m` : ''
+      dlgPrint(`${head} delegate_task 完成 · 成功 ${data.succeeded ?? '?'}/${total}\x1b[0m${rst}\x1b[90m · ${dlgFmtAge((data.duration || 0) * 1000)} · 完整过程: /dlog\x1b[0m`)
+      break
+    }
+  }
+}
+
 // ── Markdown 逐行渲染器 ────────────────────────────────
 // 流式增量先缓冲，凑满整行再格式化为 ANSI 输出。
 // 解决两个问题：
@@ -829,6 +1072,83 @@ function printBanner() {
   term!.writeln('')
 }
 
+// ── 最近任务会话（启动/手动 /tasks 展示，点击编号恢复并继续）──────
+
+interface TaskItem {
+  session_id: string
+  question: string
+  current?: boolean
+}
+
+// 可点击任务行登记：buffer 行号 → 该行编号与所属会话（LinkProvider 消费）
+let sessionLinkLines: { line: number; index: number; sessionId: string }[] = []
+// 最近一次任务列表编号对应的会话 id（输入 [n] 恢复的兜底）
+let lastTaskIds: string[] = []
+
+async function showRecentSessions() {
+  if (!term) return
+  try {
+    const data = await wsSend('list_sessions', { limit: 5 })
+    const tasks: TaskItem[] = data.tasks || []
+    if (!tasks.length) return
+    term.writeln('\x1b[90m── 最近任务（点击编号或输入 [n] 恢复并继续，/tasks 重显）──\x1b[0m')
+    const startLine = term.buffer.active.baseY + term.buffer.active.cursorY + 1
+    tasks.forEach((t, i) => {
+      const tag = t.current ? ' \x1b[90m(当前)\x1b[0m' : ''
+      term!.writeln(`  \x1b[4;96m[${i + 1}]\x1b[0m \x1b[0;97m${t.question}\x1b[0m${tag}`)
+      sessionLinkLines.push({ line: startLine + i, index: i, sessionId: t.session_id })
+    })
+    if (sessionLinkLines.length > 40) sessionLinkLines.splice(0, sessionLinkLines.length - 40)
+    lastTaskIds = tasks.map(t => t.session_id)
+    term.writeln('')
+  } catch {
+    // 列表拉取失败不打扰输入（后端未就绪/超时）
+  }
+}
+
+async function resumeSessionById(sessionId: string) {
+  if (!term) return
+  if (isProcessing) {
+    term.writeln('\x1b[93m  有任务正在运行，请先等待完成再切换会话\x1b[0m')
+    return
+  }
+  isProcessing = true
+  try {
+    term.writeln('')
+    term.writeln('\x1b[90m  正在恢复会话…\x1b[0m')
+    const data = await wsSend('resume_session', { session_id: sessionId }, 15000)
+    if (data.error) {
+      term.writeln(`\x1b[91m  ${data.error}\x1b[0m`)
+      return
+    }
+    term.write('\x1b[2J\x1b[H')  // 清屏，回放历史会话
+    sessionLinkLines = []  // 旧列表行已清掉，注销点击命中防误触
+    printBanner()
+    const history: { role: string; content: string }[] = data.history || []
+    const shown = history.slice(-20)
+    if (data.total_history > shown.length) {
+      term.writeln(`\x1b[90m  …… 更早 ${data.total_history - shown.length} 条已省略 ……\x1b[0m`)
+    }
+    for (const m of shown) {
+      if (m.role === 'user') {
+        term.writeln(`\x1b[1;96m  你 ❯\x1b[0m ${m.content.substring(0, 200)}`)
+      } else {
+        term.writeln(`\x1b[1;93m  Spirit ❯\x1b[0m ${m.content.substring(0, 200)}`)
+      }
+      term.writeln('')
+    }
+    term.writeln(
+      `\x1b[92m  ✓ 会话已恢复（共 ${data.message_count} 条上下文），直接输入消息即可继续任务\x1b[0m`
+    )
+    term.writeln('')
+  } catch (e: any) {
+    term.writeln(`\x1b[91m  恢复失败: ${e.message}\x1b[0m`)
+  } finally {
+    isProcessing = false
+    printPrompt()
+  }
+}
+
 async function sendChatMessage(message: string) {
   term!.writeln('')
   isStreaming = true
@@ -886,6 +1206,16 @@ async function processInput(line: string) {
   if (!trimmed) {
     printPrompt()
     return
+  }
+
+  // 输入 [n] = 恢复最近任务列表第 n 项（点击编号的键盘兜底）
+  const taskPick = trimmed.match(/^\[(\d+)\]$/)
+  if (taskPick) {
+    const sid = lastTaskIds[parseInt(taskPick[1], 10) - 1]
+    if (sid) {
+      await resumeSessionById(sid)
+      return
+    }
   }
 
   // 添加到历史
@@ -983,7 +1313,36 @@ onMounted(async () => {
   fitAddon = new FitAddon()
   term.loadAddon(fitAddon)
   term.loadAddon(new WebLinksAddon())
+
   term.open(terminalRef.value)
+
+  // ── 最近任务行点击恢复（DOM 级命中：点中任务行任意位置即恢复其会话）──
+  // 不走 xterm registerLinkProvider（激活依赖 hover 命中，Electron 无边框
+  // 窗口下不可靠）：直接用鼠标坐标换算点击落在哪个 buffer 行。
+  const hitTaskSession = (ev: MouseEvent): string | null => {
+    const screenEl = term?.element?.querySelector('.xterm-screen') as HTMLElement | null
+    if (!screenEl || !term) return null
+    const rect = screenEl.getBoundingClientRect()
+    const cellH = rect.height / term.rows
+    if (cellH <= 0) return null
+    const rowInViewport = Math.floor((ev.clientY - rect.top) / cellH)
+    const absLine = term.buffer.active.viewportY + rowInViewport + 1
+    const entry = sessionLinkLines.find(l => l.line === absLine)
+    return entry ? entry.sessionId : null
+  }
+  terminalRef.value.addEventListener('click', (ev) => {
+    const sid = hitTaskSession(ev)
+    if (sid) {
+      ev.preventDefault()
+      ev.stopPropagation()
+      void resumeSessionById(sid)
+    }
+  })
+  terminalRef.value.addEventListener('mousemove', (ev) => {
+    if (terminalRef.value) {
+      terminalRef.value.style.cursor = hitTaskSession(ev) ? 'pointer' : ''
+    }
+  })
 
   // ── 剪贴板快捷键修复（Ctrl+V 粘贴 / Ctrl+C 复制）─────────────
   // Electron 无边框窗口默认不带 Edit 菜单角色，Ctrl+C/V 不会自动
@@ -1001,6 +1360,22 @@ onMounted(async () => {
       e.preventDefault()
       const text = api.clipboardRead()
       if (text) insertText(text)
+      return false
+    }
+
+    // 子 Agent 视图：Ctrl+D — 运行中收起/展开树状行直播；空闲时回看上次全程
+    if (e.ctrlKey && !e.shiftKey && key === 'd' && e.type === 'keydown') {
+      e.preventDefault()
+      if (dlg.active) {
+        dlg.expanded = !dlg.expanded
+        dlgClearBlock()
+        term?.writeln(dlg.expanded
+          ? '\x1b[90m[已展开] 子Agent 执行过程树状行直播到 scrollback\x1b[0m'
+          : '\x1b[90m[已收起] 仅显示状态块与生命周期行，/dlog 回看完整过程\x1b[0m')
+        dlgRenderBlock()
+      } else {
+        dumpDlgLog()
+      }
       return false
     }
 
@@ -1056,6 +1431,8 @@ onMounted(async () => {
   // 连接 WebSocket
   try {
     await wsConnect()
+    // 连上后展示最近 5 个任务（点击编号可恢复历史会话并继续）
+    await showRecentSessions()
   } catch {
     // 连接失败已在 onerror 中显示
   }

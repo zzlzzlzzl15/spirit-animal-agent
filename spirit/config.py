@@ -187,7 +187,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "execute_code_default": 60,           # Python 代码执行默认超时
         "execute_code_max": 300,              # Python 代码执行最大超时上限
         "web_default": 30.0,                  # Web 搜索/抓取默认超时
-        "delegate_default": 300,              # 子 Agent 委派任务默认超时
+        "delegate_default": 900,              # 子 Agent 委派单次尝试墙钟上限（超时自动重启子任务）
+        "stream_ttfb_seconds": 90.0,          # 流首字节看门狗：发起请求后 N 秒无任何 chunk → 杀流重试（0=禁用）
+        "stream_chunk_stale_seconds": 120.0,  # 流 chunk 间隔看门狗：N 秒无新 chunk → 判流死亡杀流重试（0=禁用）
         "memora_tool": 60,                    # Memora 知识库工具调用超时
         "gateway_confirm": 300,               # 斜杠命令确认等待超时
         "graph_client": 60.0,                 # MS Graph API 客户端请求超时
@@ -207,6 +209,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_resume_on_timeout": True,       # 超时中断当前轮后自动注入续跑指令重进循环，继续完成未完成任务
         "max_auto_resumes": 3,                # 单次聊天请求最多自动续跑轮数（防无限续跑烧 token）
         "resume_grace_seconds": 120,          # 超时后等旧对话循环退出的宽限秒数；逾放弃续跑（防双 chat 并行）
+    },
+    # ── 委派子任务容错（停滞监测 + 超时自动重启） ──────────────
+    "delegation": {
+        "child_max_attempts": 2,              # 每个子任务最大尝试次数（含首次）；停滞/单次超时/异常自动重启，耗尽才报失败
+        "child_stale_idle_seconds": 450,      # 子 Agent 轮间等待（非工具内）无任何进展 N 秒 → 判停滞杀当前尝试（0=禁用）
+        "child_stale_in_tool_seconds": 1200,  # 子 Agent 卡同一工具无进展 N 秒 → 判停滞杀当前尝试（0=禁用）
     },
     # ── 错误恢复退避（秒） ────────────────────────────────────
     "backoff": {

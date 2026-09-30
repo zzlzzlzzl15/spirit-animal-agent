@@ -41,7 +41,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, provide } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide, watch } from 'vue'
 import PetSprite from './components/PetSprite.vue'
 import StatusPopupPage from './components/StatusPopupPage.vue'
 import SpeechBubblePage from './components/SpeechBubblePage.vue'
@@ -82,6 +82,24 @@ let moveThrottleTimer: ReturnType<typeof setTimeout> | null = null
 let pendingDx = 0
 let pendingDy = 0
 
+// ── 交互态捕获开关 ────────────────────────────────────────
+// 透明区的点击穿透与狐狸区域的捕获收回，由主进程按光标位置轮询判定
+// （穿透态下渲染层收不到 mousemove，无法自行判定命中）。菜单/面板展开或
+// 拖拽期间整窗必须收回捕获，否则点不到菜单项、拖拽会中途断链。
+function setForceCapture(force: boolean): void {
+  window.electronAPI?.setForceCapture?.(force)
+}
+
+/** 交还命中轮询；若仍有菜单/面板打开则保持整窗捕获 */
+function releaseForceCapture(): void {
+  setForceCapture(Boolean(showMenu.value || activePanel.value))
+}
+
+// 菜单/面板开合立即切换捕获范围（不等下一轮轮询）
+watch([showMenu, activePanel], ([menu, panel]) => {
+  setForceCapture(Boolean(menu || panel))
+})
+
 // 随机气泡定时器
 let bubbleTimer: ReturnType<typeof setInterval> | null = null
 
@@ -107,6 +125,10 @@ const IDLE_BUBBLES = [
 ]
 
 onMounted(async () => {
+  // 与主进程同步初始捕获态：页面重载/渲染进程自愈后，主进程可能残留
+  // “强制捕获”标记，会把整窗鼠标捕获卡死（透明区又开始吞屏幕点击）
+  releaseForceCapture()
+
   // 连接 WebSocket
   await connect('ws://127.0.0.1:9877', {
     onEvent(event: string, data: any) {
@@ -200,6 +222,8 @@ function onMenuAction(action: string) {
 
 function onDragStart(e: MouseEvent) {
   isDragging.value = false
+  // 拖拽期间整窗收回捕获：窗口跟着光标移动，命中轮询可能瞬间判定脱靶
+  setForceCapture(true)
   // 用屏幕绝对坐标作为锚点，窗口移动不影响后续 delta 计算
   dragStartScreenX = e.screenX
   dragStartScreenY = e.screenY
@@ -240,6 +264,7 @@ function onDragEnd() {
     clearTimeout(moveThrottleTimer)
     moveThrottleTimer = null
   }
+  releaseForceCapture()
   setTimeout(() => { isDragging.value = false }, 50)
 }
 

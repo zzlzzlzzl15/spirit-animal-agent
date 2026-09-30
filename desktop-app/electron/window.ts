@@ -26,6 +26,15 @@ const DEFAULT_SCALE = 0.75
 /** 窗口额外边距（防止精灵被裁剪） */
 const PADDING = 4
 
+/**
+ * 狐狸可见包围盒（帧内坐标，按 spritesheet alpha 通道实测 (28,6)-(178,202)）。
+ * 包围盒之外全是帧的透明边距——这块隐形矩形正是“看不见却挡住点击”的区域。
+ */
+const FOX_BBOX = { x: 28, y: 6, w: 151, h: 197 }
+
+/** 光标命中轮询间隔（ms）：光标移到狐狸上后收回鼠标捕获的最大延迟 */
+const HIT_POLL_MS = 50
+
 // ---------------------------------------------------------------------------
 // 窗口管理
 // ---------------------------------------------------------------------------
@@ -119,8 +128,12 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
     }
   })
 
-  // 注意：不使用 setIgnoreMouseEvents，因为在 Windows 透明窗口上会导致拖拽失效
-  // 透明区域的点击穿透通过 CSS pointer-events 控制
+  // 点击穿透：初始整窗在 OS 层放开鼠标捕获，之后由命中轮询按狐狸可见
+  // 区域动态收回（详见下方“光标命中轮询”一节）。
+  forceCapture = false
+  ignoring = false  // 窗口可能是重建的：清掉缓存，确保下一次真正下发
+  applyMouseIgnore(true)
+  startHitPolling()
 
   // 开发模式加载 Vite dev server，生产模式加载构建产物
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -131,6 +144,7 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
 
   // 窗口关闭事件
   petWindow.on('closed', () => {
+    stopHitPolling()
     petWindow = null
   })
 
@@ -159,6 +173,80 @@ export function resizePetWindow(scale: number): void {
   const contentH = Math.round(FRAME_H * scale) + PADDING
 
   petWindow.setSize(contentW, contentH)
+}
+
+// ---------------------------------------------------------------------------
+// 点击穿透：光标命中轮询
+// ---------------------------------------------------------------------------
+//
+// Windows 透明窗口按整个窗口矩形命中（CSS pointer-events 只作用于渲染层），
+// 于是狐狸四周的透明边距会整块吞掉屏幕点击。setIgnoreMouseEvents(true,
+// { forward: true }) 本应把 move 事件转发进渲染层做命中判定，但 Electron 29
+// 在本环境下转发不生效（实测穿透态渲染层收不到任何 mousemove），因此改由
+// 主进程轮询光标位置：落在狐狸可见包围盒内 → 收回捕获（可点可拖），
+// 否则 → OS 层穿透（点击直达下层窗口）。
+
+let hitTimer: ReturnType<typeof setInterval> | null = null
+
+/** 渲染层交互态（菜单/面板/拖拽）要求整窗收回捕获 */
+let forceCapture = false
+
+/** 当前 OS 层鼠标忽略状态（缓存，避免每轮重复调用 setIgnoreMouseEvents） */
+let ignoring = true
+
+function applyMouseIgnore(ignore: boolean): void {
+  if (!petWindow || petWindow.isDestroyed()) return
+  if (ignore === ignoring) return
+  ignoring = ignore
+  petWindow.setIgnoreMouseEvents(ignore)
+}
+
+/** 光标是否落在狐狸可见包围盒内（窗口 DIP 坐标 → 精灵帧内坐标）。 */
+function cursorOnFox(): boolean {
+  if (!petWindow || petWindow.isDestroyed() || !petWindow.isVisible()) return false
+  const b = petWindow.getBounds()
+  const p = screen.getCursorScreenPoint()
+  const lx = p.x - b.x
+  const ly = p.y - b.y
+  if (lx < 0 || ly < 0 || lx >= b.width || ly >= b.height) return false
+  // 画布在窗口内居中（四周各 PADDING/2），缩放由窗口宽度反解
+  const scale = (b.width - PADDING) / FRAME_W
+  if (scale <= 0) return false
+  const fx = (lx - PADDING / 2) / scale
+  const fy = (ly - PADDING / 2) / scale
+  return (
+    fx >= FOX_BBOX.x && fx <= FOX_BBOX.x + FOX_BBOX.w &&
+    fy >= FOX_BBOX.y && fy <= FOX_BBOX.y + FOX_BBOX.h
+  )
+}
+
+function startHitPolling(): void {
+  if (hitTimer) return
+  hitTimer = setInterval(() => {
+    if (!petWindow || petWindow.isDestroyed()) {
+      stopHitPolling()
+      return
+    }
+    if (forceCapture) return
+    applyMouseIgnore(!cursorOnFox())
+  }, HIT_POLL_MS)
+}
+
+function stopHitPolling(): void {
+  if (hitTimer) {
+    clearInterval(hitTimer)
+    hitTimer = null
+  }
+}
+
+/**
+ * 渲染层交互态开关：force=true → 整窗收回捕获（菜单项可点、拖拽不断链）；
+ * force=false → 交还命中轮询（只有狐狸可见像素捕获鼠标）。
+ */
+export function setPetForceCapture(force: boolean): void {
+  forceCapture = force
+  if (!petWindow || petWindow.isDestroyed()) return
+  applyMouseIgnore(force ? false : !cursorOnFox())
 }
 
 /**
@@ -498,6 +586,9 @@ export function createBubbleWindow(
       sandbox: false,
     },
   })
+
+  // 纯展示窗口：完全点击穿透，气泡的透明矩形不吞屏幕点击
+  bubbleWindow.setIgnoreMouseEvents(true)
 
   // 将文本通过 URL query 传递（简单方案）
   const encodedText = encodeURIComponent(text)
