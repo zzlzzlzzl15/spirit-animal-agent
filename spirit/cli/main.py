@@ -453,25 +453,63 @@ def chat(model, api_key, base_url):
         def _bottom_toolbar():
             """用 FormattedText 拼状态栏片段，不再用 HTML() 包装 Rich markup。
 
-            字段顺序：状态 | 模型 | ctx% (详情) | Σ 会话用量 (in out, calls) | 时长 | #msgs | Ttools
+            v0.2.10 统一风格 + ctx 标签 + since 时间戳：
+              - 字段顺序：状态 | 模型 | ctx [bar] 15% 19K/128K | since HH:MM:SS
+                          | Σ 45K ⇄ 3 calls | 28s | tools: web_search( | #msgs | Ttools
+              - 全部 info 段统一前景色 (status-bar 黄)，只让 ctx 进度条走阈值色。
+              - `ctx` 标签让用户明确「这是上下文用量」而不是「官网 quota」。
+              - `since HH:MM:SS` 是会话启动时间——给「累计从何时起」一个明确锚点。
+                （未来可接 AccountUsageSnapshot 后补 quota / reset_at。）
+              - 累计字段精简：去掉 in/out 拆开（占位太重）→ `Σ 45K ⇄ 3 calls`。
+              - 统一分隔符 ` | `（一个空格 + | + 一个空格）——与 hermes _status_bar_segments 对齐。
             """
+            # ── 状态标签 ──
             if state.thinking:
                 head = [("class:status-bar-thinking", "思考中")]
             else:
                 head = [("class:status-bar-strong", "空闲")]
+
+            # ── 模型名 ──
             model_txt = (agent.model or "?").strip()
             if len(model_txt) > 26:
                 model_txt = model_txt[:23] + "..."
+
+            # ── 耗时（仅当前轮，spinner 期间递增）──
             elapsed_txt = _fmt_duration(state.elapsed)
+
+            # ── 工具列表 ──
             tool_summary = state.last_tools or ""
             if len(tool_summary) > 24:
                 tool_summary = tool_summary[:21] + "..."
+
+            # ── msgs / tools 计数 ──
             msgs = len(agent.messages)
             tools = len(agent.get_tool_definitions())
 
-            # ── 上下文 % / 详情（从 context_compressor 拿）──
-            # 样式对齐 hermes-agent-main 的 _build_context_bar：进度条 + 百分比 + used/total。
-            # 不擅自加 t/s / session 累计时长（属于"精神性升级"不在本次任务范围）。
+            # ── since HH:MM:SS 会话启动时间（v0.2.10）──
+            # 「更新时间错」问题解答：spirit 状态栏里每一个计数（Σ、ctx）
+            # 都以 _session_started_at 为起点——所以标在状态栏上更透明。
+            # 进程重启后 _session_started_at 丢失，下一行为从 db.started_at 补。
+            since_txt = None
+            try:
+                _started = getattr(agent, "_session_started_at", None)
+                if _started is None and getattr(agent, "_session_db", None) and agent.session_id:
+                    _row = agent._session_db.get_session(agent.session_id) or {}
+                    _iso = _row.get("started_at")
+                    if _iso:
+                        from datetime import datetime
+                        try:
+                            _started = datetime.fromisoformat(str(_iso)).timestamp()
+                        except Exception:
+                            _started = None
+                if _started:
+                    from datetime import datetime
+                    since_txt = datetime.fromtimestamp(float(_started)).strftime("%H:%M:%S")
+            except Exception:
+                since_txt = None
+
+            # ── 上下文 ctx% / 详情（加 ctx 标签，v0.2.10）──
+            # 进度条 + 百分比 + used/total，样式对齐 hermes _build_context_bar。
             ctx_frag = None
             try:
                 compressor = getattr(agent, "_context_compressor", None)
@@ -486,7 +524,7 @@ def chat(model, api_key, base_url):
                     if ctx_len > 0 and tokens >= 0:
                         pct = round((tokens / ctx_len) * 100)
                         pct = max(0, min(100, pct))
-                        # 阈值色：绿 ≤50 / 黄 50-80 / 红 >80
+                        # 阈值色：绿 ≤50 / 黄 50-80 / 红 >80（仅进度条用）
                         if pct > 80:
                             ctx_class = "class:status-bar-bad"
                         elif pct > 50:
@@ -498,19 +536,18 @@ def chat(model, api_key, base_url):
                         filled = round((pct / 100) * bar_width)
                         empty = max(0, bar_width - filled)
                         bar = f"[{chr(0x2588) * filled}{chr(0x2591) * empty}]"
-                        # 片段顺序：进度条 | 百分比 | used/total，全部走阈值色保证统一
+                        # ctx 标签 + 进度条 + 百分比 + used/total
+                        # 「ctx」明确这是上下文用量（不是官网 quota）
                         ctx_frag = [
-                            ("class:status-bar-dim", "  |  "),
+                            ("class:status-bar-dim", " | "),
+                            ("class:status-bar", "ctx "),
                             (ctx_class, bar),
-                            ("class:status-bar-dim", " "),
-                            (ctx_class, f"{pct}%"),
-                            ("class:status-bar-dim", " "),
-                            ("class:status-bar", f"{_fmt_tokens(tokens)}/{_fmt_tokens(ctx_len)}"),
+                            ("class:status-bar", f" {pct}% {_fmt_tokens(tokens)}/{_fmt_tokens(ctx_len)}"),
                         ]
             except Exception:
                 ctx_frag = None
 
-            # ── Σ 会话用量：in + out + API calls（从 agent.session_* 拿）──
+            # ── Σ 会话用量：in + out + API calls（精简版）──
             try:
                 in_tok = int(getattr(agent, "session_input_tokens", 0) or 0)
                 out_tok = int(getattr(agent, "session_output_tokens", 0) or 0)
@@ -521,38 +558,39 @@ def chat(model, api_key, base_url):
 
             sum_frag = None
             if total_tok > 0 or api_calls > 0:
+                # 精简为 `Σ 45K ⇄ 3 calls`（去括号、去掉 in/out 拆开）
                 sum_frag = [
-                    ("class:status-bar-dim", "  |  "),
-                    ("class:status-bar-tool", f"Σ {_fmt_tokens(total_tok)}"),
-                    ("class:status-bar-dim", " ("),
-                    ("class:status-bar", f"in {_fmt_tokens(in_tok)}"),
-                    ("class:status-bar-dim", " "),
-                    ("class:status-bar", f"out {_fmt_tokens(out_tok)}"),
-                    ("class:status-bar-dim", ", "),
-                    ("class:status-bar", f"{api_calls} calls"),
-                    ("class:status-bar-dim", ")"),
+                    ("class:status-bar-dim", " | "),
+                    ("class:status-bar", f"Σ {_fmt_tokens(total_tok)} ⇄ {api_calls} calls"),
                 ]
 
+            # ── 拼装全部片段（统一前景色 status-bar 黄）──
             frags = [
                 ("class:status-bar-dim", "  "),
                 *head,
-                ("class:status-bar-dim", "  |  "),
+                ("class:status-bar-dim", " | "),
                 ("class:status-bar", model_txt),
             ]
             if ctx_frag:
                 frags.extend(ctx_frag)
+            if since_txt:
+                frags.extend([
+                    ("class:status-bar-dim", " | "),
+                    ("class:status-bar", f"since {since_txt}"),
+                ])
             if sum_frag:
                 frags.extend(sum_frag)
+            # 剩余字段：耗时 / 工具列表 / msgs / tools
             frags.extend([
-                ("class:status-bar-dim", "  |  "),
-                ("class:status-bar-tool", elapsed_txt),
-                ("class:status-bar-dim", "  |  "),
+                ("class:status-bar-dim", " | "),
+                ("class:status-bar", elapsed_txt),
+                ("class:status-bar-dim", " | "),
                 ("class:status-bar", "tools: "),
-                ("class:status-bar-tool", tool_summary or "-"),
-                ("class:status-bar-dim", "  |  "),
-                ("class:status-bar-tool", f"#{msgs}"),
-                ("class:status-bar-dim", "  |  "),
-                ("class:status-bar-tool", f"T{tools}"),
+                ("class:status-bar", tool_summary or "-"),
+                ("class:status-bar-dim", " | "),
+                ("class:status-bar", f"#{msgs}"),
+                ("class:status-bar-dim", " | "),
+                ("class:status-bar", f"T{tools}"),
             ])
             return FormattedText(frags)
 

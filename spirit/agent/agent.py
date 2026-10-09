@@ -17,6 +17,7 @@
 
 import json
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -285,6 +286,11 @@ class SpiritAgent:
                 logger.warning(
                     "自动创建会话记录失败 (非致命): %s", _create_exc
                 )
+
+        # ── 会话开始时间戳 (v0.2.10) ───────────────────
+        # 状态栏显示 "since HH:MM:SS" 是用户查看累计用量的更新时间错。
+        # 不存 db：进程重启后重置，重启后从 db.started_at 补。
+        self._session_started_at = time.time()
 
         # 钩子系统（在 __init__ 统一装配：CLI/桌面 launcher/gateway 都是
         # 直接构造 SpiritAgent，不走 agent_init.create_agent；失败非致命）
