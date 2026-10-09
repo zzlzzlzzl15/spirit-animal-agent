@@ -40,6 +40,13 @@ from spirit.agent.tool_executor import (
 )
 from spirit.agent.context_compressor import estimate_messages_tokens
 from spirit.agent.prompt_caching import apply_cache_control, should_use_prompt_caching
+from spirit.agent.provider_switch_protection import (
+    ProviderRoute,
+    apply_provider_labels,
+    build_provider_switch_notice,
+    protect_provider_switch,
+    snapshot_agent_route,
+)
 from spirit.agent.text_tool_parser import parse_text_tool_calls
 from spirit.config import get_config_value
 
@@ -255,7 +262,7 @@ def run_conversation(
                 continue
 
         # ── 构建 API 消息 ───────────────────────────────────────
-        api_messages = prepare_api_messages(agent.messages)
+        api_messages = _prepare_api_messages_safe(agent)
 
         # ── 应用 prompt caching ─────────────────────────────────
         if use_cache:
@@ -322,7 +329,7 @@ def run_conversation(
                             provider=agent.provider, model=agent.model,
                             base_url=agent.base_url,
                         )
-                        api_messages = prepare_api_messages(agent.messages)
+                        api_messages = _prepare_api_messages_safe(agent)
                         if use_cache:
                             api_messages = apply_cache_control(
                                 api_messages,
@@ -348,7 +355,7 @@ def run_conversation(
                         after_tokens=estimate_messages_tokens(agent._messages),
                         trigger="error_recovery",
                     )
-                    api_messages = prepare_api_messages(agent.messages)
+                    api_messages = _prepare_api_messages_safe(agent)
                     budget.refund()
                     break  # 跳出重试，回到主循环
 
@@ -661,6 +668,22 @@ def _get_fallback_chain(agent) -> List[Dict[str, Any]]:
     return chain
 
 
+def _prepare_api_messages_safe(agent):
+    """prepare_api_messages 包装版：R-P1.4 provider 标签剥离。
+
+    R-P1.4 在切换 provider 后会给 messages 打 ``_provider / _model`` 等
+    元数据。这些元数据是 Spirit 内部追踪用的，**不应**进 LLM API payload。
+    本函数在 prepare_api_messages 前先 ``apply_provider_labels`` 剥离
+    （同时补齐缺失的标签——保证每条消息都明确归属），再交给 prepare_api_messages
+    转为 OpenAI 格式。
+
+    切换提示（system 消息）的 ``role + content`` 不被剥离，LLM 能看到。
+    """
+    current_route = snapshot_agent_route(agent)
+    labeled = apply_provider_labels(agent.messages, current_route)
+    return prepare_api_messages(labeled)
+
+
 def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callable[[str], None]] = None) -> bool:
     """切换到 fallback 链中下一个可用的 provider（照搬 Hermes try_activate_fallback）。
 
@@ -712,12 +735,25 @@ def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callabl
                 "api_key": agent.api_key,
                 "base_url": agent.base_url,
             }
+        # 快照“即将离开”的路由（用于切换提示文案 + provider 标签）
+        route_from = ProviderRoute(
+            provider=agent.provider,
+            model=agent.model,
+            base_url=agent.base_url,
+            api_key=agent.api_key,
+        )
         agent.provider = fb.get("provider")
         agent.model = fb_model
         agent.api_key = fb.get("api_key")
         agent.base_url = fb.get("base_url")
         agent._client = None  # 惰性 client 下次访问时按新参数重建
         agent._fallback_activated = True
+        route_to = ProviderRoute(
+            provider=agent.provider,
+            model=agent.model,
+            base_url=agent.base_url,
+            api_key=agent.api_key,
+        )
         reason_txt = getattr(reason, "value", None) or str(reason or "") or "调用失败"
         notice = (
             f"\n⚠ {reason_txt} — 已切换 fallback 提供方 {fb.get('name')}"
@@ -729,6 +765,30 @@ def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callabl
                 stream_callback(notice)
             except Exception:  # noqa: BLE001 - 通知失败不影响切换
                 logger.debug("fallback 通知推送失败", exc_info=True)
+
+        # ── R-P1.4：provider 切换保护 ──
+        # 给 agent._messages 里的消息打 route_to 标签 + 注入一条 system
+        # “刚切换了 provider，请基于现有工具结果继续”提示。下一轮
+        # prepare_api_messages 前会用 apply_provider_labels 剥掉元数据
+        # （不污染 API payload），但切换提示作为 system 消息被保留。
+        if hasattr(agent, "_messages") and agent._messages is not None:
+            try:
+                protected_messages, switch_notice = protect_provider_switch(
+                    list(agent._messages),
+                    route_from=route_from,
+                    route_to=route_to,
+                    reason=reason_txt,
+                )
+                agent._messages = protected_messages
+                logger.info(
+                    "[fallback] 已给 %d 条消息打 provider 标签 + 注入切换提示（from %s → to %s）",
+                    len(protected_messages),
+                    route_from.label(),
+                    route_to.label(),
+                )
+            except Exception as exc:  # noqa: BLE001 - 保护失败不影响切换主路径
+                logger.warning("[fallback] provider 切换保护注入失败（非致命）: %s", exc)
+
         return True
     return False
 
