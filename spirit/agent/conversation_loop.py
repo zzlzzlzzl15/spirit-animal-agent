@@ -47,6 +47,11 @@ from spirit.agent.provider_switch_protection import (
     protect_provider_switch,
     snapshot_agent_route,
 )
+from spirit.agent.accuracy_attribution import (
+    should_activate_moa,
+    should_self_correct,
+    build_self_correction_prompt,
+)
 from spirit.agent.text_tool_parser import parse_text_tool_calls
 from spirit.config import get_config_value
 
@@ -241,6 +246,38 @@ def run_conversation(
 
         api_call_count += 1
         agent._api_call_count = api_call_count
+
+        # ── M-P1.0：自我纠错检查 ───────────────────────────
+        # 检测上一轮 assistant 回复 / 当前 user message 是否触发自我纠错
+        # （上一轮含 <error> / failed / 用户追问“哪里不对” / 工具 status=error）。
+        # 触发时注入一条审视提示，让 LLM 重新检查上一轮答案，不是默默重复。
+        if len(agent.messages) >= 2:
+            previous_assistant = ""
+            for _m in reversed(agent.messages):
+                if _m.get("role") == "assistant":
+                    previous_assistant = _m.get("content", "") or ""
+                    break
+            current_user = ""
+            for _m in reversed(agent.messages):
+                if _m.get("role") == "user":
+                    current_user = _m.get("content", "") or ""
+                    break
+            if previous_assistant and current_user:
+                try:
+                    if should_self_correct(
+                        previous_response=previous_assistant,
+                        user_message=current_user,
+                    ):
+                        correction_prompt = build_self_correction_prompt(
+                            reason="上一轮结果包含错误标识 或 用户追问'哪里不对'"
+                        )
+                        agent.add_message("user", correction_prompt)
+                        logger.info(
+                            "[M-P1.0] 自我纠错触发，注入审视提示（上一轮长度 %d 字符）",
+                            len(previous_assistant),
+                        )
+                except Exception as exc:  # noqa: BLE001 - 纠错检测失败不阻断主循环
+                    logger.debug("[M-P1.0] 自我纠错检测异常（非致命）: %s", exc)
 
         # ── 上下文压缩预检 ──────────────────────────────────────
         if compressor and len(agent.messages) > 5:
@@ -548,6 +585,29 @@ def run_conversation(
                 )
 
             agent.add_message("assistant", content)
+
+            # ── M-P1.0：MoA 兜底检测（启发式信心判断）────────
+            # Spirit 暂无模型内置 logprobs，这里用启发式指纹判断主 LLM 信心低：
+            # 回复极短 / 含"我不确定"等低信心短语。MoA 在 Spirit 是 provider
+            # 配置（all-or-nothing），无法动态开关，所以这里只记 log 推荐用户
+            # 启用 MoA（provider="moa" 切换）。LLM 端仍能感知到原始回复。
+            try:
+                if should_activate_moa(
+                    response_text=content,
+                    response_length=len(content),
+                ):
+                    logger.info(
+                        "[M-P1.0] 主 LLM 信心低（回复长度 %d），建议下一轮启用 MoA "
+                        "(provider='moa') 或检查任务复杂度（当前 provider=%s）",
+                        len(content), getattr(agent, "provider", ""),
+                    )
+                    _emit_hook(
+                        agent, "on_moa_recommended",
+                        response_length=len(content),
+                        current_provider=getattr(agent, "provider", ""),
+                    )
+            except Exception as exc:  # noqa: BLE001 - MoA 检测不阻断主流程
+                logger.debug("[M-P1.0] MoA 兑底检测异常（非致命）: %s", exc)
 
             # ── 后台进程通知回灌（Phase 4.7）──────────────────
             # 模型给出了最终文本回答，但返回前先检查是否有后台进程/
