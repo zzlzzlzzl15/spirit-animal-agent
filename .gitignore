@@ -83,3 +83,18 @@ benchmarks/
 # 临时诊断脚本（一次性调试用）
 diag_*.py
 add_tool_call_removal.py
+
+# 临时调试产物（下划线前缀的一次性脚本 / 输出）
+_tmp_*.py
+_tmp_*.txt
+_pytest_run.py
+_ver_check.py
+_pptbuild/
+_memora_src/
+
+# 用户学习资料（不属于 Spirit 项目代码）
+economics-system/
+finance-system/
+
+# PowerShell 异常占位符
+$null

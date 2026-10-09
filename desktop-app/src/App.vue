@@ -1,13 +1,16 @@
 <template>
   <!-- 状态弹窗模式 -->
   <StatusPopupPage v-if="isStatusPopup" />
-  
+
   <!-- 气泡对话模式 -->
   <SpeechBubblePage v-else-if="isSpeechBubble" />
-  
+
   <!-- CLI 终端模式 -->
   <CLITerminalPage v-else-if="isCLITerminal" />
-  
+
+  <!-- 系统面板模式（独立窗口，不再嵌进桌宠窗口） -->
+  <SystemPanel v-else-if="isSystemPanel" @close="onSystemPanelClose" />
+
   <!-- 桌宠主界面 -->
   <div v-else id="pet-app">
     <!-- 精灵渲染器 -->
@@ -32,9 +35,8 @@
       @action="onMenuAction"
     />
 
-    <!-- 功能面板（按需显示） -->
+    <!-- 功能面板（按需显示：知识库/语音仍嵌进桌宠；“系统”改为独立窗口） -->
     <KnowledgePanel v-if="activePanel === 'knowledge'" @close="activePanel = ''" />
-    <SystemPanel v-if="activePanel === 'system'" @close="activePanel = ''" />
     <TaskCLI v-if="activePanel === 'cli'" @close="activePanel = ''" />
     <VoiceChat v-if="activePanel === 'voice'" @close="activePanel = ''" />
   </div>
@@ -63,6 +65,7 @@ const { connect, disconnect, send, connected } = useWebSocket()
 const isStatusPopup = computed(() => window.location.hash === '#status-popup')
 const isSpeechBubble = computed(() => window.location.hash.startsWith('#speech-bubble'))
 const isCLITerminal = computed(() => window.location.hash === '#cli-terminal')
+const isSystemPanel = computed(() => window.location.hash === '#system-panel')
 
 // 将 WebSocket send 注入给子组件
 provide('wsSend', send)
@@ -140,6 +143,13 @@ onMounted(async () => {
       } else if (event === 'init') {
         petStore.syncFromServer(data)
         statusStore.syncFromServer(data)
+      } else if (event === 'autonomy_decision') {
+        // 自主探索遇到需拍板的分叉/停滞 → 存入 store（SystemPanel 渲染应答），
+        // 并让桌宠冒个泡提醒用户去「系统」面板帮它决定（超时未答则 fail-open 自主继续）
+        statusStore.setDecision(data)
+        if (window.electronAPI?.showBubble && !activePanel.value) {
+          window.electronAPI.showBubble('🤔 探索遇到选择，打开「系统」面板帮我拍板~')
+        }
       }
     },
   })
@@ -182,18 +192,28 @@ onUnmounted(() => {
 function onSpriteClick(e: MouseEvent) {
   console.log('[App] leftClick, isDragging:', isDragging.value)
   if (isDragging.value) return
-  // 左键 → 圆形功能菜单
-  showMenu.value = !showMenu.value
+  // 左键 → 直接打开 CLI 终端独立窗口（Spirit 核心交互入口）
+  if (window.electronAPI?.openCLITerminal) {
+    window.electronAPI.openCLITerminal()
+  }
+  // 关闭可能打开的菜单
+  showMenu.value = false
   showStatus.value = false
-  console.log('[App] showMenu:', showMenu.value)
 }
 
 function onSpriteRightClick(e: MouseEvent) {
   console.log('[App] rightClick')
-  // 右键 → 打开独立状态弹窗窗口
-  if (window.electronAPI?.openStatusWindow) {
-    window.electronAPI.openStatusWindow()
-  }
+  // 右键 → 弹出圆形功能菜单（知识库/系统/CLI/语音等备用入口）
+  showMenu.value = !showMenu.value
+  showStatus.value = false
+}
+
+/**
+ * 独立系统面板窗口的关闭处理：SystemPanel 只能发 close emit，
+ * 这里是独立窗口模式，所以要主动通知主进程关窗（关后 hash 路由也就没了）。
+ */
+function onSystemPanelClose() {
+  window.electronAPI?.closeSystemWindow?.()
 }
 
 function onMenuAction(action: string) {
@@ -206,7 +226,12 @@ function onMenuAction(action: string) {
       }
       break
     case 'system':
-      activePanel.value = 'system'
+      // 系统面板 → 独立窗口。
+      // 桌宠窗口只有 148×160，嵌不下 340×460 的 SystemPanel，原本被裁到只看得到一角。
+      // 改为与 CLI 终端同模式的独立 BrowserWindow，可独立拖动、可独立关闭。
+      if (window.electronAPI?.openSystemWindow) {
+        window.electronAPI.openSystemWindow()
+      }
       break
     case 'cli':
       // CLI → 打开独立的 CMD 终端窗口

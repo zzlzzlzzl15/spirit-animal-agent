@@ -62,6 +62,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_memories": 1000,                 # 跨会话持久记忆最大条数（超出后 LRU 淘汰）
         "credential_max_fail_count": 10,      # 凭据池：单凭据累计失败 N 次后自动禁用
         "credential_cooldown": 300,           # 凭据池：失败后冷却时间（秒），期间不再使用
+        # Tool Search（Progressive Tool Disclosure — 照 hermes 改为 3 bridge 代替 60+ schema）
+        # 开启 + 工具总数 > eager_threshold 时，对 LLM 只发 3 个元工具
+        # （tool_search / tool_describe / tool_call），系统 prompt 注入 manifest 透露其余。
+        # 关 / 工具少时仍走原路径（发所有 schema）。
+        "tool_search": {
+            "enabled": False,                 # 默认关，保守（手动 ~/.spirit/config.yaml 启用）
+            "eager_threshold": 15,            # ≤ 此数直接发所有 schema（不用 bridge，避免多跳开销）
+            "manifest_budget_pct": 5.0,       # manifest 占 context 总长度的比例（5% ≈ 25.6K chars @ 128K）
+        },
     },
     # ── 上下文压缩（对话过长时自动摘要） ──────────────────────
     "compression": {
@@ -215,6 +224,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "child_max_attempts": 2,              # 每个子任务最大尝试次数（含首次）；停滞/单次超时/异常自动重启，耗尽才报失败
         "child_stale_idle_seconds": 450,      # 子 Agent 轮间等待（非工具内）无任何进展 N 秒 → 判停滞杀当前尝试（0=禁用）
         "child_stale_in_tool_seconds": 1200,  # 子 Agent 卡同一工具无进展 N 秒 → 判停滞杀当前尝试（0=禁用）
+    },
+    # ── 自主探索（Autonomy Loop — 常驻自由探索，Phase 7） ──────
+    # 桌宠启动默认挂载（除非 --no-autonomy）；给一个 domain 方向即围绕它自由探索。
+    "autonomy": {
+        "enabled": True,                      # 是否启用常驻自主探索循环
+        "domain": "",                         # 探索方向/聚焦领域（空=不限定，LLM 基于记忆自由提议）；运行时可经桌宠输入框改写并立即触发一轮
+        "run_on_start": False,                # 启动即跑首轮探索（True=不等满 interval 立即探索一轮）
+        "interval_hours": 5.0,                # 常驻探索间隔（小时），对齐 API token 每 5h 刷新的配额窗口
+        "stop_policy": "curriculum_review",   # 单任务停止策略：curriculum_review（PASS 后可再练/再改，默认）| verifier_pass（一经验证即停，省 token）
+        "max_rounds": 5,                      # 单个探索任务最大迭代轮次
+        "max_iterations": 40,                 # execute 内 SpiritAgent 单次对话循环最大工具迭代次数
+        "hitl_timeout": 300.0,                # HITL 气泡询问等待答复超时（秒），超时 fail-open 自主决策
     },
     # ── 错误恢复退避（秒） ────────────────────────────────────
     "backoff": {

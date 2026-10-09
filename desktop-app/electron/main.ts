@@ -9,7 +9,7 @@
  */
 
 import { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, powerMonitor } from 'electron'
-import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow, showPetWindow, hidePetWindow, forceRedrawPetWindow, startPetWatchdog, stopPetWatchdog, movePetWindow, setPetForceCapture } from './window'
+import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createSystemWindow, closeSystemWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow, showPetWindow, hidePetWindow, forceRedrawPetWindow, startPetWatchdog, stopPetWatchdog, movePetWindow, setPetForceCapture, setMenuButtonBoxes, resetPetClickCapture } from './window'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 
@@ -149,6 +149,10 @@ function createTray(): void {
         }
       },
     },
+    {
+      label: '🔓 重置点击捕获（修复空气墙）',
+      click: () => resetPetClickCapture(),
+    },
     { type: 'separator' },
     {
       label: '切换宠物',
@@ -213,9 +217,16 @@ function registerIPC(): void {
     }
   })
 
-  // 渲染层交互态（菜单/面板/拖拽）→ 整窗收回捕获；平时由主进程命中轮询接管
+  // 渲染层交互态（菜单/面板/拖拽）→ 主进程按 hitTarget 精细判定；
+  // 拖拽期间 force=true 能保证拖拽动作不被命中轮询打断。
   ipcMain.on('pet-set-force-capture', (_event, { force }: { force: boolean }) => {
     setPetForceCapture(force)
+  })
+
+  // 渲染层推送菜单/面板按钮屏幕坐标：主进程用于精细判定捕获范围，
+  // 让 forceCapture=true 期间在按钮外仍能透传到屏幕下层，避免“空气墙”。
+  ipcMain.on('pet-set-menu-button-boxes', (_event, boxes: Array<{ x: number; y: number; w: number; h: number }>) => {
+    setMenuButtonBoxes(boxes)
   })
 
   // 窗口拖拽移动（走 movePetWindow 统一入口，坐标经屏幕边界钳制，防止拖出屏幕）
@@ -259,6 +270,20 @@ function registerIPC(): void {
 
   ipcMain.handle('close-status-window', () => {
     closeStatusWindow()
+    return true
+  })
+
+  // 打开系统面板窗口（独立窗口，从径向菜单“系统”触发，替代原嵌入式 340×460 面板）
+  ipcMain.handle('open-system-window', () => {
+    const win = getPetWindow()
+    if (!win) return false
+    const bounds = win.getBounds()
+    createSystemWindow({ x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height })
+    return true
+  })
+
+  ipcMain.handle('close-system-window', () => {
+    closeSystemWindow()
     return true
   })
 

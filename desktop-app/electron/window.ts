@@ -27,6 +27,13 @@ const DEFAULT_SCALE = 0.75
 const PADDING = 4
 
 /**
+ * 径向菜单外扩留白（每侧）：4 个按钮在半径 55 + 按钮半宽 22 之外还要 3px 余量。
+ * 此前 PADDING=4 时窗口 148×160，左右按钮中心 ±77 已超过窗口半宽 74，被裁 3px。
+ * 加大到 80 后窗口 308×320，按钮完全落在窗口内。
+ */
+const MENU_PADDING = 80
+
+/**
  * 狐狸可见包围盒（帧内坐标，按 spritesheet alpha 通道实测 (28,6)-(178,202)）。
  * 包围盒之外全是帧的透明边距——这块隐形矩形正是“看不见却挡住点击”的区域。
  */
@@ -34,6 +41,9 @@ const FOX_BBOX = { x: 28, y: 6, w: 151, h: 197 }
 
 /** 光标命中轮询间隔（ms）：光标移到狐狸上后收回鼠标捕获的最大延迟 */
 const HIT_POLL_MS = 50
+
+/** forceCapture 防御性超时（ms）：超过此时长强制释放，防止 IPC/拖拽异常导致整窗捕获锁死 */
+const FORCE_CAPTURE_GUARD_MS = 5000
 
 // ---------------------------------------------------------------------------
 // 窗口管理
@@ -64,8 +74,10 @@ interface PetWindowOptions {
 export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
   petUserHidden = false  // 新窗口处于可见状态
   const scale = options.scale || DEFAULT_SCALE
-  const contentW = Math.round(FRAME_W * scale) + PADDING
-  const contentH = Math.round(FRAME_H * scale) + PADDING
+  // 窗口 = 精灵 + 精灵防裁剪留白 + 径向菜单外扩留白（每侧 MENU_PADDING）
+  // 精灵在窗口内居中，四周各留 (PADDING/2 + MENU_PADDING) 的透明边距
+  const contentW = Math.round(FRAME_W * scale) + PADDING + 2 * MENU_PADDING
+  const contentH = Math.round(FRAME_H * scale) + PADDING + 2 * MENU_PADDING
 
   // 默认位置：屏幕底部居中
   const display = screen.getPrimaryDisplay()
@@ -132,6 +144,11 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
   // 区域动态收回（详见下方“光标命中轮询”一节）。
   forceCapture = false
   ignoring = false  // 窗口可能是重建的：清掉缓存，确保下一次真正下发
+  hitBoxes = []
+  if (forceGuardTimer) {
+    clearTimeout(forceGuardTimer)
+    forceGuardTimer = null
+  }
   applyMouseIgnore(true)
   startHitPolling()
 
@@ -145,6 +162,12 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
   // 窗口关闭事件
   petWindow.on('closed', () => {
     stopHitPolling()
+    if (forceGuardTimer) {
+      clearTimeout(forceGuardTimer)
+      forceGuardTimer = null
+    }
+    hitBoxes = []
+    forceCapture = false
     petWindow = null
   })
 
@@ -169,8 +192,9 @@ export function getPetWindow(): BrowserWindow | null {
 export function resizePetWindow(scale: number): void {
   if (!petWindow) return
 
-  const contentW = Math.round(FRAME_W * scale) + PADDING
-  const contentH = Math.round(FRAME_H * scale) + PADDING
+  // 同步 createPetWindow 的尺寸公式：精灵 + PADDING + 2*MENU_PADDING
+  const contentW = Math.round(FRAME_W * scale) + PADDING + 2 * MENU_PADDING
+  const contentH = Math.round(FRAME_H * scale) + PADDING + 2 * MENU_PADDING
 
   petWindow.setSize(contentW, contentH)
 }
@@ -194,6 +218,12 @@ let forceCapture = false
 /** 当前 OS 层鼠标忽略状态（缓存，避免每轮重复调用 setIgnoreMouseEvents） */
 let ignoring = true
 
+/** 菜单/面板按钮屏幕坐标列表（由渲染层 RadialMenu/Panel 推送到主进程，屏幕绝对坐标） */
+let hitBoxes: Array<{ x: number; y: number; w: number; h: number }> = []
+
+/** forceCapture 防御 timer：到时强制释放，防止 forceCapture 标志锁死 */
+let forceGuardTimer: ReturnType<typeof setTimeout> | null = null
+
 function applyMouseIgnore(ignore: boolean): void {
   if (!petWindow || petWindow.isDestroyed()) return
   if (ignore === ignoring) return
@@ -209,15 +239,58 @@ function cursorOnFox(): boolean {
   const lx = p.x - b.x
   const ly = p.y - b.y
   if (lx < 0 || ly < 0 || lx >= b.width || ly >= b.height) return false
-  // 画布在窗口内居中（四周各 PADDING/2），缩放由窗口宽度反解
-  const scale = (b.width - PADDING) / FRAME_W
+  // 画布在窗口内居中：反解缩放 = (窗口宽 - 全部留白) / 帧宽
+  const scale = (b.width - PADDING - 2 * MENU_PADDING) / FRAME_W
   if (scale <= 0) return false
-  const fx = (lx - PADDING / 2) / scale
-  const fy = (ly - PADDING / 2) / scale
+  // 精灵相对窗口左上角的偏移（窗口内居中）
+  const offsetX = (b.width - FRAME_W * scale) / 2
+  const offsetY = (b.height - FRAME_H * scale) / 2
+  const fx = (lx - offsetX) / scale
+  const fy = (ly - offsetY) / scale
   return (
     fx >= FOX_BBOX.x && fx <= FOX_BBOX.x + FOX_BBOX.w &&
     fy >= FOX_BBOX.y && fy <= FOX_BBOX.y + FOX_BBOX.h
   )
+}
+
+/**
+ * 光标是否落在某个“捕获目标”区域：狐狸可见包围盒 + 渲染层推送的菜单/面板按钮。
+ * 主进程轮询以这个为唯一判定——让 forceCapture=true 期间仍能在按钮外穿透。
+ */
+function cursorOnHitTarget(): boolean {
+  if (cursorOnFox()) return true
+  if (hitBoxes.length === 0) return false
+  const p = screen.getCursorScreenPoint()
+  for (let i = 0; i < hitBoxes.length; i++) {
+    const b = hitBoxes[i]
+    if (p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) {
+      return true
+    }
+  }
+  return false
+}
+
+/**
+ * 接收渲染层推送的菜单/面板按钮坐标（渲染层视口坐标）。
+ * 主进程换算为屏幕绝对坐标（加窗口位置偏移）后用于 hitTarget 判定。
+ * 传空数组表示清除所有按钮区域（菜单卸载时调用）。
+ */
+export function setMenuButtonBoxes(boxes: Array<{ x: number; y: number; w: number; h: number }>): void {
+  if (!petWindow || petWindow.isDestroyed()) {
+    hitBoxes = []
+    applyMouseIgnore(true)
+    return
+  }
+  const winBounds = petWindow.getBounds()
+  // 渲染层视口坐标 → 屏幕绝对坐标：加窗口位置偏移。
+  hitBoxes = (Array.isArray(boxes) ? boxes : []).map((b) => ({
+    x: b.x + winBounds.x,
+    y: b.y + winBounds.y,
+    w: b.w,
+    h: b.h,
+  }))
+  // 坐标更新后立即同步一次捕获态，不等下一轮轮询
+  applyMouseIgnore(!cursorOnHitTarget())
 }
 
 function startHitPolling(): void {
@@ -227,8 +300,9 @@ function startHitPolling(): void {
       stopHitPolling()
       return
     }
-    if (forceCapture) return
-    applyMouseIgnore(!cursorOnFox())
+    // forceCapture 期间也用 hitTarget 判定：能点菜单按钮/拖拽中能拖窗口；
+    // 光标在按钮/fox 外则透传（避免菜单期间点不到屏幕下层按钮的“空气墙”）。
+    applyMouseIgnore(!cursorOnHitTarget())
   }, HIT_POLL_MS)
 }
 
@@ -240,13 +314,45 @@ function stopHitPolling(): void {
 }
 
 /**
- * 渲染层交互态开关：force=true → 整窗收回捕获（菜单项可点、拖拽不断链）；
- * force=false → 交还命中轮询（只有狐狸可见像素捕获鼠标）。
+ * 渲染层交互态开关：force=true → 整窗轮询按 hitTarget 判定（菜单按钮区可点），
+ * 拖拽期间 force=true 能保证拖拽动作不被命中轮询打断；
+ * force=false → 走光标轮询（只有狐狸可见像素 + 推送的按钮区域捕获鼠标）。
+ *
+ * 加 5s 防御 timer：拖拽/菜单异常退出未释放时强制清除 forceCapture，
+ * 防止“空气墙”锁死（用户可在托盘菜单里“Reset Click Capture”手动加速释放）。
  */
 export function setPetForceCapture(force: boolean): void {
   forceCapture = force
+  if (forceGuardTimer) {
+    clearTimeout(forceGuardTimer)
+    forceGuardTimer = null
+  }
+  if (force) {
+    // 防御性超时：5s 后强制释放，防 IPC 丢包或 drag 异常中断导致 forceCapture 锁死
+    forceGuardTimer = setTimeout(() => {
+      forceCapture = false
+      hitBoxes = []
+      if (!petWindow || petWindow.isDestroyed()) return
+      applyMouseIgnore(!cursorOnFox())
+    }, FORCE_CAPTURE_GUARD_MS)
+  }
   if (!petWindow || petWindow.isDestroyed()) return
-  applyMouseIgnore(force ? false : !cursorOnFox())
+  applyMouseIgnore(!cursorOnHitTarget())
+}
+
+/**
+ * 托盘/快捷键调用：强制释放 forceCapture + 清除所有 hitBoxes，
+ * 用户遇到空气墙时一键恢复桌宠可穿透状态。
+ */
+export function resetPetClickCapture(): void {
+  forceCapture = false
+  hitBoxes = []
+  if (forceGuardTimer) {
+    clearTimeout(forceGuardTimer)
+    forceGuardTimer = null
+  }
+  if (!petWindow || petWindow.isDestroyed()) return
+  applyMouseIgnore(!cursorOnFox())
 }
 
 /**
@@ -526,6 +632,92 @@ export function closeStatusWindow(): void {
  */
 export function getStatusWindow(): BrowserWindow | null {
   return statusWindow
+}
+
+// ---------------------------------------------------------------------------
+// 系统面板窗口（独立窗口，不再嵌入桌宠窗口）
+// ---------------------------------------------------------------------------
+// 原本在径向菜单点“系统”会在桌宠窗口（148×160）里弹出 340×460 的 SystemPanel，
+// 面板溢出被裁，只能看到一角。现在改为独立窗口，与 CLI 终端同模式。
+// ---------------------------------------------------------------------------
+
+let systemWindow: BrowserWindow | null = null
+
+/**
+ * 创建/聚焦系统面板窗口。
+ */
+export function createSystemWindow(petBounds: { x: number; y: number; w: number; h: number }): BrowserWindow {
+  if (systemWindow) {
+    if (systemWindow.isDestroyed()) {
+      systemWindow = null
+    } else {
+      systemWindow.focus()
+      return systemWindow
+    }
+  }
+
+  const panelW = 360
+  const panelH = 500
+  const gap = 8
+
+  // 智能定位：宠物在屏幕右半 → 面板在左边；否则在右边
+  const display = screen.getPrimaryDisplay()
+  const screenW = display.workAreaSize.width
+  const petCenterX = petBounds.x + petBounds.w / 2
+  const showOnLeft = petCenterX > screenW / 2
+
+  const x = showOnLeft
+    ? petBounds.x - panelW - gap
+    : petBounds.x + petBounds.w + gap
+  const y = petBounds.y
+  // 确保不超出屏幕左边界
+  const finalX = Math.max(0, x)
+
+  systemWindow = new BrowserWindow({
+    x: finalX,
+    y,
+    width: panelW,
+    height: panelH,
+    transparent: true,
+    frame: false,
+    alwaysOnTop: true,
+    resizable: false,
+    skipTaskbar: true,
+    hasShadow: true,
+    movable: true,
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+  })
+
+  // 加载系统面板页面（与状态弹窗走同一个 hash 路由机制）
+  if (process.env.VITE_DEV_SERVER_URL) {
+    systemWindow.loadURL(`${process.env.VITE_DEV_SERVER_URL}#system-panel`)
+  } else {
+    systemWindow.loadFile(path.join(__dirname, '../dist/index.html'), {
+      hash: 'system-panel',
+    })
+  }
+
+  systemWindow.on('closed', () => {
+    systemWindow = null
+  })
+
+  return systemWindow
+}
+
+/**
+ * 关闭系统面板窗口
+ */
+export function closeSystemWindow(): void {
+  if (systemWindow && !systemWindow.isDestroyed()) {
+    systemWindow.close()
+  }
+  systemWindow = null
 }
 
 // ---------------------------------------------------------------------------

@@ -110,11 +110,16 @@ class AutonomyLoop:
         max_cycles: Optional[int] = None,
         stop_policy: str = STOP_CURRICULUM_REVIEW,
         max_rounds: int = 5,
+        domain: str = "",
+        run_on_start: bool = False,
         sleep: Optional[SleepFn] = None,
     ) -> None:
         self._propose = propose
         self._caller = caller
         self.memory = memory
+        # 运行时可变的探索方向（“给一个方向 → 自由探索”）；propose seam 经 domain_getter 读它。
+        self.domain = (domain or "").strip()
+        self.run_on_start = bool(run_on_start)
         self.sandbox = sandbox or Sandbox()
         self.hitl = hitl or HumanInTheLoop(memory=memory)
         # 常驻探索缺省：对任务自动迭代打磨——curriculum_review（PASS 后仍可要求再练/再改）
@@ -135,6 +140,8 @@ class AutonomyLoop:
         self.cycles: List[ExploreCycle] = []
         self._cycle_no = 0
         self._stop = threading.Event()
+        # 即时探索信号：set_domain(run_now) / run_on_start 置位，常驻循环下一 poll 内消费并立即 step。
+        self._pending_run = threading.Event()
 
         # Scheduler 驱动：interval 探索 + daily 日报
         self.scheduler = Scheduler(clock=self._clock, push=push)
@@ -142,6 +149,22 @@ class AutonomyLoop:
             "autonomy_explore", self.step, every_seconds=self.interval_seconds
         )
         self.scheduler.add_daily_task("autonomy_report", self.summary, at=daily_at)
+
+    # -- 方向控制（运行时给方向）-----------------------------------------
+    def set_domain(self, direction: str, *, run_now: bool = True) -> Dict[str, Any]:
+        """运行时设定/切换探索方向；``run_now`` 时唤醒常驻循环立即探索一轮。
+
+        这是“给一个方向 → 立刻自由探索”的运行时入口：更新 :attr:`domain` 后，
+        propose seam（经 domain_getter 读本属性）下一轮即围绕新方向递进提议。
+        非阻塞——只置 ``_pending_run`` 信号，实际 step 在常驻循环单线程内执行（避免并发）。
+        """
+        self.domain = (direction or "").strip()
+        logger.info("autonomy.explorer: 探索方向设为 %r（run_now=%s）", self.domain, run_now)
+        triggered = False
+        if run_now:
+            self._pending_run.set()
+            triggered = True
+        return {"domain": self.domain, "triggered": triggered, "running": self.running}
 
     # -- 目标提议 ---------------------------------------------------------
     def propose_next(self) -> Optional[str]:
@@ -176,8 +199,10 @@ class AutonomyLoop:
         """无注入 propose 时用 LLM 生成候选探索目标；无 caller/异常 → []（fail-soft）。"""
         if self._caller is None:
             return []
+        domain_hint = f"聚焦领域：{self.domain}。\n" if self.domain else ""
         prompt = (
             "你是自主探索规划器。基于当前记忆，提出 1-3 个值得探索的新任务方向，"
+            f"{domain_hint}"
             "每行一个，不要编号、不要解释。\n当前记忆摘要：\n"
             + (CurriculumPlanner(memory=self.memory).progress_summary(self.memory))
         )
@@ -252,9 +277,21 @@ class AutonomyLoop:
 
     def run_forever(self, *, stop: Optional[threading.Event] = None,
                     poll: float = 1.0) -> None:
-        """常驻循环：周期性 ``tick`` 直到 ``stop`` 被置位或达 ``max_cycles``。"""
+        """常驻循环：周期性 ``tick`` 直到 ``stop`` 被置位或达 ``max_cycles``。
+
+        ``run_on_start`` 为真时启动即跑首轮（不等满 interval）；``_pending_run``
+        被 set_domain 置位时，下一 poll 内立即补跑一轮（运行时给方向即探索）。
+        """
         stop_event = stop or self._stop
+        if self.run_on_start:
+            self._pending_run.set()
         while not stop_event.is_set():
+            if self._pending_run.is_set():
+                self._pending_run.clear()
+                try:
+                    self.step()
+                except Exception as exc:  # 即时探索轮失败不中断常驻循环
+                    logger.warning("autonomy.explorer: 即时探索轮失败: %s", exc)
             self.tick()
             if self.max_cycles is not None and len(self.cycles) >= self.max_cycles:
                 break
@@ -291,6 +328,9 @@ class AutonomyLoop:
             "cycle_no": self._cycle_no,
             "cycles": [c.to_dict() for c in self.cycles],
             "running": self.running,
+            "domain": self.domain,
+            "run_on_start": self.run_on_start,
+            "interval_seconds": self.interval_seconds,
         }
 
 

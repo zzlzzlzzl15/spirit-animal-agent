@@ -33,6 +33,37 @@ export interface SystemMetrics {
   disk: { partitions: any[] }
 }
 
+// 一轮自主探索的结果（对齐后端 ExploreCycle.to_dict）
+export interface AutonomyCycle {
+  cycle_no: number
+  task: string
+  status: string
+  decision_source: string
+  decision_text: string
+  note_path: string
+  summary: string
+}
+
+// 常驻自主探索状态（对齐后端 AutonomyLoop.state）
+export interface AutonomyState {
+  running: boolean
+  domain: string
+  cycle_no: number
+  cycles: AutonomyCycle[]
+  run_on_start?: boolean
+  interval_seconds?: number
+}
+
+// HITL 决策询问（对齐后端 autonomy_decision 广播事件 payload）
+export interface AutonomyDecision {
+  id: number
+  question: string
+  options: string[]
+  context: string
+  is_fork: boolean
+  timeout: number
+}
+
 export const useStatusStore = defineStore('status', () => {
   const agentStatus = ref<AgentStatus>({
     running: false,
@@ -51,6 +82,15 @@ export const useStatusStore = defineStore('status', () => {
     memory: { total_gb: 0, used_gb: 0, percent: 0 },
     disk: { partitions: [] },
   })
+
+  // 自主探索：当前状态 + 待应答的 HITL 决策（气泡询问）
+  const autonomy = ref<AutonomyState>({
+    running: false,
+    domain: '',
+    cycle_no: 0,
+    cycles: [],
+  })
+  const pendingDecision = ref<AutonomyDecision | null>(null)
 
   function syncFromServer(data: any) {
     // 服务端 Agent 字段是扁平合并在顶层的（get_status / init 同一真相源），
@@ -71,9 +111,44 @@ export const useStatusStore = defineStore('status', () => {
     }
   }
 
+  // 用 autonomy_status 响应（{state:{...}}）或直接 state 对象刷新探索进展
+  function syncAutonomy(data: any) {
+    const s = data && data.state ? data.state : data
+    if (!s || typeof s !== 'object') return
+    autonomy.value = {
+      running: Boolean(s.running),
+      domain: typeof s.domain === 'string' ? s.domain : '',
+      cycle_no: Number(s.cycle_no || 0),
+      cycles: Array.isArray(s.cycles) ? s.cycles : [],
+      run_on_start: Boolean(s.run_on_start),
+      interval_seconds: s.interval_seconds != null ? Number(s.interval_seconds) : undefined,
+    }
+  }
+
+  function setDecision(data: any) {
+    if (!data || typeof data !== 'object') return
+    pendingDecision.value = {
+      id: Number(data.id || 0),
+      question: String(data.question || ''),
+      options: Array.isArray(data.options) ? data.options : [],
+      context: String(data.context || ''),
+      is_fork: Boolean(data.is_fork),
+      timeout: Number(data.timeout || 0),
+    }
+  }
+
+  function clearDecision() {
+    pendingDecision.value = null
+  }
+
   return {
     agentStatus,
     systemMetrics,
+    autonomy,
+    pendingDecision,
     syncFromServer,
+    syncAutonomy,
+    setDecision,
+    clearDecision,
   }
 })

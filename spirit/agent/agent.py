@@ -72,6 +72,14 @@ class AgentConfig:
     prompt_caching_enabled: bool = True   # 是否启用 prompt caching
     cache_ttl: str = "5m"                 # 缓存有效期: '5m' 或 '1h'
 
+    # Tool Search（Progressive Tool Disclosure，Hermes 同款）
+    # 开关开启 + 工具总数 > eager_threshold 时，对 LLM 只暴露 3 个元工具
+    # （tool_search / tool_describe / tool_call）+ 在 system prompt 注入精简 manifest。
+    # 关闭 / 工具数少时走原有路径（直接发所有 schema），保持向后兼容。
+    tool_search_enabled: bool = False
+    tool_search_eager_threshold: int = 15  # ≤ 此数直接发所有 schema（不用 bridge）
+    tool_search_manifest_budget_pct: float = 5.0  # manifest 占 context 比例
+
     # 回调（事件总线简化版）
     on_tool_start: Optional[Callable] = None
     on_tool_complete: Optional[Callable] = None
@@ -106,6 +114,15 @@ class AgentConfig:
         if isinstance(agent_cfg, dict):
             if agent_cfg.get("max_iterations"):
                 config.max_iterations = int(agent_cfg["max_iterations"])
+            # 嵌套格式: agent.tool_search.*
+            ts = agent_cfg.get("tool_search", {})
+            if isinstance(ts, dict):
+                if "enabled" in ts:
+                    config.tool_search_enabled = bool(ts["enabled"])
+                if ts.get("eager_threshold") is not None:
+                    config.tool_search_eager_threshold = int(ts["eager_threshold"])
+                if ts.get("manifest_budget_pct") is not None:
+                    config.tool_search_manifest_budget_pct = float(ts["manifest_budget_pct"])
 
         # 嵌套格式: compression.*
         comp = data.get("compression", {})
@@ -133,7 +150,9 @@ class AgentConfig:
         for key in ("model", "api_key", "base_url", "provider",
                      "max_iterations", "session_id", "platform",
                      "system_prompt", "context_length", "compression_enabled",
-                     "compression_threshold", "streaming_enabled"):
+                     "compression_threshold", "streaming_enabled",
+                     "tool_search_enabled", "tool_search_eager_threshold",
+                     "tool_search_manifest_budget_pct"):
             if key in data and data[key] is not None:
                 setattr(config, key, data[key])
 
@@ -191,6 +210,7 @@ class SpiritAgent:
         self.max_iterations = config.max_iterations
         self.session_id = config.session_id or str(uuid.uuid4())
         self.platform = config.platform
+        self.context_length = config.context_length  # Tool Search manifest / 压缩器都要用
 
         # 工具集过滤
         self.enabled_toolsets = config.enabled_toolsets
@@ -269,6 +289,14 @@ class SpiritAgent:
         # Prompt caching 配置
         self._use_prompt_caching = config.prompt_caching_enabled
         self._cache_ttl = config.cache_ttl
+
+        # Tool Search（Progressive Tool Disclosure）
+        self.tool_search_enabled = config.tool_search_enabled
+        self.tool_search_eager_threshold = config.tool_search_eager_threshold
+        self.tool_search_manifest_budget_pct = config.tool_search_manifest_budget_pct
+        # bridge 句柄（lazy 导入避免循环依赖 spirit.tools.tool_search → spirit.tools.registry）
+        self._bridge_handlers: Optional[Dict[str, Callable]] = None
+        self._bridge_tool_names: Optional[set] = None
 
         # 临时系统提示词
         self._ephemeral_system_prompt = None
@@ -721,14 +749,44 @@ class SpiritAgent:
     # ------------------------------------------------------------------
 
     def get_tool_definitions(self) -> List[dict]:
-        """获取当前可用的工具定义（OpenAI 格式）。"""
-        return self.registry.get_definitions(
+        """获取当前可用的工具定义（OpenAI 格式）。
+
+        Tool Search 路径（agent.tool_search.enabled=True 且工具总数 > eager_threshold）：
+            返回 3 个 bridge schema（tool_search / tool_describe / tool_call）；
+            原始工具 schema 走 system prompt 里注入的精简 manifest 透露。
+        Eager 路径：返回所有工具 schema（与原行为一致），避免不必要的多跳开销。
+        """
+        definitions = self.registry.get_definitions(
             enabled_toolsets=self.enabled_toolsets,
             disabled_toolsets=self.disabled_toolsets,
         )
+        if not self.tool_search_enabled:
+            return definitions
+        if len(definitions) <= self.tool_search_eager_threshold:
+            return definitions
+        # Defer 模式：只发 3 个 bridge，外加 manifest 拼到 system prompt
+        from spirit.tools.tool_search import ALL_BRIDGE_SCHEMAS
+        return list(ALL_BRIDGE_SCHEMAS)
+
+    def _ensure_bridge_loaded(self) -> None:
+        """Lazy 加载 bridge 句柄（避免循环依赖）。"""
+        if self._bridge_handlers is None:
+            from spirit.tools.tool_search import BRIDGE_HANDLERS, BRIDGE_TOOL_NAMES
+            self._bridge_handlers = dict(BRIDGE_HANDLERS)
+            self._bridge_tool_names = set(BRIDGE_TOOL_NAMES)
+
+    def _is_bridge_tool(self, name: str) -> bool:
+        """判断是否为 Tool Search 桥接工具。"""
+        self._ensure_bridge_loaded()
+        return name in (self._bridge_tool_names or set())
 
     def invoke_tool(self, name: str, args: Dict[str, Any]) -> str:
-        """调用工具。"""
+        """调用工具。
+
+        Tool Search 启用时：先检查 name 是否是 bridge（tool_search/tool_describe/tool_call），
+        是则走桥接 handler，不走 registry.dispatch。其它情况透传到原 dispatcher。
+        这样 bridge 永远能被 LLM 调用，同时 60+ 原生工具的可调用能力也保留。
+        """
         # 回调
         if self.on_tool_start:
             try:
@@ -736,7 +794,25 @@ class SpiritAgent:
             except Exception:
                 pass
 
-        result = self.registry.dispatch(name, args)
+        if self.tool_search_enabled and self._is_bridge_tool(name):
+            self._ensure_bridge_loaded()
+            handler = (self._bridge_handlers or {}).get(name)
+            if handler is None:
+                result = json.dumps(
+                    {"error": f"未知的 bridge 工具: {name}"},
+                    ensure_ascii=False,
+                )
+            else:
+                try:
+                    result = handler(args, agent=self)
+                except Exception as exc:
+                    logger.warning("bridge 工具 %s 执行失败: %s", name, exc, exc_info=True)
+                    result = json.dumps(
+                        {"error": f"bridge 工具执行失败: {type(exc).__name__}: {str(exc)[:500]}"},
+                        ensure_ascii=False,
+                    )
+        else:
+            result = self.registry.dispatch(name, args)
 
         # 回调
         if self.on_tool_complete:
@@ -759,25 +835,47 @@ class SpiritAgent:
 
     def get_system_prompt(self) -> str:
         """获取系统提示词（动态构建 + 缓存）。
-
-        系统提示词采用"一次构建，永久缓存"架构:
+    
+        系统提示词采用“一次构建，永久缓存”架构:
         - 仅在首次调用时构建
         - 后续轮次直接返回缓存，确保 prompt cache 前缀稳定
         - 只有 reset_session() 或 switch_model() 才会清除缓存
+    
+        Tool Search 启用且走 defer 模式（返回的是 bridge 而非全部 schema）时，
+        会在 prompt 末尾追加一份精简 manifest（name + toolset + 一句话描述），
+        作为 LLM 跳查工具名的索引。manifest 按 token 预算（默认 5% context）降级。
         """
         if self._cached_system_prompt:
             return self._cached_system_prompt
-
+    
         from spirit.agent.prompt_builder import build_system_prompt
-
+    
+        extra_context = None
+        if self.tool_search_enabled:
+            try:
+                # 计算实际生效的 definitions：与 get_tool_definitions 同样的门槛
+                definitions = self.registry.get_definitions(
+                    enabled_toolsets=self.enabled_toolsets,
+                    disabled_toolsets=self.disabled_toolsets,
+                )
+                if len(definitions) > self.tool_search_eager_threshold:
+                    from spirit.tools.tool_search import build_tool_manifest
+                    extra_context = build_tool_manifest(
+                        budget_pct=self.tool_search_manifest_budget_pct,
+                        context_length=self.context_length,
+                    )
+            except Exception as exc:  # noqa: BLE001 - manifest 生成失败不影响主路径
+                logger.debug("tool manifest 生成失败（非致命）: %s", exc)
+    
         prompt = build_system_prompt(
             agent=self,
             custom_system_message=self.config.system_prompt or None,
+            extra_context=extra_context,
         )
-
+    
         self._cached_system_prompt = prompt
         return prompt
-
+    
     def set_ephemeral_system_prompt(self, text: str):
         """设置临时系统提示词（仅当前轮有效）。"""
         from spirit.agent.prompt_builder import EphemeralSystemPrompt

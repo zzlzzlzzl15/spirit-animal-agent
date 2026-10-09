@@ -19,7 +19,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 
 const emit = defineEmits<{
   (e: 'close'): void
@@ -56,11 +56,37 @@ function onAction(action: string) {
   emit('action', action)
 }
 
+/**
+ * 把当前菜单按钮的渲染层视口坐标推送给主进程。
+ * 主进程会加窗口偏移转屏幕绝对坐标，让 forceCapture=true 期间：
+ * - 光标在按钮上 → 捕获（可点菜单项）
+ * - 光标不在按钮 → 透传（避免点不到屏幕下层按钮的“空气墙”）
+ */
+function reportButtonBoxes(): void {
+  const buttons = document.querySelectorAll<HTMLElement>('.radial-btn')
+  const boxes: Array<{ x: number; y: number; w: number; h: number }> = []
+  buttons.forEach((el) => {
+    const r = el.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) {
+      boxes.push({ x: r.left, y: r.top, w: r.width, h: r.height })
+    }
+  })
+  window.electronAPI?.setMenuButtonBoxes?.(boxes)
+}
+
 onMounted(() => {
   // 延迟触发动画
   requestAnimationFrame(() => {
     showItems.value = true
+    // 动画结束后（4 个按钮从顶部依次展开 0/50/100/150ms + 0.3s transition）
+    // 推送按钮坐标给主进程，避免动画途中误判透传
+    setTimeout(reportButtonBoxes, 250)
   })
+})
+
+onUnmounted(() => {
+  // 菜单卸载时清空按钮区域 → 主进程恢复仅狐狸可见像素捕获
+  window.electronAPI?.setMenuButtonBoxes?.([])
 })
 </script>
 

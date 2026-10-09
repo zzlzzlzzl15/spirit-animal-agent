@@ -33,6 +33,7 @@ CMD_ANSWER = "autonomy_answer"
 CMD_STATUS = "autonomy_status"
 CMD_START = "autonomy_start"
 CMD_STOP = "autonomy_stop"
+CMD_SET_DOMAIN = "autonomy_set_domain"
 
 SendFn = Callable[[str, Dict[str, Any]], Any]
 
@@ -127,11 +128,28 @@ class DesktopBridge:
             ctrl.stop()
             return {"ok": True}
 
+        async def on_set_domain(ws_client, data: Dict[str, Any]) -> Dict[str, Any]:
+            """运行时给一个探索方向（“给方向 → 自由探索”入口）。
+
+            调 controller.set_domain 改写领域；``run_now``（默认 True）置位即时探索
+            信号，常驻循环下一 poll 内立即跑一轮。若循环未在跑则拉起守护线程。
+            """
+            ctrl = bridge.controller
+            if ctrl is None or not hasattr(ctrl, "set_domain"):
+                return {"ok": False, "error": "no controller"}
+            domain = str((data or {}).get("domain", "") or "")
+            run_now = bool((data or {}).get("run_now", True))
+            result = ctrl.set_domain(domain, run_now=run_now)
+            if run_now and hasattr(ctrl, "running") and not ctrl.running and hasattr(ctrl, "start"):
+                ctrl.start()
+            return {"ok": True, **(result if isinstance(result, dict) else {})}
+
         return {
             CMD_ANSWER: on_answer,
             CMD_STATUS: on_status,
             CMD_START: on_start,
             CMD_STOP: on_stop,
+            CMD_SET_DOMAIN: on_set_domain,
         }
 
     def attach(self, server: Any) -> None:
@@ -170,4 +188,5 @@ __all__ = [
     "CMD_STATUS",
     "CMD_START",
     "CMD_STOP",
+    "CMD_SET_DOMAIN",
 ]

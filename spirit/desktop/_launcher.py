@@ -76,6 +76,28 @@ def main():
         streaming_cfg = raw.get("streaming", {})
         if isinstance(streaming_cfg, dict) and "enabled" in streaming_cfg:
             config.streaming_enabled = bool(streaming_cfg["enabled"])
+        # Tool Search（agent.tool_search.*）：桌宠主链路 — launcher 手动传 dict 给 AgentConfig，
+        # 不会走 AgentConfig.from_dict，所以这里需要单独从 raw 挑出来设上。
+        ts_cfg = raw.get("agent", {}).get("tool_search", {})
+        if isinstance(ts_cfg, dict):
+            if "enabled" in ts_cfg:
+                config.tool_search_enabled = bool(ts_cfg["enabled"])
+            if ts_cfg.get("eager_threshold") is not None:
+                try:
+                    config.tool_search_eager_threshold = int(ts_cfg["eager_threshold"])
+                except (TypeError, ValueError):
+                    pass
+            if ts_cfg.get("manifest_budget_pct") is not None:
+                try:
+                    config.tool_search_manifest_budget_pct = float(ts_cfg["manifest_budget_pct"])
+                except (TypeError, ValueError):
+                    pass
+            logger.info(
+                "Tool Search 初始化: enabled=%s, eager_threshold=%d, manifest_budget_pct=%.1f%%",
+                config.tool_search_enabled,
+                config.tool_search_eager_threshold,
+                config.tool_search_manifest_budget_pct,
+            )
         agent = SpiritAgent(config)
         logger.info("SpiritAgent 已初始化: model=%s, provider=%s", config.model, config.provider)
     except Exception as exc:

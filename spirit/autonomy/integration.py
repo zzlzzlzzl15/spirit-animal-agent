@@ -315,6 +315,7 @@ def make_proposer(
     caller: Optional[LLMCaller],
     *,
     domain: str = "",
+    domain_getter: Optional[Callable[[], str]] = None,
     limit: int = 3,
 ) -> Optional[Callable[[Any], List[str]]]:
     """构造“架构型自提议” propose seam：每轮基于沉淀记忆提出下一个架构/设计型问题。
@@ -326,6 +327,8 @@ def make_proposer(
     - 无 caller → None（fail-soft，AutonomyLoop 回退到 _default_propose 或空转）。
 
     ``domain`` 可限定探索领域（如“金融”）；``limit`` 控制每轮候选数（>1 触发 HITL 分叉询问）。
+    ``domain_getter`` 优先于静态 ``domain``：每轮实时读取（late-binding），让
+    :meth:`AutonomyLoop.set_domain` 运行时改方向后，下一轮立即围绕新领域提议。
     """
     if caller is None:
         return None
@@ -335,7 +338,8 @@ def make_proposer(
             summary = CurriculumPlanner(memory=memory).progress_summary(memory)
         except Exception:  # pragma: no cover - 记忆读取失败降级
             summary = "（无历史记忆）"
-        domain_hint = f"聚焦领域：{domain}。\n" if domain else ""
+        cur_domain = str((domain_getter() if domain_getter is not None else domain) or "").strip()
+        domain_hint = f"聚焦领域：{cur_domain}。\n" if cur_domain else ""
         prompt = (
             "你是自主探索规划器。基于下方已沉淀的记忆，提出接下来最值得探索的 "
             f"{limit} 个【架构/设计型】问题（例如：系统结构权衡、模块边界划分、设计模式选型、"
@@ -376,6 +380,7 @@ def build_autonomy(
     stop_policy: Optional[str] = None,
     max_rounds: Optional[int] = None,
     domain: str = "",
+    run_on_start: Optional[bool] = None,
 ) -> Tuple[DesktopBridge, AutonomyLoop]:
     """组装桥接 + 常驻循环（不启动线程、不注册命令）。离线可测（server=None）。
 
@@ -405,10 +410,9 @@ def build_autonomy(
     if execute is None and enable_agent_execute:
         execute = make_execute(sandbox, max_iterations=max_iterations)
 
-    # 架构型自提议：有 caller 且未注入 propose 时接上（每轮基于记忆提出下一个架构问题，
-    # 实现“做完一个→自提新架构问题→继续探索”）。
-    if propose is None and caller is not None:
-        propose = make_proposer(caller, domain=domain)
+    # 探索方向 + 启动即跑首轮：显式传入 > 配置 autonomy.domain / autonomy.run_on_start > 默认。
+    resolved_domain = resolve_domain(domain)
+    resolved_run_on_start = resolve_run_on_start(run_on_start)
 
     autonomy = AutonomyLoop(
         caller=caller, memory=memory, hitl=hitl, sandbox=sandbox,
@@ -417,7 +421,16 @@ def build_autonomy(
         interval_seconds=resolve_interval_seconds(interval_seconds),
         stop_policy=resolve_stop_policy(stop_policy),
         max_rounds=resolve_max_rounds(max_rounds),
+        domain=resolved_domain,
+        run_on_start=resolved_run_on_start,
     )
+
+    # 架构型自提议：有 caller 且未注入 propose 时接上（每轮基于记忆提出下一个架构问题，
+    # 实现“做完一个→自提新架构问题→继续探索”）。domain_getter late-binding 读
+    # autonomy.domain，让 set_domain 运行时改方向后，下一轮立即围绕新领域提议。
+    if propose is None and caller is not None:
+        autonomy._propose = make_proposer(caller, domain_getter=lambda: autonomy.domain)
+
     bridge.controller = autonomy
     return bridge, autonomy
 
@@ -434,11 +447,14 @@ def start_autonomy(
     stop_policy: Optional[str] = None,
     max_rounds: Optional[int] = None,
     domain: str = "",
+    run_on_start: Optional[bool] = None,
 ) -> Optional[AutonomyLoop]:
     """把常驻自主循环挂到桌宠 WS 服务并（可选）启动守护线程。失败 → None（fail-soft）。
 
     缺省即“完全自动化”：持久记忆 + DRS 三角色推理 + 真实 execute（有 api_key 时）全部接上；
     探索间隔缺省 5 小时（对齐 API token 刷新），可经 ``autonomy.interval_hours`` 配置覆盖。
+    ``domain`` / ``run_on_start`` 缺省从配置 ``autonomy`` 段解析——给一个方向即围绕它自由探索，
+    ``run_on_start=True`` 时启动不等满间隔立即跑首轮。
     """
     try:
         bridge, autonomy = build_autonomy(
@@ -446,6 +462,7 @@ def start_autonomy(
             interval_seconds=interval_seconds,
             enable_agent_execute=enable_agent_execute, max_iterations=max_iterations,
             stop_policy=stop_policy, max_rounds=max_rounds, domain=domain,
+            run_on_start=run_on_start,
         )
         bridge.attach(server)
         if autostart:
@@ -461,5 +478,6 @@ def start_autonomy(
 
 __all__ = ["make_llm_caller", "make_memory", "make_execute", "make_proposer",
            "resolve_interval_seconds", "DEFAULT_RESIDENT_INTERVAL_SECONDS",
+           "resolve_domain", "resolve_run_on_start",
            "resolve_stop_policy", "resolve_max_rounds",
            "build_autonomy", "start_autonomy"]

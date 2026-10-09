@@ -39,6 +39,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   closeStatusWindow: (): Promise<boolean> =>
     ipcRenderer.invoke('close-status-window'),
 
+  /** 打开系统面板窗口（独立窗口，不嵌进桌宠窗口） */
+  openSystemWindow: (): Promise<boolean> =>
+    ipcRenderer.invoke('open-system-window'),
+
+  /** 关闭系统面板窗口 */
+  closeSystemWindow: (): Promise<boolean> =>
+    ipcRenderer.invoke('close-system-window'),
+
   /** 打开 CLI 终端窗口 */
   openCLITerminal: (): Promise<boolean> =>
     ipcRenderer.invoke('open-cli-terminal'),
@@ -96,9 +104,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.send('resize-window', { width, height })
   },
 
-  /** 交互态捕获开关：菜单/面板/拖拽期间整窗收回鼠标捕获 */
+  /** 交互态捕获开关：菜单/面板/拖拽期间轮询按 hitTargets 判定，不上抬整窗捕获 */
   setForceCapture: (force: boolean): void => {
     ipcRenderer.send('pet-set-force-capture', { force })
+  },
+
+  /** 推送菜单/面板按钮屏幕坐标给主进程：在这些区域内捕获鼠标，其他区域透传 */
+  setMenuButtonBoxes: (boxes: Array<{ x: number; y: number; w: number; h: number }>): void => {
+    ipcRenderer.send('pet-set-menu-button-boxes', boxes)
   },
 
   // ── 事件监听 ──────────────────────────────────────────────
@@ -132,6 +145,8 @@ declare global {
       getWindowPosition: () => Promise<{ x: number; y: number; w: number; h: number }>
       openStatusWindow: () => Promise<boolean>
       closeStatusWindow: () => Promise<boolean>
+      openSystemWindow: () => Promise<boolean>
+      closeSystemWindow: () => Promise<boolean>
       openCLITerminal: () => Promise<boolean>
       closeCLITerminal: () => Promise<boolean>
       showBubble: (text: string) => Promise<boolean>
@@ -145,6 +160,7 @@ declare global {
       moveWindow: (deltaX: number, deltaY: number) => void
       resizeWindow: (width: number, height: number) => void
       setForceCapture: (force: boolean) => void
+      setMenuButtonBoxes: (boxes: Array<{ x: number; y: number; w: number; h: number }>) => void
       onSwitchPet: (callback: (data: { slug: string }) => void) => void
       removeAllListeners: (channel: string) => void
     }

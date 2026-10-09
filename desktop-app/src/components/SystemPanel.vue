@@ -6,6 +6,62 @@
     </div>
     <div class="panel-body">
       <div v-if="refreshError" class="error-msg">{{ refreshError }}</div>
+
+      <!-- 🧭 自主探索：给一个方向 → 自由探索 -->
+      <div class="autonomy-section">
+        <div class="autonomy-head">
+          <span class="autonomy-title">🧭 自主探索</span>
+          <span class="autonomy-badge" :class="{ on: autonomy.running }">
+            {{ autonomy.running ? '运行中' : '未启动' }}
+          </span>
+        </div>
+
+        <!-- HITL 决策询问：探索遇分叉/停滞时弹出，点选即应答 -->
+        <div v-if="decision" class="decision-box">
+          <div class="decision-q">{{ decision.question }}</div>
+          <div v-if="decision.context" class="decision-ctx">{{ decision.context }}</div>
+          <div class="decision-opts">
+            <button
+              v-for="(opt, i) in decision.options"
+              :key="i"
+              class="decision-opt"
+              @click="answerDecision(opt)"
+            >{{ opt }}</button>
+          </div>
+        </div>
+
+        <!-- 方向输入 -->
+        <div class="direction-row">
+          <input
+            v-model="direction"
+            class="direction-input"
+            type="text"
+            placeholder="给个方向，如：金融数据分析…"
+            @keyup.enter="startExplore"
+            :disabled="sending"
+          />
+          <button
+            class="explore-btn"
+            @click="startExplore"
+            :disabled="sending || !direction.trim()"
+          >{{ sending ? '…' : '开始探索' }}</button>
+        </div>
+        <div class="autonomy-hint">
+          <span v-if="autonomy.domain">当前方向：{{ autonomy.domain }}</span>
+          <span v-else class="text-gray">未设方向 · 基于记忆自由提议</span>
+          <span v-if="autonomy.cycle_no"> · 已探索 {{ autonomy.cycle_no }} 轮</span>
+        </div>
+
+        <!-- 近期探索进展 -->
+        <div v-if="recentCycles.length" class="cycle-list">
+          <div v-for="c in recentCycles" :key="c.cycle_no" class="cycle-item">
+            <span class="cycle-no">#{{ c.cycle_no }}</span>
+            <span class="cycle-status" :class="statusClass(c.status)">{{ statusText(c.status) }}</span>
+            <span class="cycle-task" :title="c.task">{{ c.task || '（空转）' }}</span>
+          </div>
+        </div>
+      </div>
+
       <!-- CPU -->
       <div class="metric-group">
         <div class="metric-label">CPU</div>
@@ -60,6 +116,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, inject, ref } from 'vue'
+import { storeToRefs } from 'pinia'
 import { useStatusStore } from '../stores/statusStore'
 
 defineEmits<{
@@ -69,6 +126,12 @@ defineEmits<{
 const wsSend = inject<Function>('wsSend')
 const statusStore = useStatusStore()
 const refreshError = ref('')
+
+// 自主探索：方向输入 + 发送态；进展/决策从 store 响应式读取（决策事件由 App.vue 路由入 store）
+const { autonomy, pendingDecision: decision } = storeToRefs(statusStore)
+const direction = ref('')
+const sending = ref(false)
+const recentCycles = computed(() => (autonomy.value.cycles || []).slice(-6).reverse())
 
 const cpuPercent = computed(() => {
   const p = statusStore.systemMetrics.cpu.percent
@@ -103,9 +166,66 @@ async function fetchSystemStatus() {
   }
 }
 
+// 自主探索进展轮询（后端 autonomy_status → {state:{...}}）
+async function fetchAutonomy() {
+  if (!wsSend) return
+  try {
+    const data = await wsSend('autonomy_status')
+    if (data && !data.error) statusStore.syncAutonomy(data)
+  } catch { /* 未挂载 autonomy/后端未就绪：静默降级 */ }
+}
+
+function statusClass(s: string): string {
+  if (s === 'CONVERGED' || s === 'READY_FOR_RETRY') return 'ok'
+  if (s === 'STALLED') return 'warn'
+  if (s === 'IDLE') return 'dim'
+  return ''
+}
+
+function statusText(s: string): string {
+  const map: Record<string, string> = {
+    CONVERGED: '收敛', STALLED: '停滞', IDLE: '空转', READY_FOR_RETRY: '待重试',
+  }
+  return map[s] || s || '-'
+}
+
+// 给一个方向 → 立即自由探索（autonomy_set_domain, run_now）
+async function startExplore() {
+  const dir = direction.value.trim()
+  if (!dir || sending.value || !wsSend) return
+  sending.value = true
+  try {
+    const res = await wsSend('autonomy_set_domain', { domain: dir, run_now: true })
+    if (res && res.ok) {
+      direction.value = ''
+      refreshError.value = ''
+      await fetchAutonomy()
+    } else if (res && res.error) {
+      refreshError.value = `设置探索方向失败：${res.error}`
+    }
+  } catch (err: any) {
+    refreshError.value = err.message || '设置探索方向失败'
+  } finally {
+    sending.value = false
+  }
+}
+
+// 应答 HITL 决策（点选选项 → autonomy_answer）
+async function answerDecision(text: string) {
+  if (!wsSend) return
+  try {
+    await wsSend('autonomy_answer', { text })
+  } catch { /* 忽略应答失败 */ }
+  statusStore.clearDecision()
+}
+
 onMounted(() => {
   fetchSystemStatus()
-  refreshTimer = setInterval(fetchSystemStatus, 5000)
+  fetchAutonomy()
+  refreshTimer = setInterval(() => {
+    fetchSystemStatus()
+    fetchAutonomy()
+  }, 5000)
 })
 
 onUnmounted(() => {
@@ -245,5 +365,152 @@ onUnmounted(() => {
   color: #f87171;
   font-size: 11px;
   padding: 8px 0;
+}
+
+/* ── 自主探索 ─────────────────────── */
+.autonomy-section {
+  margin-bottom: 14px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.autonomy-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.autonomy-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+}
+.autonomy-badge {
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #888;
+}
+.autonomy-badge.on {
+  background: rgba(74, 222, 128, 0.16);
+  color: #4ade80;
+}
+.direction-row {
+  display: flex;
+  gap: 6px;
+}
+.direction-input {
+  flex: 1;
+  min-width: 0;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: #e0e0e0;
+  font-size: 11px;
+  padding: 6px 8px;
+  outline: none;
+}
+.direction-input:focus {
+  border-color: rgba(251, 146, 60, 0.7);
+}
+.direction-input:disabled {
+  opacity: 0.5;
+}
+.explore-btn {
+  flex-shrink: 0;
+  background: linear-gradient(90deg, #fb923c, #f97316);
+  border: none;
+  border-radius: 8px;
+  color: #1a1a1a;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 10px;
+  cursor: pointer;
+}
+.explore-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.autonomy-hint {
+  font-size: 10px;
+  color: #999;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+.cycle-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.cycle-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+}
+.cycle-no {
+  color: #666;
+  flex-shrink: 0;
+}
+.cycle-status {
+  flex-shrink: 0;
+  font-size: 9px;
+  padding: 0 5px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #aaa;
+}
+.cycle-status.ok { background: rgba(74, 222, 128, 0.16); color: #4ade80; }
+.cycle-status.warn { background: rgba(251, 146, 60, 0.16); color: #fb923c; }
+.cycle-status.dim { color: #666; }
+.cycle-task {
+  flex: 1;
+  min-width: 0;
+  color: #ccc;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.decision-box {
+  background: rgba(251, 146, 60, 0.1);
+  border: 1px solid rgba(251, 146, 60, 0.4);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+}
+.decision-q {
+  font-size: 11px;
+  color: #ffd9b3;
+  font-weight: 600;
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+.decision-ctx {
+  font-size: 10px;
+  color: #999;
+  margin-bottom: 6px;
+  line-height: 1.4;
+  max-height: 48px;
+  overflow: hidden;
+}
+.decision-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.decision-opt {
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 6px;
+  color: #e0e0e0;
+  font-size: 10px;
+  padding: 5px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.decision-opt:hover {
+  background: rgba(251, 146, 60, 0.2);
+  border-color: rgba(251, 146, 60, 0.5);
 }
 </style>

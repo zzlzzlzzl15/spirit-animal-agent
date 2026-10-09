@@ -82,3 +82,9 @@ from spirit.tools import edit_proposal
 
 # Memora 知识库工具
 from spirit.tools import memora_tool
+
+# 专家角色库（agency-agents 282 个 specialist 懒加载路由）
+from spirit.tools import agency_agents
+
+# Tool Search 桥接（Progressive Tool Disclosure — 替代一次性塞 60+ schema）
+from spirit.tools import tool_search  # noqa: F401
