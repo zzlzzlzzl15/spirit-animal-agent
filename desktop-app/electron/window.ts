@@ -746,11 +746,19 @@ export function createBubbleWindow(
 
   const bubbleW = 220
   const bubbleH = 60
-  const gap = 2
+  const gap = 10  // 气泡底部与狐狸头顶的视觉间距（之前是 2px 在窗口顶部，看着像悬空）
 
-  // 气泡显示在宠物窗口正上方，水平居中
+  // 反算精灵缩放：窗口宽 = round(FRAME_W*scale) + PADDING + 2*MENU_PADDING
+  // （含 MENU_PADDING=80 的径向菜单外扩留白——之前按窗口顶部定位会离狐狸 ~84px 远）
+  const scale = (petBounds.w - PADDING - 2 * MENU_PADDING) / FRAME_W
+  const spriteH = Math.round(FRAME_H * scale)
+  // 精灵在窗口内顶部偏移 = (窗口高 - 精灵高) / 2
+  const spriteTopOffset = Math.round((petBounds.h - spriteH) / 2)
+
+  // 气泡显示在狐狸头顶上方，水平居中
   const x = petBounds.x + Math.round(petBounds.w / 2) - Math.round(bubbleW / 2)
-  const y = petBounds.y - bubbleH - gap
+  // 气泡底部 = 精灵顶部 - gap
+  const y = petBounds.y + spriteTopOffset - bubbleH - gap
 
   // 确保不超出屏幕左边界
   const finalX = Math.max(0, x)
