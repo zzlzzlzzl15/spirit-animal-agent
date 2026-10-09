@@ -960,10 +960,39 @@ class SpiritAgent:
     # ------------------------------------------------------------------
 
     def add_message(self, role: str, content: str, **kwargs):
-        """添加消息到对话历史。"""
+        """添加消息到对话历史。
+
+        v0.2.11: 同步落库到 session_db.messages 表。
+        之前只 append 到内存 self._messages，db 里没有 user / assistant 消息——
+        导致 _print_recent_tasks 拿不到首条 user message preview，全部显示
+        「(空会话)」。现在每条消息同步落库，db 完整记录对话历史。
+        失败隔离：db 落库失败仅 log debug，不阻断主对话循环。
+
+        tool_calls 序列化：db.save_message 直接 INSERT 不做 json.dumps，
+        传 list/dict 会报 `type 'list' is not supported`。这里在调用前序列化。
+        """
         msg = {"role": role, "content": content}
         msg.update(kwargs)
         self._messages.append(msg)
+        # 同步落库（异常隔离）
+        if self._session_db and self.session_id:
+            try:
+                # tool_calls 若是 list/dict 需 json 序列化为 str
+                _tool_calls = kwargs.get("tool_calls")
+                if _tool_calls is not None and not isinstance(_tool_calls, str):
+                    try:
+                        _tool_calls = json.dumps(_tool_calls, ensure_ascii=False)
+                    except Exception:
+                        _tool_calls = None
+                self._session_db.save_message(
+                    self.session_id,
+                    role,
+                    content,
+                    tool_calls=_tool_calls,
+                    tool_call_id=kwargs.get("tool_call_id"),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("add_message 落库失败 (非致命): %s", e)
 
     def get_system_prompt(self) -> str:
         """获取系统提示词（动态构建 + 缓存）。
