@@ -24,6 +24,12 @@ from spirit.agent.tool_guardrails import (
     toolguard_synthetic_result,
     append_toolguard_guidance,
 )
+from spirit.agent.tool_result_classification import (
+    classify_tool_result,
+    format_classified_for_llm,
+    ClassifiedToolResult,
+    ToolResultCategory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +50,25 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     guardrail_decision: Optional[ToolGuardrailDecision] = None,
+    classified: Optional[ClassifiedToolResult] = None,
 ) -> Dict[str, Any]:
-    """构建 tool 角色消息。"""
-    content = result
+    """构建 tool 角色消息。
+
+    Args:
+        tool_name: 工具名
+        result: 工具返回的字符串
+        tool_call_id: OpenAI 工具调用 ID
+        guardrail_decision: 护栏后检结果（可选）
+        classified: 工具结果分类（来自 :func:`classify_tool_result`，可选）。
+                     失败时会自动在 content 前注入 ``_classification`` / ``_retryable`` / ``_guidance``，
+                     让 LLM 区分"参数错误（不可重试）"vs"网络超时（可重试）"。
+                     成功时不会污染 content。
+    """
+    # 失败 / 部分成功 / 可重试 / 不可重试时注入分类前缀
+    if classified is not None and classified.category != ToolResultCategory.SUCCESS:
+        content = format_classified_for_llm(classified, include_original=True)
+    else:
+        content = result
     if guardrail_decision:
         content = append_toolguard_guidance(content, guardrail_decision)
 
@@ -164,9 +186,9 @@ def execute_single_tool(
     # 护栏：调用后检查
     guardrail_decision = None
     if guardrails:
-        # 简单失败检测
-        failed = _detect_tool_failure(tool_name, result)
-        guardrail_decision = guardrails.after_call(tool_name, args, result, failed=failed)
+        # 分类工具结果（新分类器：区分成功 / 部分成功 / 失败 / 可重试 / 不可重试）
+        classified = classify_tool_result(tool_name, result)
+        guardrail_decision = guardrails.after_call(tool_name, args, result, failed=classified.is_failure)
 
     return result, tool_name, guardrail_decision
 
@@ -219,11 +241,15 @@ def execute_tool_calls_sequential(
             guardrails=guardrails,
         )
 
+        # 分类工具结果（新分类器：让 LLM 看到分类指引）
+        classified = classify_tool_result(tool_name, result)
+
         messages.append(make_tool_result_message(
             tool_name,
             result,
             tool_call.get("id", ""),
             guardrail_decision=guardrail_decision,
+            classified=classified,
         ))
 
 
@@ -369,12 +395,15 @@ def execute_tool_calls_concurrent(
         # 护栏后检
         guardrail_decision = None
         if guardrails:
-            failed = _detect_tool_failure(name, result)
-            guardrail_decision = guardrails.after_call(name, args, result, failed=failed)
+            classified = classify_tool_result(name, result)
+            guardrail_decision = guardrails.after_call(name, args, result, failed=classified.is_failure)
+        else:
+            classified = classify_tool_result(name, result)
 
         messages.append(make_tool_result_message(
             name, result, tc.get("id", ""),
             guardrail_decision=guardrail_decision,
+            classified=classified,
         ))
 
 
