@@ -30,14 +30,30 @@ from spirit.agent.tool_result_classification import (
     ClassifiedToolResult,
     ToolResultCategory,
 )
+from spirit.agent.tool_liveness import (
+    LivenessConfig,
+    LivenessDetector,
+    OutputLivenessProbe,
+    build_timeout_result_json,
+    create_default_liveness_detector,
+)
 
 logger = logging.getLogger(__name__)
 
 # 最大并发工作线程
 _MAX_TOOL_WORKERS = 8
 
-# 默认并发超时（秒）
-_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+# 默认并发超时（秒）—— R-P1.3 从 420s 缩短到 300s（整体硬超时）
+_DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 300.0
+
+# 单工具硬超时（秒）—— R-P1.3 新增（默认 60s）
+_DEFAULT_SINGLE_TOOL_TIMEOUT_S = 60.0
+
+# 单工具软超时（秒）—— R-P1.3 新增（默认 30s warning）
+_DEFAULT_SINGLE_TOOL_SOFT_WARN_S = 30.0
+
+# 整体软超时（秒）—— R-P1.3 新增（默认 90s warning）
+_DEFAULT_OVERALL_SOFT_WARN_S = 90.0
 
 
 # =========================================================================
@@ -128,6 +144,7 @@ def execute_single_tool(
     *,
     tool_call: Dict[str, Any],
     guardrails: Optional[ToolCallGuardrailController] = None,
+    detector: Optional[LivenessDetector] = None,
 ) -> Tuple[str, str, Optional[ToolGuardrailDecision]]:
     """执行单个工具调用。
 
@@ -135,6 +152,9 @@ def execute_single_tool(
         agent: SpiritAgent 实例
         tool_call: 工具调用 dict（含 id, function.name, function.arguments）
         guardrails: 护栏控制器
+        detector: 可选的 liveness detector（R-P1.3 新增）。如提供，工具执行
+                  期间会监控 elapsed；超时后用分类的 timeout JSON 替换 result
+                  （而不是默默失败）。
 
     Returns:
         (result, tool_name, guardrail_decision)
@@ -164,8 +184,16 @@ def execute_single_tool(
     # 执行（on_tool_start/on_complete 回调统一在 invoke_tool 内触发，避免重复推送）
     _emit_hook(agent, "before_tool_execute", tool_name=tool_name, tool_args=args)
     start_time = time.time()
+
+    # R-P1.3：liveness 检测器启动（如提供）
+    if detector is not None:
+        detector.start()
+
     try:
         result = agent.invoke_tool(tool_name, args)
+        # R-P1.3：记录进度（重置 inactivity 计时）
+        if detector is not None:
+            detector.record_progress(output=result)
     except Exception as exc:
         logger.error("工具 %s 执行异常: %s", tool_name, exc, exc_info=True)
         _emit_hook(agent, "on_tool_error", tool_name=tool_name, error=exc, tool_args=args)
@@ -173,6 +201,22 @@ def execute_single_tool(
             "error": f"工具执行异常: {type(exc).__name__}: {str(exc)[:500]}",
             "status": "error",
         }, ensure_ascii=False)
+
+    # R-P1.3：liveness 检测器停止 + 检查是否超时
+    if detector is not None:
+        detector.stop()
+        if detector.is_cancelled():
+            elapsed = detector.elapsed()
+            logger.warning(
+                "[tool_executor] 工具 %s 被 liveness 标记假死（%.1fs），替换结果为超时分类",
+                tool_name, elapsed,
+            )
+            result = build_timeout_result_json(
+                tool_name=tool_name,
+                elapsed_s=elapsed,
+                timeout_kind="single_tool",
+                retryable=True,
+            )
 
     duration_ms = int((time.time() - start_time) * 1000)
     logger.info("工具 %s 执行完成 (%d ms)", tool_name, duration_ms)
@@ -221,10 +265,16 @@ def execute_tool_calls_sequential(
     messages: List[Dict[str, Any]],
     *,
     guardrails: Optional[ToolCallGuardrailController] = None,
+    single_tool_timeout_s: float = _DEFAULT_SINGLE_TOOL_TIMEOUT_S,
+    single_tool_soft_warn_s: float = _DEFAULT_SINGLE_TOOL_SOFT_WARN_S,
 ) -> None:
     """顺序执行多个工具调用。
 
     结果按原始顺序追加到 messages。
+
+    R-P1.3 新增：每个工具启动一个 LivenessDetector，监控 elapsed；超过
+    ``single_tool_timeout_s`` 无进展 → 标记取消并用分类的 timeout JSON
+    替换 result（不是默默失败）。
     """
     for tool_call in tool_calls:
         if getattr(agent, "_interrupt_requested", False):
@@ -235,10 +285,20 @@ def execute_tool_calls_sequential(
             ))
             continue
 
+        # R-P1.3：为每个工具创建 liveness detector
+        tool_name_for_detector = tool_call.get("function", {}).get("name", "")
+        detector = create_default_liveness_detector(
+            single_tool_timeout_s=single_tool_timeout_s,
+            overall_timeout_s=single_tool_timeout_s * 10,  # sequential 下整体 = 10x 单工具
+        )
+        # 自定义软超时阈值
+        detector.config.single_tool_soft_warn_s = single_tool_soft_warn_s
+
         result, tool_name, guardrail_decision = execute_single_tool(
             agent,
             tool_call=tool_call,
             guardrails=guardrails,
+            detector=detector,
         )
 
         # 分类工具结果（新分类器：让 LLM 看到分类指引）
@@ -265,11 +325,20 @@ def execute_tool_calls_concurrent(
     guardrails: Optional[ToolCallGuardrailController] = None,
     max_workers: int = _MAX_TOOL_WORKERS,
     timeout_s: float = _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S,
+    single_tool_timeout_s: float = _DEFAULT_SINGLE_TOOL_TIMEOUT_S,
+    overall_soft_warn_s: float = _DEFAULT_OVERALL_SOFT_WARN_S,
 ) -> None:
     """并发执行多个工具调用（线程池）。
 
     结果按原始 tool_call 顺序追加到 messages。
     超时后取消未完成的 future。
+
+    R-P1.3 新增 liveness 检测：
+    - 启动一个 LivenessDetector 监控整批
+    - 超过 ``overall_timeout_s``（默认 300s）→ 全局取消
+    - 超过 ``overall_soft_warn_s``（默认 90s）→ warning log
+    - 取消后的工具 result 被替换为 :func:`build_timeout_result_json`
+      （含分类信息，让 LLM 区分原因），不是默默失败
     """
     num_tools = len(tool_calls)
 
@@ -317,10 +386,24 @@ def execute_tool_calls_concurrent(
     # 解析超时
     timeout = _resolve_timeout(timeout_s)
 
+    # ── R-P1.3：启动整批 liveness detector ──
+    detector = LivenessDetector(
+        probe=OutputLivenessProbe(),
+        config=LivenessConfig(
+            single_tool_timeout_s=single_tool_timeout_s,
+            single_tool_soft_warn_s=_DEFAULT_SINGLE_TOOL_SOFT_WARN_S,
+            overall_timeout_s=timeout if (timeout and timeout > 0) else _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S,
+            overall_soft_warn_s=overall_soft_warn_s,
+            check_interval_s=2.0,
+        ),
+    )
+    detector.start()
+
     # 线程池执行
     results: Dict[int, str] = {}
     start_times: Dict[int, float] = {}
     deadline = time.time() + timeout if timeout and timeout > 0 else None
+    batch_cancelled_by = None  # 记录是谁触发的取消（"liveness_single" / "liveness_overall" / "interrupt" / "deadline"）
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=min(max_workers, len(to_execute)),
@@ -341,20 +424,35 @@ def execute_tool_calls_concurrent(
                 for f in future_to_idx:
                     if f not in done:
                         f.cancel()
+                batch_cancelled_by = "interrupt"
                 break
 
-            # 检查超时
+            # 检查 liveness 触发的取消（单工具假死 / 整体超时）
+            if detector.is_cancelled():
+                for f in future_to_idx:
+                    if f not in done:
+                        f.cancel()
+                # 区分触发原因
+                elapsed = detector.elapsed()
+                if elapsed >= detector.config.overall_timeout_s:
+                    batch_cancelled_by = "liveness_overall"
+                else:
+                    batch_cancelled_by = "liveness_single"
+                break
+
+            # 检查 deadline（保留旧逻辑作为 fallback）
             if deadline and time.time() > deadline:
                 for f in future_to_idx:
                     if f not in done:
                         f.cancel()
                 logger.warning("并发工具执行超时 (%.0fs)，取消剩余", timeout)
+                batch_cancelled_by = "deadline"
                 break
 
             try:
                 batch_done, _ = concurrent.futures.wait(
                     future_to_idx,
-                    timeout=5.0,
+                    timeout=2.0,
                     return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 for f in batch_done:
@@ -363,6 +461,8 @@ def execute_tool_calls_concurrent(
                         idx = future_to_idx[f]
                         try:
                             results[idx] = f.result(timeout=1.0)
+                            # R-P1.3：记录进度
+                            detector.record_progress(output=results[idx])
                         except concurrent.futures.CancelledError:
                             results[idx] = json.dumps({
                                 "error": "工具执行被取消",
@@ -376,12 +476,31 @@ def execute_tool_calls_concurrent(
             except concurrent.futures.TimeoutError:
                 continue
 
+    # R-P1.3：停止 detector
+    detector.stop()
+
     # 按原始顺序追加结果
     for idx, (tc, name, args) in enumerate(to_execute):
         result = results.get(idx, json.dumps({
             "error": "工具执行超时",
             "status": "timeout",
         }, ensure_ascii=False))
+
+        # R-P1.3：如果被取消且 result 不是 timeout JSON，用 build_timeout_result_json 替换
+        if batch_cancelled_by and '"status": "timeout"' not in result and '"status": "cancelled"' not in result:
+            elapsed = detector.elapsed() if detector else 0.0
+            timeout_kind = (
+                "overall" if batch_cancelled_by == "liveness_overall"
+                else "single_tool" if batch_cancelled_by == "liveness_single"
+                else "cancelled" if batch_cancelled_by == "interrupt"
+                else "overall"
+            )
+            result = build_timeout_result_json(
+                tool_name=name,
+                elapsed_s=elapsed,
+                timeout_kind=timeout_kind,
+                retryable=(batch_cancelled_by != "interrupt"),
+            )
 
         # 钩子：并发路径的执行后事件（异常已被 _run_tool_safe 封装进 result，
         # 不单独触发 on_tool_error；args/result 别名供 memora_auto_save 消费）
