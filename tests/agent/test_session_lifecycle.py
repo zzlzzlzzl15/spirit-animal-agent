@@ -383,6 +383,48 @@ class TestSwitchModelBehavior:
         fresh_agent.switch_model("gpt-4")
         assert len(fresh_agent._messages) == 1
 
+    # ── switch_model 边界（None / 空串 / 多次累积）──────
+
+    def test_switch_model_none_base_url_keeps_existing(self, fresh_agent):
+        """base_url=None 时不修改原 base_url"""
+        original_url = fresh_agent.base_url
+        fresh_agent.switch_model("claude-3", base_url=None)
+        assert fresh_agent.base_url == original_url
+
+    def test_switch_model_none_api_key_keeps_existing(self, fresh_agent):
+        """api_key=None 时不修改原 api_key"""
+        original_key = fresh_agent.api_key
+        fresh_agent.switch_model("claude-3", api_key=None)
+        assert fresh_agent.api_key == original_key
+
+    def test_switch_model_empty_string_base_url_keeps_existing(self, fresh_agent):
+        """base_url=''（空串）时同样不修改（if 守卫：falsy）"""
+        original_url = fresh_agent.base_url
+        fresh_agent.switch_model("claude-3", base_url="")
+        # 空串是 falsy，if base_url 不成立
+        assert fresh_agent.base_url == original_url
+
+    def test_switch_model_multiple_calls_accumulate(self, fresh_agent):
+        """多次 switch_model 累积生效（model 每次更新）"""
+        fresh_agent.switch_model("gpt-4o-mini")
+        assert fresh_agent.model == "gpt-4o-mini"
+        fresh_agent.switch_model("claude-3-5-sonnet")
+        assert fresh_agent.model == "claude-3-5-sonnet"
+        fresh_agent.switch_model("gpt-4-turbo")
+        assert fresh_agent.model == "gpt-4-turbo"
+
+    def test_switch_model_keeps_api_call_count(self, fresh_agent):
+        """switch_model 不重置 _api_call_count（不像 reset_session）"""
+        fresh_agent._api_call_count = 42
+        fresh_agent.switch_model("gpt-4")
+        assert fresh_agent._api_call_count == 42
+
+    def test_switch_model_keeps_interrupt_state(self, fresh_agent):
+        """switch_model 不重置 _interrupt_requested（保留中断状态）"""
+        fresh_agent._interrupt_requested = True
+        fresh_agent.switch_model("gpt-4")
+        assert fresh_agent._interrupt_requested is True
+
 
 # ===========================================================================
 # 7. get_status 字段完整性
