@@ -166,7 +166,18 @@ def _render_progress(event: Dict[str, Any]) -> None:
         summary = event.get("summary", "") or ""
         iterations = event.get("iterations", 0) or 0
         extra = event.get("extra") or {}
-        duration_ms = extra.get("duration_ms")
+
+        # ── 字段读取双路径：优先顶层 (notify_progress._build_event 会把
+        # extra 里的字段 merge 到 payload 顶层)，fallback 到 extra 嵌套 ──
+        # 不这么写会读到 0 / None（之前版本 bug：调用工具显示 "0 个"、
+        # 完成显示 "0.0s"）。
+        def _get(key, default=None):
+            v = event.get(key)
+            if v is not None:
+                return v
+            return extra.get(key, default)
+
+        duration_ms = _get("duration_ms")
         if phase == ProgressPhase.TASK_START.value:
             console.print(f"  [bold yellow]─── 任务开始[/bold yellow]  [dim]{_truncate(summary, 70)}[/dim]")
         elif phase == ProgressPhase.THINKING.value:
@@ -178,24 +189,27 @@ def _render_progress(event: Dict[str, Any]) -> None:
                     f"  [dim]·[/dim] [yellow]推理完成[/yellow] [dim]({duration_ms / 1000:.1f}s，第 {iterations} 轮)[/dim]"
                 )
         elif phase == ProgressPhase.TOOL_CALL.value:
-            count = extra.get("count", 0) or 0
+            count = int(_get("count", 0) or 0)
             console.print(
                 f"  [dim]·[/dim] [cyan]调用工具[/cyan] [bold]{summary}[/bold] [dim]({count} 个)[/dim]"
             )
         elif phase == ProgressPhase.TOOL_RESULT.value:
             ms = duration_ms if duration_ms is not None else 0
+            count = int(_get("count", 0) or 0)
             # TOOL_RESULT 与 TOOL_CALL 的 summary 都是工具名拼接
+            # count>0 时附加 "(N 个)" 与调用行保持格式一致
+            count_tail = f"，{count} 个" if count > 0 else ""
             console.print(
-                f"  [green]✓[/green] [dim]完成[/dim] [bold]{summary}[/bold] [dim]({ms / 1000:.1f}s)[/dim]"
+                f"  [green]✓[/green] [dim]完成[/dim] [bold]{summary}[/bold]{count_tail} [dim]({ms / 1000:.1f}s)[/dim]"
             )
         elif phase == ProgressPhase.TASK_COMPLETE.value:
-            reason = extra.get("reason", "")
+            reason = _get("reason", "")
             tail = f"  [dim]({reason})[/dim]" if reason else ""
             console.print(
                 f"  [bold green]─── 任务完成[/bold green]  [dim]({iterations} 轮)[/dim]{tail}"
             )
         elif phase == ProgressPhase.TASK_ABORTED.value:
-            reason = extra.get("reason", "unknown")
+            reason = _get("reason", "unknown")
             console.print(
                 f"  [bold red]─── 任务中断[/bold red]  [dim]({reason})[/dim]"
             )
