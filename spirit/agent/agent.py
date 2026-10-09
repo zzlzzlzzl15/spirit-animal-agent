@@ -251,7 +251,7 @@ class SpiritAgent:
 
         # 会话数据库（延迟初始化）
         self._session_db = None
-        
+
         # 自动初始化会话数据库
         try:
             from spirit.storage.session_db import SessionDB
@@ -259,6 +259,32 @@ class SpiritAgent:
             logger.info("会话数据库已初始化")
         except Exception as e:
             logger.warning("会话数据库初始化失败 (非致命): %s", e)
+
+        # ── 首启 session 幂等创建（v0.2.8） ──────────────────────
+        # 之前：SpiritAgent.__init__ 只设内存 session_id，conversation_loop
+        # 也不调 create_session——用户首次启动 spirit 跑任务、退出，db 里
+        # 根本没记录这条任务，导致 "之前最新的五条" 永远不包含刚跑完的任务
+        # （仅包含 /new 主动创建的会话）。
+        # 修复：spirit 启动时幂等确保 session_id 已在 db 里。
+        #   - 新启动：create_session 插一行
+        #   - 恢复（/resume [n] 或 config.session_id 显式传）：get_session
+        #     返回非空、跳过
+        #   - 失败：非致命（log warning 继续运行）
+        if self._session_db and self.session_id:
+            try:
+                if not self._session_db.get_session(self.session_id):
+                    self._session_db.create_session(
+                        session_id=self.session_id,
+                        source=self.platform,
+                        model=self.model,
+                    )
+                    logger.info(
+                        "会话记录已创建 (首启): %s", self.session_id[:8]
+                    )
+            except Exception as _create_exc:  # noqa: BLE001
+                logger.warning(
+                    "自动创建会话记录失败 (非致命): %s", _create_exc
+                )
 
         # 钩子系统（在 __init__ 统一装配：CLI/桌面 launcher/gateway 都是
         # 直接构造 SpiritAgent，不走 agent_init.create_agent；失败非致命）
