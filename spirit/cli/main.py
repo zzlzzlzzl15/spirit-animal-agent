@@ -456,6 +456,8 @@ def chat(model, api_key, base_url):
             tools = len(agent.get_tool_definitions())
 
             # ── 上下文 % / 详情（从 context_compressor 拿）──
+            # 样式对齐 hermes-agent-main 的 _build_context_bar：进度条 + 百分比 + used/total。
+            # 不擅自加 t/s / session 累计时长（属于"精神性升级"不在本次任务范围）。
             ctx_frag = None
             try:
                 compressor = getattr(agent, "_context_compressor", None)
@@ -477,12 +479,19 @@ def chat(model, api_key, base_url):
                             ctx_class = "class:status-bar-warn"
                         else:
                             ctx_class = "class:status-bar-good"
+                        # 进度条（10 格宽度，和 hermes _build_context_bar 一致）
+                        bar_width = 10
+                        filled = round((pct / 100) * bar_width)
+                        empty = max(0, bar_width - filled)
+                        bar = f"[{chr(0x2588) * filled}{chr(0x2591) * empty}]"
+                        # 片段顺序：进度条 | 百分比 | used/total，全部走阈值色保证统一
                         ctx_frag = [
                             ("class:status-bar-dim", "  |  "),
-                            (ctx_class, f"ctx {pct}%"),
-                            ("class:status-bar-dim", " ("),
+                            (ctx_class, bar),
+                            ("class:status-bar-dim", " "),
+                            (ctx_class, f"{pct}%"),
+                            ("class:status-bar-dim", " "),
                             ("class:status-bar", f"{_fmt_tokens(tokens)}/{_fmt_tokens(ctx_len)}"),
-                            ("class:status-bar-dim", ")"),
                         ]
             except Exception:
                 ctx_frag = None
