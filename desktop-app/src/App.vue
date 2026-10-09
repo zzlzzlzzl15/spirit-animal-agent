@@ -192,20 +192,18 @@ onUnmounted(() => {
 function onSpriteClick(e: MouseEvent) {
   console.log('[App] leftClick, isDragging:', isDragging.value)
   if (isDragging.value) return
-  // 左键 → 直接打开 CLI 终端独立窗口（Spirit 核心交互入口）
-  if (window.electronAPI?.openCLITerminal) {
-    window.electronAPI.openCLITerminal()
-  }
-  // 关闭可能打开的菜单
-  showMenu.value = false
+  // 左键 → 圆形功能菜单（知识库 / 系统 / CLI / 语音 4 个小气泡环绕桌宠）
+  showMenu.value = !showMenu.value
   showStatus.value = false
+  console.log('[App] showMenu:', showMenu.value)
 }
 
 function onSpriteRightClick(e: MouseEvent) {
   console.log('[App] rightClick')
-  // 右键 → 弹出圆形功能菜单（知识库/系统/CLI/语音等备用入口）
-  showMenu.value = !showMenu.value
-  showStatus.value = false
+  // 右键 → 打开独立状态弹窗（运行状态 / 模型 / provider / 会话 / 消息数 / 工具数 / API 调用 / 额度）
+  if (window.electronAPI?.openStatusWindow) {
+    window.electronAPI.openStatusWindow()
+  }
 }
 
 /**
