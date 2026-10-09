@@ -11,7 +11,7 @@ import logging
 import os
 import sys
 import time
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import click
 from rich.console import Console
@@ -21,6 +21,17 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
+
+# ── 阶段进度事件总线（C-P1.1 接线）──
+# spirit.conversation_loop 在 9 个点调 notify_progress() 广播 7 阶段
+# （task_start/thinking/thinking_end/tool_call/tool_result/task_complete/task_aborted）；
+# 这里注册一个 sink 把这些事件渲染到终端，让 CLI 能看到工具调用、思考耗时、
+# 任务阶段、最终结果汇总（对齐 Hermes 的工具调用摘要 + 分阶段显示）。
+from spirit.agent.progress_notifier import (
+    ProgressPhase,
+    register_progress_sink,
+    unregister_progress_sink,
+)
 
 console = Console()
 
@@ -32,9 +43,10 @@ console = Console()
 #   - 主色: yellow (Spirit 小狐狸主题)
 #   - 折叠: dim 灰色边框 + 小标题
 #   - 顶部欢迎面板: HEAVY 边框 + 🦊 图标
-#   - 状态栏: 'state | ⚡ model | 🕐 time | 💬 msgs | 🔧 tools' + 绿点
+#   - 状态栏: 'state | model | ctx% | Σ 用量 | 时长 | msgs | tools' + 绿点
+#     （用 FormattedText 片段，不用 Rich markup 字符串—prompt_toolkit HTML() 不解析 markup）
 #   - 历史任务: [n] 编号 + 第一条用户消息前 50 字
-#   - 思考中: Live(Spinner) 显示，屏蔽所有内部回调
+#   - 阶段渲染: 思考中 Live(Spinner) + 完成后逐行阶段标题 + 工具调用摘要
 # ---------------------------------------------------------------------------
 
 WELCOME_PANEL = """\
@@ -48,16 +60,149 @@ RECENT_HEADER.append("—— 最近任务（点击编号或输入 ", style="dim"
 RECENT_HEADER.append("[n]", style="yellow")
 RECENT_HEADER.append(" 恢复并继续，/tasks 重显）——", style="dim")
 
-STATUS_BAR_IDLE = (
-    "  [dim]空闲[/dim]  |  [yellow]⚡ {model}[/yellow]  |  "
-    "[cyan]🕐 {elapsed}s[/cyan]  |  [magenta]💬 {msgs}[/magenta]  |  "
-    "[green]🔧 {tools}[/green]"
-)
-STATUS_BAR_THINKING = (
-    "  [bold yellow]思考中...[/bold yellow]  |  [yellow]⚡ {model}[/yellow]  |  "
-    "[cyan]🕐 {elapsed}s[/cyan]  |  [magenta]💬 {msgs}[/magenta]  |  "
-    "[green]🔧 {tools}[/green]"
-)
+# 状态栏片段 style key（在 chat() 里 Style.from_dict 集中注册）
+STATUS_STYLE = {
+    "status-bar":        "ansiyellow",                       # 主色：主文
+    "status-bar-dim":    "ansigray",                          # 灰色：分隔符 / 标签
+    "status-bar-strong": "ansiyellow bold",                   # 强亮黄：状态
+    "status-bar-warn":   "ansiyellow",                        # 黄：ctx 中位
+    "status-bar-bad":    "ansired bold",                      # 红：ctx 高位
+    "status-bar-good":   "ansigreen",                         # 绿：ctx 低位
+    "status-bar-thinking": "ansiyellow bold",                  # 思考中提示
+    "status-bar-tool":   "ansicyan",                          # 工具/用量计数
+}
+
+
+def _fmt_duration(secs: float) -> str:
+    """人性化时长：0s / 12s / 3m25s / 1h12m。"""
+    secs = max(0, int(secs))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m{secs % 60:02d}s"
+    return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+
+
+def _fmt_tokens(n: int) -> str:
+    """人性化 token 计数：0 / 999 / 1.2K / 23K / 1.5M / 12M。"""
+    if n is None or n <= 0:
+        return "0"
+    n = int(n)
+    if n < 1_000:
+        return str(n)
+    if n < 10_000:
+        return f"{n / 1_000:.1f}K"
+    if n < 1_000_000:
+        return f"{round(n / 1_000)}K"
+    if n < 10_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    return f"{round(n / 1_000_000)}M"
+
+
+def _truncate(s: str, n: int) -> str:
+    """安全截断中英文混合串。"""
+    if not s:
+        return ""
+    s = str(s)
+    return s if len(s) <= n else s[: max(0, n - 1)] + "…"
+
+
+def _format_tool_call_summary(tool_calls: List[Dict[str, Any]], max_args: int = 3) -> str:
+    """拼接工具调用摘要：函数名 + 简化参数（参数 > max_args 个时标 +N more）。
+
+    参考 Hermes CLI 工具调用显示规范：函数名 + 简化参数。
+    """
+    if not tool_calls:
+        return ""
+    parts: List[str] = []
+    for tc in tool_calls:
+        func = (tc.get("function") or {})
+        name = func.get("name", "?") or "?"
+        raw_args = func.get("arguments", "")
+        # 参数可能是 JSON 字符串，也可能已经是 dict
+        if isinstance(raw_args, dict):
+            args_dict = raw_args
+        elif isinstance(raw_args, str) and raw_args.strip():
+            try:
+                import json as _json
+                args_dict = _json.loads(raw_args)
+            except Exception:
+                args_dict = {"_": _truncate(raw_args, 30)}
+        else:
+            args_dict = {}
+        # 取前 max_args 个参数
+        items = list(args_dict.items())[:max_args]
+        kv = ", ".join(f"{k}={_truncate(str(v), 24)}" for k, v in items)
+        more = len(args_dict) - max_args
+        suffix = f", +{more} more" if more > 0 else ""
+        if kv:
+            parts.append(f"{name}({kv}{suffix})")
+        else:
+            parts.append(f"{name}()")
+    if len(parts) > 4:
+        return "、".join(parts[:4]) + f" 等 {len(parts)} 个"
+    return "、".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# 阶段进度事件渲染（register_progress_sink 的 sink 回调）
+# ---------------------------------------------------------------------------
+# 在 spirit.cli.chat() 里调 register_progress_sink(_render_progress) 生效；
+# conversation_loop 推送 7 阶段，本函数负责逐阶段渲染到 console（不在
+# Live(Spinner) 里渲染——避免 spinner 刷新覆盖阶段标题、阶段行产生越级）。
+# ---------------------------------------------------------------------------
+
+def _render_progress(event: Dict[str, Any]) -> None:
+    """progress_notifier 推送的事件 sink：渲染到 CLI 终端。
+
+    设计原则：
+    - 单事件 = 一行，避免多行让用户压力
+    - 使用 ASCII 标点 (─ · ✓ ✗) 避免 Windows GBK 终端乱码
+    - 所有输出裹 try/except：sink 异常不影响主循环（progress_notifier 也隔离）
+    - 不在 Live(Spinner) 里渲染（spinner 之外，由 chat() 控制 Live 生命周期）
+    """
+    try:
+        phase = event.get("phase")
+        summary = event.get("summary", "") or ""
+        iterations = event.get("iterations", 0) or 0
+        extra = event.get("extra") or {}
+        duration_ms = extra.get("duration_ms")
+        if phase == ProgressPhase.TASK_START.value:
+            console.print(f"  [bold yellow]─── 任务开始[/bold yellow]  [dim]{_truncate(summary, 70)}[/dim]")
+        elif phase == ProgressPhase.THINKING.value:
+            # 思考开始——不输出独立行（Live(Spinner) 正在显示），仅记录迭代
+            pass
+        elif phase == ProgressPhase.THINKING_END.value:
+            if duration_ms is not None:
+                console.print(
+                    f"  [dim]·[/dim] [yellow]推理完成[/yellow] [dim]({duration_ms / 1000:.1f}s，第 {iterations} 轮)[/dim]"
+                )
+        elif phase == ProgressPhase.TOOL_CALL.value:
+            count = extra.get("count", 0) or 0
+            console.print(
+                f"  [dim]·[/dim] [cyan]调用工具[/cyan] [bold]{summary}[/bold] [dim]({count} 个)[/dim]"
+            )
+        elif phase == ProgressPhase.TOOL_RESULT.value:
+            ms = duration_ms if duration_ms is not None else 0
+            # TOOL_RESULT 与 TOOL_CALL 的 summary 都是工具名拼接
+            console.print(
+                f"  [green]✓[/green] [dim]完成[/dim] [bold]{summary}[/bold] [dim]({ms / 1000:.1f}s)[/dim]"
+            )
+        elif phase == ProgressPhase.TASK_COMPLETE.value:
+            reason = extra.get("reason", "")
+            tail = f"  [dim]({reason})[/dim]" if reason else ""
+            console.print(
+                f"  [bold green]─── 任务完成[/bold green]  [dim]({iterations} 轮)[/dim]{tail}"
+            )
+        elif phase == ProgressPhase.TASK_ABORTED.value:
+            reason = extra.get("reason", "unknown")
+            console.print(
+                f"  [bold red]─── 任务中断[/bold red]  [dim]({reason})[/dim]"
+            )
+    except Exception:
+        # sink 异常隔离：不影响主循环（与 progress_notifier 内部逻辑一致）
+        pass
+
 
 FOX_LOGO = r"""
     /\_   _/\
@@ -164,13 +309,23 @@ def _resolve_resume_index(db, user_input: str, limit: int = 5) -> Optional[str]:
 
 
 def setup_logging(verbose: bool = False):
-    """配置日志。"""
-    level = logging.DEBUG if verbose else logging.INFO
+    """配置日志 — 默认 ERROR（仅错误），verbose 时开 INFO（看 LLM 链路）。
+
+    设计原则：用户不需要看 WARNING/INFO 噪声。任务里需要的关键 WARNING
+    （如 LLM 思考中的提示）由 progress_notifier 推送到可视化层；全量日志
+    仅 verbose 模式开。
+    """
+    level = logging.DEBUG if verbose else logging.ERROR
     logging.basicConfig(
         level=level,
         format="%(message)s",
         handlers=[RichHandler(console=console, rich_tracebacks=True)],
     )
+    # spirit.* 命名空间 logger 兜底（防止子模块继承 root 后仍输出 INFO）
+    logging.getLogger("spirit").setLevel(level)
+    # 库级 logger 也不在终端暴露（urllib3 / httpcore / openai 等）
+    for noisy in ("urllib3", "httpcore", "httpx", "openai", "anthropic", "asyncio"):
+        logging.getLogger(noisy).setLevel(logging.ERROR)
 
 
 @click.group()
@@ -231,16 +386,13 @@ def chat(model, api_key, base_url):
     set_approval_callback(_approval_callback)
     set_interactive_context(True)
 
-    # --- 隐藏所有内部思考 / 工具调用同调 ---
-    # 思考过程不显示，只看到最终响应 + spinner。
-    # tool 回调 / reasoning stream 都置为 no-op，避免 UI 噪声。
-    def _silent(*_args, **_kwargs):
-        pass
-
-    agent.on_tool_start = _silent
-    agent.on_tool_complete = _silent
-    if getattr(agent, "on_stream_delta", None) is not None:
-        agent.on_stream_delta = _silent
+    # --- 内部回调接线 ---
+    # 移除 _silent no-op：现在阶段输出走 progress_notifier 7 阶段事件总线
+    # （conversation_loop 在 9 个点调 notify_progress）。这样 LLM 推理中的
+    # 工具调用 / 思考耗时 / 任务完成都能在终端看到。
+    # 不设 agent.on_tool_start/complete/stream_delta（保持默认 None）——
+    # conversation_loop 不走这 3 个回调，而是全部走 progress_notifier。
+    register_progress_sink(_render_progress)
 
     # 会话数据库（用于历史任务列表）
     db = getattr(agent, "_session_db", None)
@@ -254,30 +406,132 @@ def chat(model, api_key, base_url):
     # 底部状态栏 + 黄色 prompt
     try:
         from prompt_toolkit import PromptSession
-        from prompt_toolkit.formatted_text import HTML
+        from prompt_toolkit.formatted_text import FormattedText, HTML
         from prompt_toolkit.history import InMemoryHistory
         from prompt_toolkit.styles import Style
 
+        # 状态栏样式字典（与 STATUS_STYLE 映射一致）
+        # prompt_toolkit 的 HTML() 不解析 Rich markup，所以底部状态栏必须用
+        # FormattedText 片段，每个片段是 (style_class, text) 元组。
         prompt_style = Style.from_dict({
             "prompt": "ansiyellow bold",
             "indicator": "ansiyellow",
+            # 状态栏专用样式
+            "status-bar":        "ansiyellow",
+            "status-bar-dim":    "ansigray",
+            "status-bar-strong": "ansiyellow bold",
+            "status-bar-warn":   "ansiyellow",
+            "status-bar-bad":    "ansired bold",
+            "status-bar-good":   "ansigreen",
+            "status-bar-thinking": "ansiyellow bold",
+            "status-bar-tool":   "ansicyan",
         })
 
         # 会话状态容器
         class _State:
             thinking: bool = False
             elapsed: float = 0.0
+            last_tools: List[str] = []  # 最近一轮调用的工具名拼接
+            iterations: int = 0        # 最近一轮的 API 调用次数
 
         state = _State()
 
         def _bottom_toolbar():
-            template = STATUS_BAR_THINKING if state.thinking else STATUS_BAR_IDLE
-            return HTML(template.format(
-                model=agent.model or "?",
-                elapsed=int(state.elapsed),
-                msgs=len(agent.messages),
-                tools=len(agent.get_tool_definitions()),
-            ))
+            """用 FormattedText 拼状态栏片段，不再用 HTML() 包装 Rich markup。
+
+            字段顺序：状态 | 模型 | ctx% (详情) | Σ 会话用量 (in out, calls) | 时长 | #msgs | Ttools
+            """
+            if state.thinking:
+                head = [("class:status-bar-thinking", "思考中")]
+            else:
+                head = [("class:status-bar-strong", "空闲")]
+            model_txt = (agent.model or "?").strip()
+            if len(model_txt) > 26:
+                model_txt = model_txt[:23] + "..."
+            elapsed_txt = _fmt_duration(state.elapsed)
+            tool_summary = state.last_tools or ""
+            if len(tool_summary) > 24:
+                tool_summary = tool_summary[:21] + "..."
+            msgs = len(agent.messages)
+            tools = len(agent.get_tool_definitions())
+
+            # ── 上下文 % / 详情（从 context_compressor 拿）──
+            ctx_frag = None
+            try:
+                compressor = getattr(agent, "_context_compressor", None)
+                if compressor:
+                    ctx_len = int(getattr(compressor, "context_length", 0) or 0)
+                    # 优先拿 _last_prompt_tokens；fallback 拿公开属性
+                    tokens = int(
+                        getattr(compressor, "_last_prompt_tokens", 0)
+                        or getattr(compressor, "last_prompt_tokens", 0)
+                        or 0
+                    )
+                    if ctx_len > 0 and tokens >= 0:
+                        pct = round((tokens / ctx_len) * 100)
+                        pct = max(0, min(100, pct))
+                        # 阈值色：绿 ≤50 / 黄 50-80 / 红 >80
+                        if pct > 80:
+                            ctx_class = "class:status-bar-bad"
+                        elif pct > 50:
+                            ctx_class = "class:status-bar-warn"
+                        else:
+                            ctx_class = "class:status-bar-good"
+                        ctx_frag = [
+                            ("class:status-bar-dim", "  |  "),
+                            (ctx_class, f"ctx {pct}%"),
+                            ("class:status-bar-dim", " ("),
+                            ("class:status-bar", f"{_fmt_tokens(tokens)}/{_fmt_tokens(ctx_len)}"),
+                            ("class:status-bar-dim", ")"),
+                        ]
+            except Exception:
+                ctx_frag = None
+
+            # ── Σ 会话用量：in + out + API calls（从 agent.session_* 拿）──
+            try:
+                in_tok = int(getattr(agent, "session_input_tokens", 0) or 0)
+                out_tok = int(getattr(agent, "session_output_tokens", 0) or 0)
+                total_tok = int(getattr(agent, "session_total_tokens", 0) or 0)
+                api_calls = int(getattr(agent, "session_api_calls", 0) or 0)
+            except Exception:
+                in_tok = out_tok = total_tok = api_calls = 0
+
+            sum_frag = None
+            if total_tok > 0 or api_calls > 0:
+                sum_frag = [
+                    ("class:status-bar-dim", "  |  "),
+                    ("class:status-bar-tool", f"Σ {_fmt_tokens(total_tok)}"),
+                    ("class:status-bar-dim", " ("),
+                    ("class:status-bar", f"in {_fmt_tokens(in_tok)}"),
+                    ("class:status-bar-dim", " "),
+                    ("class:status-bar", f"out {_fmt_tokens(out_tok)}"),
+                    ("class:status-bar-dim", ", "),
+                    ("class:status-bar", f"{api_calls} calls"),
+                    ("class:status-bar-dim", ")"),
+                ]
+
+            frags = [
+                ("class:status-bar-dim", "  "),
+                *head,
+                ("class:status-bar-dim", "  |  "),
+                ("class:status-bar", model_txt),
+            ]
+            if ctx_frag:
+                frags.extend(ctx_frag)
+            if sum_frag:
+                frags.extend(sum_frag)
+            frags.extend([
+                ("class:status-bar-dim", "  |  "),
+                ("class:status-bar-tool", elapsed_txt),
+                ("class:status-bar-dim", "  |  "),
+                ("class:status-bar", "tools: "),
+                ("class:status-bar-tool", tool_summary or "-"),
+                ("class:status-bar-dim", "  |  "),
+                ("class:status-bar-tool", f"#{msgs}"),
+                ("class:status-bar-dim", "  |  "),
+                ("class:status-bar-tool", f"T{tools}"),
+            ])
+            return FormattedText(frags)
 
         session = PromptSession(
             history=InMemoryHistory(),
@@ -289,7 +543,7 @@ def chat(model, api_key, base_url):
         # ImportError: prompt_toolkit 未安装
         # OSError/NoConsoleScreenBufferError: stdio 被重定向（CI、管道）无 Win32 console
         session = None
-        state = type("_S", (), {"thinking": False, "elapsed": 0.0})()
+        state = type("_S", (), {"thinking": False, "elapsed": 0.0, "last_tools": [], "iterations": 0})()
 
     import threading
 
@@ -328,12 +582,14 @@ def chat(model, api_key, base_url):
                 else:
                     break
 
-            # --- 对话：Spinner 表示思考中，内部回调全部静默 ---
+            # --- 对话：Spinner 表示思考中，阶段输出在 spinner 结束后由 progress_sink 渲染 ---
             state.thinking = True
+            state.last_tools = ""
+            state.iterations = 0
             t0 = time.time()
             spinner_text = Text()
             spinner_text.append("spirit 正在思考", style="bold yellow")
-            spinner_text.append("  •  ", style="dim")
+            spinner_text.append("  ·  ", style="dim")
             spinner_text.append(agent.model or "?", style="yellow")
 
             # 启动计时线程以刷新底部 elapsed
@@ -347,6 +603,11 @@ def chat(model, api_key, base_url):
             tick_thread = threading.Thread(target=_tick, daemon=True)
             tick_thread.start()
 
+            # spinner 期间临时屏蔽 logger（防止内部 INFO 漏到 spinner 之外的 stdout）
+            # CRITICAL > ERROR：连 WARNING 也不输出，确保 spinner 期间干净
+            _root_logger = logging.getLogger()
+            _prev_level = _root_logger.level
+            _root_logger.setLevel(logging.CRITICAL)
             try:
                 with Live(
                     Spinner("dots", text=spinner_text),
@@ -359,9 +620,25 @@ def chat(model, api_key, base_url):
                 stop_tick.set()
                 state.thinking = False
                 state.elapsed = time.time() - t0
+                # 恢复原 logger level（保持 verbose 模式仍能看后续警告）
+                _root_logger.setLevel(_prev_level)
 
-            # --- 只显示最终响应（不含 thinking 内部过程）---
+            # --- 阶段输出已在 spinner 过程中由 progress_sink 渲染；现在汇总本轮结果 ---
+            state.iterations = getattr(result, "iterations", 0) or 0
+            tool_calls = getattr(result, "tool_calls", None) or []
+
+            # 状态栏展示最近一轮调用的工具名拼接（供底部 toolbar 轮末更新）
+            if tool_calls:
+                state.last_tools = _format_tool_call_summary(tool_calls)
+
+            # --- 最终响应：阶段标题 + Markdown 渲染 ---
             if result.response:
+                # 工具调用摘要：fallback——如果 progress_sink 没接上，工具调用会显示
+                if tool_calls and not getattr(_render_progress, "_sinked", False):
+                    console.print(
+                        f"  [dim]本轮调用了 {len(tool_calls)} 个工具：[/dim]"
+                        f"  [cyan]{_format_tool_call_summary(tool_calls)}[/cyan]"
+                    )
                 # console.print("[bold yellow]spirit>[/bold yellow]")
                 # 响应体用 Markdown 渲染（与原版一致）
                 console.print(Markdown(result.response))
@@ -375,7 +652,11 @@ def chat(model, api_key, base_url):
         except EOFError:
             break
 
-    # 结束
+    # 结束前反注册 progress_sink（避免多 CLI 实例之间的泄漏）
+    try:
+        unregister_progress_sink(_render_progress)
+    except Exception:
+        pass
     console.print("\n[dim]再见！[/dim]")
 
 

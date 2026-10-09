@@ -54,6 +54,11 @@ from spirit.agent.accuracy_attribution import (
 )
 from spirit.agent.text_tool_parser import parse_text_tool_calls
 from spirit.config import get_config_value
+from spirit.agent.progress_notifier import (
+    ProgressPhase,
+    notify_progress,
+    set_current_session_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +183,18 @@ def run_conversation(
     # ── 钩子：对话开始 ─────────────────────────────────
     _emit_hook(agent, "before_conversation", user_message=user_message, session_id=agent.session_id)
 
+    # ── C-P1.1：进度推送（任务开始） ─────────────────
+    # 钉住当前 session_id（所有后续进度事件会带上），推送 task_start。
+    # 此处必须在主循环前调用，否则后续 thinking/tool_call 会因 session 为空被丢失。
+    set_current_session_id(agent.session_id)
+    _task_summary = (
+        user_message[:60] + "..." if len(user_message) > 60 else user_message
+    )
+    notify_progress(
+        ProgressPhase.TASK_START,
+        summary=_task_summary,
+    )
+
     # ── Prompt caching 初始化 ──────────────────────────────────
     # 检测当前 provider/model 是否支持 Anthropic 风格的 cache_control
     use_cache, native_layout = should_use_prompt_caching(
@@ -227,6 +244,13 @@ def run_conversation(
         # 中断检查
         if agent._interrupt_requested:
             logger.info("对话被用户中断")
+            # C-P1.1：进度推送（任务中断）
+            notify_progress(
+                ProgressPhase.TASK_ABORTED,
+                iterations=api_call_count,
+                summary="用户中断",
+                extra={"reason": "user_interrupt"},
+            )
             return ConversationResult(
                 response="[已中断]",
                 messages=agent.messages,
@@ -237,6 +261,13 @@ def run_conversation(
         # 消耗迭代
         if not budget.consume():
             logger.info("迭代预算耗尽 (%d/%d)", budget.used, budget.max_total)
+            # C-P1.1：进度推送（迭代预算耗尽）
+            notify_progress(
+                ProgressPhase.TASK_COMPLETE,
+                iterations=api_call_count,
+                summary=f"达到最大迭代次数 {agent.max_iterations}",
+                extra={"reason": "max_iterations"},
+            )
             return ConversationResult(
                 response=f"[达到最大迭代次数 {agent.max_iterations}]",
                 messages=agent.messages,
@@ -319,13 +350,47 @@ def run_conversation(
                     agent, "before_llm_call",
                     messages=api_messages, tools=tools, retry_count=retry_count,
                 )
+                # C-P1.1：进度推送（思考开始）
+                notify_progress(
+                    ProgressPhase.THINKING,
+                    iterations=api_call_count,
+                    summary=f"第 {api_call_count} 轮推理",
+                )
                 _llm_started = time.monotonic()
                 response = _call_llm(agent, api_messages, tools, stream_callback)
+                # C-P1.1：进度推送（思考结束 + 耗时）
+                _llm_duration_ms = (time.monotonic() - _llm_started) * 1000.0
+                notify_progress(
+                    ProgressPhase.THINKING_END,
+                    iterations=api_call_count,
+                    extra={"duration_ms": _llm_duration_ms},
+                )
                 _emit_hook(
                     agent, "after_llm_call",
                     response=response,
-                    duration_ms=(time.monotonic() - _llm_started) * 1000.0,
+                    duration_ms=_llm_duration_ms,
                 )
+                # ── 累计会话级 token 用量（状态栏 / 计费 / debug）──
+                # 每次成功 API 调用都累加到 agent.session_* 字段；状态栏会取这些
+                # 字段显示「用量是多少」。response.usage 缺失 / 字段异常不主路径中断
+                # （只一条 debug 错误）。与 Hermes agent.session_*_tokens 语义对齐。
+                try:
+                    _usage = getattr(response, "usage", None)
+                    if _usage:
+                        _in_tok = int(getattr(_usage, "prompt_tokens", 0) or 0)
+                        _out_tok = int(getattr(_usage, "completion_tokens", 0) or 0)
+                        _total_tok = int(
+                            getattr(_usage, "total_tokens", 0)
+                            or (_in_tok + _out_tok)
+                        )
+                        agent.session_input_tokens += _in_tok
+                        agent.session_output_tokens += _out_tok
+                        agent.session_total_tokens += _total_tok
+                        agent.session_api_calls += 1
+                except Exception as _usage_exc:  # noqa: BLE001
+                    logger.debug(
+                        "[token-accumulate] 累加 usage 失败（非致命）: %s", _usage_exc
+                    )
                 break  # 成功
             except Exception as exc:
                 retry_count += 1
@@ -490,7 +555,25 @@ def run_conversation(
             # 重置护栏（新一轮工具调用）
             guardrails.reset_for_turn()
 
-            # 执行工具
+            # ── C-P1.1：进度推送（工具调用开始） ─────────────────
+            # 工具名拼成 summary，让桌宠能看到"正在跑哪几个工具"。
+            _tool_names = [
+                tc.get("function", {}).get("name", "?")
+                for tc in tool_calls_dicts
+            ]
+            _tool_summary = (
+                "、".join(_tool_names[:3])
+                + (f" 等 {len(_tool_names)} 个" if len(_tool_names) > 3 else "")
+            )
+            _tool_started = time.monotonic()
+            notify_progress(
+                ProgressPhase.TOOL_CALL,
+                iterations=api_call_count,
+                summary=_tool_summary,
+                extra={"count": len(_tool_names)},
+            )
+
+            # 执行工具（同步阻塞 — 按记忆 5d01f921：钩子 + execute 都是同步路径）
             if len(tool_calls_dicts) > 1:
                 # 并发执行
                 execute_tool_calls_concurrent(
@@ -504,9 +587,28 @@ def run_conversation(
                     guardrails=guardrails,
                 )
 
+            # ── C-P1.1：进度推送（工具调用完成 + 耗时） ─────────
+            _tool_duration_ms = (time.monotonic() - _tool_started) * 1000.0
+            notify_progress(
+                ProgressPhase.TOOL_RESULT,
+                iterations=api_call_count,
+                summary=_tool_summary,
+                extra={
+                    "duration_ms": _tool_duration_ms,
+                    "count": len(_tool_names),
+                },
+            )
+
             # 检查护栏是否要求停止
             if guardrails.halt_decision and guardrails.halt_decision.should_halt:
                 logger.warning("工具护栏触发停止: %s", guardrails.halt_decision.message)
+                # C-P1.1：进度推送（护栏触发）
+                notify_progress(
+                    ProgressPhase.TASK_ABORTED,
+                    iterations=api_call_count,
+                    summary=f"工具护栏触发: {guardrails.halt_decision.message}",
+                    extra={"reason": "guardrail_halt"},
+                )
                 agent.add_message("assistant", f"[工具循环停止: {guardrails.halt_decision.message}]")
                 return ConversationResult(
                     response=f"[工具循环停止: {guardrails.halt_decision.message}]",
@@ -641,6 +743,16 @@ def run_conversation(
                     aggregator_output_fallback=content,
                 )
 
+            # C-P1.1：进度推送（任务完成）
+            notify_progress(
+                ProgressPhase.TASK_COMPLETE,
+                iterations=api_call_count,
+                summary="完成",
+                extra={
+                    "iterations": api_call_count,
+                    "tool_calls": len(tool_calls_in_turn),
+                },
+            )
             _emit_hook(
                 agent, "after_conversation",
                 response=content, iterations=api_call_count,
@@ -655,6 +767,13 @@ def run_conversation(
             )
 
     # 达到最大迭代
+    # C-P1.1：进度推送（主循环自然结束于最大迭代）
+    notify_progress(
+        ProgressPhase.TASK_COMPLETE,
+        iterations=api_call_count,
+        summary=f"达到最大迭代次数 {agent.max_iterations}",
+        extra={"reason": "max_iterations"},
+    )
     _emit_hook(
         agent, "after_conversation",
         response="[max_iterations]", iterations=api_call_count,

@@ -227,6 +227,16 @@ class SpiritAgent:
         self._api_call_count = 0
         self._messages: List[Dict[str, Any]] = []
 
+        # ── 会话级 token 用量累加（对齐 Hermes session_*_tokens 语义）──
+        # 状态栏 / debug / 计费统计共用。conversation_loop 在每次 LLM 响应成功后
+        # 调用 += 累加。初始 0 表示"还没产生过 API 调用"，与 _api_call_count 配套。
+        # 字段语义对齐 Hermes：session_input_tokens / session_output_tokens /
+        # session_total_tokens / session_api_calls。
+        self.session_input_tokens: int = 0     # 本会话累计输入（prompt）token
+        self.session_output_tokens: int = 0    # 本会话累计输出（completion）token
+        self.session_total_tokens: int = 0     # 本会话累计总 token（输入+输出）
+        self.session_api_calls: int = 0        # 本会话成功 API 调用次数
+
         # 工作区上下文（由 VSCode 扩展推送，CLI 模式下为 None）
         self.workspace_context: Any = None
 

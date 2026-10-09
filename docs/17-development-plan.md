@@ -352,3 +352,124 @@ V3 不重做 V2 已完成的事，**只补缺口 + 加新能力**：
 - **自进化定位**：`docs/14-rsiagent-architecture-and-spirit-gap.md`
 - **架构差距**：上一轮 Spirit vs Hermes 源码对比（19 文件 vs 100+ 文件）
 - **评测证据**：SWE-bench 双 Agent 评测 / AgentBench 自定义评测
+
+---
+
+## 12. 开发状态总表（V2 + V3）
+
+> **当前真实进度**（规划视角见 §0-§11）：v0.2.4 已发布、v0.4.0 进行中（C-P1.2）
+> **最后更新**：2026-10-09
+> **配套清单**：[07-development-checklist.md §6](./07-development-checklist.md)（V2 完整模块级 + 同样的总表）
+
+### 12.1 V2 阶段（Phase 1-7）完成状态
+
+| 阶段 | 目标 | 状态 | 子项 | 行数 | 测试 | 备注 |
+|------|------|------|------|------|------|------|
+| Phase 1 | 核心闭环 | ✅ | 7/7 | ~5,400 | 111+ | 记忆 / 初始化 / Transport / 任务 / 钩子 / 凭据 / 配置 |
+| Phase 2 | 多端接入 | ✅ | 6/6 | ~1,500 | - | API / 网关 / 7 平台 / Web / 会话 / VSCode |
+| Phase 3 | 桌宠与语音 | ✅ | 6/6 | ~3,200 | 998+ | 桌宠 / 语音 / 打包 / 审批门禁 |
+| Phase 4 | 高级功能 | ✅ | 7/7 | ~13,904 | 1,272 | MoA / Profile / Goals / TUI / Computer Use / 技能中心 / 进程注册表 |
+| Phase 5 | 生态完善 | ✅ | 5/5 | ~5,057 | 418 | 代理 / 检查点 / 集成 / 成就 / Agent 辅助 |
+| Phase 6 | 自进化 RSI | ✅ | 6/6 (A-F) | ~5,200 | 215 | protocol / verifier / curriculum / BRS / HITL / 领域化 |
+| Phase 7 | 常驻自主探索 | ✅ | 4/4 (A-D) | ~1,500 | 42 | 沙箱 / 常驻循环 / 桌宠桥接 / 部署集成 |
+| **合计** | **核心闭环 100%** | **✅ 7/7** | **41/41** | **~35,761** | **2,698+** | **V2 全部 Phase 完成** |
+
+### 12.2 仍待补完（V2 阶段中未做项）
+
+| 编号 | 模块 | 优先级 | 状态 | 说明 |
+|------|------|--------|------|------|
+| 2.10 | `spirit/dashboard/`（Web Dashboard 后端）| 🟡 中 | ❌ | 4 文件未建（web_server / auth_provider / session_export / skin_engine）；前端 `web/` 基础版 ✅ |
+| 2.11 | `spirit/security/`（独立安全扫描）| 🟡 中 | ❌ | 6 文件未建（tirith_scanner / threat_patterns / skills_guard / url_safety / supply_chain_audit / security_advisories）；命令审批 + 工具护栏 ✅ |
+| - | `acp_adapter/` | 🟢 低 | ❌ | 0%（未启动，Hermes 对应模块未移植）|
+| 1.1 | `agent/` 5 个低优先级辅助模块 | 🟢 低 | ❌ | `model_metadata` / `title_generator` / `learning_graph` / `shell_hooks` / `system_prompt` 未建；`redact` ✅ / `i18n` ✅ / `insights` ✅ |
+
+### 12.3 V3 路线图进度（按发版节点）
+
+#### v0.2.3（✅ 已发布 2026-10-09）—— 桌宠空气墙根治 + V2.1 MoA/Tool Search + V3 路线图
+
+| 类别 | 交付 | 状态 |
+|------|------|------|
+| 桌宠 BUG | 空气墙根治（精细命中 + 5s 防御 timer + 托盘兜底）| ✅ |
+| 工具系统 | `tool_search`（3 个 bridge 工具，Hermes Progressive Tool Disclosure 同款）+ `agency_agents`（282 specialists lazy router）| ✅ |
+| 规划文档 | `docs/14-rsiagent-architecture-and-spirit-gap.md` / `15-product-roadmap-v3.md` / `16-feature-roadmap.md` / `17-development-plan.md` 4 份 | ✅ |
+
+#### v0.2.4（✅ 已发布 2026-10-09）—— V3 P1 节点首收官（R/M 支柱）
+
+| 编号 | 功能 | 新增文件 | 行数 | 验证 | 状态 |
+|------|------|---------|------|------|------|
+| R-P1.1 | 错误恢复链（5 类处理器）| `spirit/agent/turn_recovery.py` | 613 | 24/24 | ✅ |
+| R-P1.2 | 工具结果分类（5 类）| `spirit/agent/tool_result_classification.py` | 411 | 27/27 | ✅ |
+| R-P1.3 | 并发工具超时修复（3 层超时 + liveness）| `spirit/agent/tool_liveness.py` | 360 | 63/63 | ✅ |
+| R-P1.4 | provider 切换保护 | `spirit/agent/provider_switch_protection.py` | 313 | 72/72 | ✅ |
+| R-P1.5 | 上下文压缩鲁棒性 v2 | `spirit/agent/context_compressor_v2.py` | 432 | 68/68 | ✅ |
+| M-P1.0 | 准确率归因 + 提升 | `spirit/agent/accuracy_attribution.py` | 442 | 82/82 | ✅ |
+| **合计** | **6 项 + 4 处 conversation_loop 集成** | **6 新增 + 2 修改** | **~2,571 净增** | **336/336** | |
+
+#### v0.3.0（❌ 计划）—— 可靠性完善 + Prompt 工程
+
+| 编号 | 功能 | 估算 | 状态 | 备注 |
+|------|------|------|------|------|
+| R-P2.1 | 截断多策略 | 1.5 周 | ❌ | `spirit/agent/turn_truncation.py`（150-250 行）|
+| R-P2.2 | 活性检测 | 1 周 | ❌ | `spirit/agent/turn_liveness.py`（80-120 行，全场景 liveness）|
+| R-P2.3 | provider 切换保护 v2 | 0.5 周 | ❌ | - |
+| R-P2.4 | 动态 prompt 组成 | 1 周 | ❌ | `spirit/agent/prompt_composer.py`（200-300 行，重构 `prompt_builder`）|
+
+#### v0.4.0（⏳ 进行中）—— 桌宠 + BRS 接线（当前所在版本）
+
+| 编号 | 功能 | 估算 | 状态 | 备注 |
+|------|------|------|------|------|
+| C-P1.1 | 长任务进度推送 | 1 周 | ✅ | `progress_notifier.py`（7 phase 全局 sink）+ `ws_server` 桥接 + `conversation_loop` 10 处埋点 + App.vue 气泡；E2E 28 progress 事件全验证 |
+| C-P1.2 | HITL 决策面板 | 1.5 周 | ⏳ 进行中 | 核心骨架已建：`agent/hitl_channel.py` 全局通道 + `DecisionKind` 4 类 + `HumanQuery.kind` + `bridge` payload 透传 + `start_autonomy` 注册全局通道 + `tool_guardrails` HITL 信号（`hitl_decision` / `force_halt`）。下一步：`conversation_loop` 工具失败触发 + 前端按 kind 分类 + 第 2/3 类触发（经验沉淀确认 / provider 切换）|
+| M-P1.1 | BRS 广度并行接线 | 2 周 | ❌ | `spirit/autonomy/wave_runner.py`（待开始）|
+
+#### v0.5.0（❌ 计划）—— 可量化 + 桌面伴侣
+
+| 编号 | 功能 | 估算 | 状态 | 备注 |
+|------|------|------|------|------|
+| M-P1.2 | 成效度量 harness | 2 周 | ❌ | `evolution/metrics_harness.py` |
+| M-P1.3 | 领域验证器扩充 | 2 周 | ❌ | `evolution/domains/{code,doc,data}_domain.py`（+ finance）4 个 |
+| M-P2.1 | 自进化日报 | 1 周 | ❌ | `evolution/daily_report.py` |
+| M-P2.2 | 经验沉淀确认 | 1 周 | ❌ | HITL 流程 + 桌宠气泡 + 记忆写入 |
+| M-P2.3 | wave 状态可视化 | 1 周 | ❌ | 桌宠 wave 详情面板 + 状态 API |
+| C-P2.1 | 任务历史回看 | 1.5 周 | ❌ | 桌宠历史面板 + 搜索 + 导出 |
+| C-P2.2 | 任务结束摘要推送 | 1 周 | ❌ | 长任务完成推送 |
+| C-P2.3 | 桌宠状态可视化 | 0.5 周 | ❌ | 5 状态机（空闲/思考/工具/等待 HITL/自主探索）|
+
+#### V3.0.0（❌ 计划）—— 完整收尾
+
+| 编号 | 功能 | 估算 | 状态 | 备注 |
+|------|------|------|------|------|
+| R-P3.1 | 消息清理 | 1.5 周 | ❌ | `agent/message_sanitization.py`（4 类清洗）|
+| R-P3.2 | 敏感信息脱敏 | 1.5 周 | ❌ | `agent/redact.py`（5 类脱敏）|
+| M-P3.1 | 成效 regression suite | 1.5 周 | ❌ | CI 集成 + 报警 |
+| M-P3.2 | strict-alternation 适配评估 | 1 周 | ❌ | 评估导向（阶段 1+2 必做，阶段 3 视结果）|
+| C-P3.1 | 多 session 监控 PoC | 2 周 | ❌ | 多 session 列表 + 旁路查看 |
+| C-P3.2 | 团队经验导入导出 | 2 周 | ❌ | 导出 / 导入 / 签名验证 |
+| C-P3.3 | 任务优先级调度 | 2 周 | ❌ | 任务队列 + 优先级 / 暂停 / 取消 |
+
+### 12.4 V3 进度统计
+
+| 类别 | 总项 | ✅ | ⏳ | ❌ |
+|------|------|----|----|-----|
+| V3 P1（v0.2.4-v0.4.0）| 8 | 6 | 1（C-P1.2）| 1（M-P1.1）|
+| V3 P2（v0.3.0-v0.5.0）| 9 | 0 | 0 | 9 |
+| V3 P3（V3.0.0）| 7 | 0 | 0 | 7 |
+| **合计** | **24** | **6** | **1** | **17** |
+
+### 12.5 整体统计（V2 + V3）
+
+| 维度 | 总项 | ✅ | ⏳ | ❌ |
+|------|------|----|----|-----|
+| V2 Phase 1-7 子项 | 41 | 41 | 0 | 0 |
+| V2 仍待补完（低优先级）| 4 大类 | 0 | 0 | 4 |
+| V3 P1（v0.2.4-v0.4.0）| 8 | 6 | 1（C-P1.2）| 1（M-P1.1）|
+| V3 P2（v0.3.0-v0.5.0）| 9 | 0 | 0 | 9 |
+| V3 P3（V3.0.0）| 7 | 0 | 0 | 7 |
+| **合计** | **69** | **47** | **1** | **21** |
+
+**关键里程碑**：
+- V2 七大阶段全部完成 → 41/41 子项 + 2,698+ 测试全通 + 35,761 行后端代码
+- v0.2.4 R/M 支柱 P1 全收官 → C 支柱进度仅 C-P1.1 完成
+- 当前 v0.4.0：C-P1.2 进行中（核心骨架 ✅，子任务待做） / M-P1.1 待开始
+- v0.3.0 / v0.5.0 / V3.0.0 全部 P2/P3 项均未开始
+- V2 阶段（Phase 1-7）全部完成，详见 [07-development-checklist.md §一/§二/§三](./07-development-checklist.md)
