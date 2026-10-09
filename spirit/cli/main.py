@@ -680,6 +680,14 @@ def chat(model, api_key, base_url):
         unregister_progress_sink(_render_progress)
     except Exception:
         pass
+    # ── v0.2.9: CLI 退出时调 close_session 兑底（幂等）──
+    # run_conversation finally 本身会调一次 (成功/异常路径已覆盖)，
+    # 这里仅覆盖「用户 /quit 提前退出」场景——中间轮就被打断，
+    # 该轮 task 标记为 cli_exit，与 session_persistence 三层终止对齐。
+    try:
+        agent.close_session(reason="cli_exit")
+    except Exception:  # noqa: BLE001
+        pass
     console.print("\n[dim]再见！[/dim]")
 
 

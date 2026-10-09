@@ -443,9 +443,34 @@ class SpiritAgent:
         - 并发工具执行
         - 迭代预算控制
         - TurnContext per-turn 初始化
+
+        v0.2.9: 包装 try/finally，在所有 return 路径 / 异常路径上
+        调 self.close_session(reason) 令 db 的 ended_at / end_reason
+        总是有值。与 Hermes session_persistence 三层终止对齐。
         """
         from spirit.agent.conversation_loop import run_conversation
-        return run_conversation(self, user_message, **kwargs)
+        _close_reason = "task_complete"
+        try:
+            result = run_conversation(self, user_message, **kwargs)
+            _close_reason = self._infer_close_reason(result)
+            return result
+        except KeyboardInterrupt:
+            _close_reason = "user_interrupt"
+            raise
+        except BaseException as exc:  # noqa: BLE001 - 捕获一切上报
+            _close_reason = "task_failed"
+            logger.warning(
+                "对话循环异常 (%s)，会话标记为 task_failed", exc,
+            )
+            raise
+        finally:
+            try:
+                self.close_session(reason=_close_reason)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "close_session finally 异常 (非致命)",
+                    exc_info=True,
+                )
 
     def prepare_turn_context(self, user_message: str):
         """准备本轮对话的上下文（per-turn initialization）。
@@ -622,6 +647,71 @@ class SpiritAgent:
         # 7. 钩子：会话重置 + 新会话开始（新 id 无历史，handler 加载为空 no-op）
         self._emit_hook("on_session_reset", old_session_id=old_session_id)
         self._emit_hook("on_session_start", session_id=self.session_id)
+
+    def close_session(self, reason: str = "task_complete") -> None:
+        """结束当前会话记录（会话终止入口，与 Hermes 三层终止对齐）。
+
+        与 ``shutdown_memory_provider`` 的区别：
+        - 本方法**只**负责 db session 结束（不关闭 compressor），
+          可被多次调用、幂等（end_session 本身 First Reason Wins）。
+        - ``shutdown_memory_provider`` 同时关 compressor，走 Medium End。
+        - ``close`` 走 Hard End（全资源释放）。
+
+        调用场景：
+        - conversation_loop 5 个 return 路径前
+        - cli/main.py chat() 退出循环
+        - 信号处理（SIGTERM / SIGBREAK）
+        - 超时（max_iterations / api_error / retry_exhausted）
+
+        设计原则：
+        - **幂等**：可被多次调用，end_session SQL 写 WHERE ended_at IS NULL
+          保证 First Reason Wins（不覆盖）
+        - **异常隔离**：db 失败只 log warning、不抛错
+        - **可选 reason**：默认 ``task_complete``，按调用方语义覆盖
+
+        reason 可选值（与 end_session reason 字段对齐）:
+            task_complete / user_interrupt / max_iterations /
+            api_error / retry_exhausted / guardrail_halt /
+            cli_exit / agent_close / signal_term / signal_break
+        """
+        if not (self.session_id and self._session_db):
+            return
+        try:
+            self._session_db.end_session(self.session_id, reason=reason)
+            logger.info(
+                "会话已结束 (v0.2.9 close_session): %s reason=%s",
+                self.session_id[:8], reason,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "close_session 结束会话失败 (非致命): %s", e,
+            )
+
+    @staticmethod
+    def _infer_close_reason(result) -> str:
+        """根据 conversation_loop 返回的 ConversationResult 推断关闭 reason。
+
+        原理：conversation_loop 8 个 return 路径的 response 前缀都是
+        固定格式（[已中断] / [达到最大迭代次数 N] / [API 错误: ...] /
+        [API 调用失败，已重试 N 次] / [工具循环停止: ...]），用 startswith
+        判定即可。其它 = task_complete（含 line 681 fallback 兜底总结、
+        line 761 正常完成、line 762 模型文本回复）。
+        """
+        try:
+            response = (getattr(result, "response", "") or "").strip()
+        except Exception:  # noqa: BLE001
+            return "task_complete"
+        if response.startswith("[已中断]"):
+            return "user_interrupt"
+        if response.startswith("[达到最大迭代次数 "):
+            return "max_iterations"
+        if response.startswith("[API 错误"):
+            return "api_error"
+        if response.startswith("[API 调用失败"):
+            return "retry_exhausted"
+        if response.startswith("[工具循环停止"):
+            return "guardrail_halt"
+        return "task_complete"
 
     def shutdown_memory_provider(self):
         """关闭记忆提供者（Medium End）。
