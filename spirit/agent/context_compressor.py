@@ -44,6 +44,15 @@ SUMMARY_END_MARKER = (
 
 # 粗略 token 估算：1 token ≈ 3.5 字符（来自集中式配置）
 from spirit.config import get_config_value
+from spirit.agent.context_compressor_v2 import (
+    CompressorV2Hooks,
+    StallConfig,
+    StallDetector,
+    deterministic_summarize,
+    is_provider_refusal,
+    micro_compact_messages,
+    summarize_with_v2,
+)
 
 _CHARS_PER_TOKEN = get_config_value("compression.chars_per_token", 3.5)
 
@@ -114,6 +123,23 @@ class ContextCompressor(ContextEngine):
         self._last_completion_tokens = 0
         self._compression_count = 0
         self._last_summary: Optional[str] = None
+
+        # V2 鲁棒性增强 hook（R-P1.5）
+        self._v2_hooks = CompressorV2Hooks(
+            stall_detector=StallDetector(
+                StallConfig(
+                    timeout_s=get_config_value("compression.stall_timeout_seconds", 60.0),
+                    soft_warn_s=get_config_value("compression.stall_soft_warn_seconds", 30.0),
+                ),
+            ),
+            deterministic_fallback_enabled=get_config_value(
+                "compression.deterministic_fallback_enabled", True
+            ),
+            micro_compact_before_summarize=get_config_value(
+                "compression.micro_compact_enabled", True
+            ),
+            pin_route_on_call=True,
+        )
 
     @property
     def threshold_tokens(self) -> int:
@@ -293,13 +319,48 @@ class ContextCompressor(ContextEngine):
         )
 
         try:
-            response = self._llm_client.chat.completions.create(
+            # 提取 provider 名（可选，从 llm_client 属性读）
+            provider = ""
+            if hasattr(self._llm_client, "provider"):
+                provider = getattr(self._llm_client, "provider", "")
+
+            def _llm_call(msgs, _focus):
+                # 重建 LLM 输入（focus_topic 已拼到 prompt 里）
+                focus_hint = f"\n重点关注: {_focus}" if _focus else ""
+                prompt = (
+                    "请将以下对话历史压缩为结构化摘要。保留：\n"
+                    "1. 已完成的关键操作（文件修改、命令执行结果）\n"
+                    "2. 当前进行中的任务状态\n"
+                    "3. 待解决的用户问题\n"
+                    "4. 重要的错误和解决方案\n"
+                    f"5. 关键的文件路径和代码片段{focus_hint}\n\n"
+                    "丢弃：重复的工具输出、中间调试步骤、冗余确认。\n"
+                    "用简洁的要点格式输出。\n\n"
+                    f"--- 对话历史 ---\n"
+                    + "\n\n".join(
+                        f"[{m.get('role', 'unknown')}]: {m.get('content', '') if isinstance(m.get('content'), str) else str(m.get('content', ''))}"
+                        for m in msgs
+                    )
+                    + "\n--- 结束 ---"
+                )
+                response = self._llm_client.chat.completions.create(
+                    model=self._llm_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=get_config_value("compression.summary_max_tokens", 2000),
+                    temperature=get_config_value("compression.summary_temperature", 0.3),
+                )
+                return response.choices[0].message.content or ""
+
+            # V2 路径：pin route → micro_compact → stall 检测 → refusal 检测 → fallback
+            summary = summarize_with_v2(
+                messages,
+                llm_call=_llm_call,
+                provider=provider,
                 model=self._llm_model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=get_config_value("compression.summary_max_tokens", 2000),
-                temperature=get_config_value("compression.summary_temperature", 0.3),
+                hooks=self._v2_hooks,
+                focus_topic=focus_topic,
             )
-            return response.choices[0].message.content or ""
+            return summary or deterministic_summarize(messages)
         except Exception as exc:
             logger.warning("LLM 摘要生成失败，回退到文本截断: %s", exc)
             return self._text_truncate_summarize(messages)
