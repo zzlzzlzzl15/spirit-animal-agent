@@ -189,21 +189,30 @@ class TestTokenOnSwitchModel:
 # ===========================================================================
 
 class TestTokenFieldsAreInMemoryOnly:
-    """token 4 字段是 in-memory 累加, 不落 db — 与 v0.2.10 状态栏"since 重启后清零"语义一致。"""
+    """v0.2.10: token 字段仅 in-memory（重启后清零）。v0.3.0 重新设计:
+
+    - sessions 表新增 input_tokens/output_tokens/total_tokens 列
+    - 累加后写入 db（跨重启不丢）
+    - session_model_usage 表聚合 per-session per-model
+
+    见 spirit/storage/schema.py + spirit/storage/usage.py
+    """
 
     def test_tokens_not_persisted_in_db(self, fresh_agent, isolated_db_path):
-        """累加 token 后, db.session 里没有这些字段值。"""
+        """v0.3.0 (Stage 6): 累加 token 后, db.session 里有这些字段（跨重启不丢）。
+        v0.2.10 旧测试期望不落库已废弃——Hermes-style 设计明确要求 token 落库。
+        """
         fresh_agent.session_input_tokens = 999
         fresh_agent.session_output_tokens = 888
         fresh_agent.session_total_tokens = 1887
         fresh_agent.session_api_calls = 7
-        # db 里的 session row 应只有基础字段
         from spirit.storage.session_db import SessionDB
         db = SessionDB(db_path=isolated_db_path)
         row = db.get_session(fresh_agent.session_id)
-        # session 行有 token 字段吗？(v0.2.10 之前的 session_db schema 查)
-        for key in ("input_tokens", "output_tokens", "total_tokens", "api_calls"):
-            assert key not in row, f"session row 不应存 {key}"
+        # v0.3.0 新 schema: sessions 表有 token 列（默认 0）
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            assert key in row, f"session row 应该有 {key} 列（v0.3.0 token 落库）"
+        # row[key] 可能是 0 或 None（未写入），但字段存在
         db.close()
 
     def test_new_agent_starts_at_zero_even_after_prev_session(self, isolated_db_path):

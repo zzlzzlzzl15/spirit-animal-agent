@@ -260,6 +260,9 @@ def _print_recent_tasks(db, limit: int = 5) -> None:
     """列出最近 N 个会话（[n] 编号 + 首条用户消息预览）。
 
     用户输入 [n] / resume <n> 时会调用 agent.resume_session(session_id)。
+
+    v0.3.0 (Hermes-style): 优先用 sessions.title 字段（auto/user），没有
+    title 才 fallback 到首条 user 消息。解决「空会话」问题 + 避免重复拼的预览闪。
     """
     if db is None:
         return
@@ -272,18 +275,23 @@ def _print_recent_tasks(db, limit: int = 5) -> None:
 
     console.print(RECENT_HEADER)
     for idx, s in enumerate(sessions, start=1):
-        # 取首条用户消息作为预览
-        try:
-            msgs = db.get_messages(s["id"])
-        except Exception:
-            msgs = []
         preview = ""
-        for m in msgs:
-            if m.get("role") == "user" and m.get("content"):
-                preview = m["content"].replace("\n", " ").strip()
-                break
-        if not preview:
-            preview = "(空会话)"
+        # v0.3.0: 优先读 sessions.title（auto 或 user）
+        title = (s.get("title") or "").strip()
+        if title:
+            preview = title
+        else:
+            # Fallback: 首条用户消息
+            try:
+                msgs = db.get_messages(s["id"])
+            except Exception:
+                msgs = []
+            for m in msgs:
+                if m.get("role") == "user" and m.get("content"):
+                    preview = m["content"].replace("\n", " ").strip()
+                    break
+            if not preview:
+                preview = "(空会话)"
         if len(preview) > 50:
             preview = preview[:50] + "..."
         started = s.get("started_at", "")[:19]  # 截掉毫秒
@@ -914,6 +922,158 @@ def tools():
             console.print(f"{entry.emoji} [bold]{entry.name}[/bold] [dim]({entry.toolset})[/dim]")
     else:
         console.print("[dim]暂无已注册工具[/dim]")
+
+
+# ── v0.4.0 storage subcommand group ─────────────────────────────
+# Hermes-aligned CLI surface for the new storage mixins: search / history /
+# undo / stats / export / health / prune / vacuum.
+@cli.group()
+def storage():
+    """SQLite 存储层运维命令（v0.4.0 Hermes-aligned）"""
+
+
+def _storage_open() -> Any:
+    """Open SessionDB with graceful error reporting."""
+    from spirit.storage.session_db import SessionDB
+    try:
+        return SessionDB()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]无法打开 state.db: {exc}[/red]")
+        sys.exit(1)
+
+
+@storage.command("search")
+@click.argument("query")
+@click.option("--limit", "-n", default=20, help="结果上限")
+@click.option("--session", "-s", default=None, help="限定 session_id")
+def cmd_storage_search(query: str, limit: int, session: Optional[str]) -> None:
+    """全量检索 messages (FTS5 + LIKE fallback)"""
+    from .storage_commands import cmd_search
+
+    db = _storage_open()
+    result = cmd_search(db, query=query, limit=limit, session_id=session)
+    if not result.get("ok"):
+        console.print(f"[red]搜索失败: {result.get('error')}[/red]")
+        db.close()
+        sys.exit(1)
+    hits = result.get("hits", [])
+    console.print(f"[bold cyan]查询：[/bold cyan] {query}  [dim]→ {len(hits)} 条命中[/dim]")
+    for h in hits:
+        sid = (h.get("session_id") or "")[:8]
+        console.print(
+            f"  [{sid}] {h.get('role'):9} | {h.get('preview', '')[:80]}"
+        )
+    db.close()
+
+
+@storage.command("history")
+@click.argument("session_id")
+@click.option("--limit", "-n", default=50, help="时间线条目上限")
+def cmd_storage_history(session_id: str, limit: int) -> None:
+    """列出某个 session 的 timeline 视图"""
+    from .storage_commands import cmd_history
+
+    db = _storage_open()
+    result = cmd_history(db, session_id=session_id, limit=limit)
+    if not result.get("ok"):
+        console.print(f"[red]history 失败: {result.get('error')}[/red]")
+        db.close()
+        sys.exit(1)
+    summary = result.get("summary") or {}
+    console.print(
+        f"[bold cyan]Session {session_id[:8]}[/bold cyan]  "
+        f"msgs={summary.get('total_messages', '?')} "
+        f"tools={summary.get('total_tool_calls', '?')}"
+    )
+    for entry in result.get("entries", []):
+        console.print(f"  {entry}")
+    db.close()
+
+
+@storage.command("undo")
+@click.argument("session_id")
+@click.option("--to-message", default=None, type=int,
+              help="跳到此 message_id 之前")
+def cmd_storage_undo(session_id: str, to_message: Optional[int]) -> None:
+    """/undo：rewind session 到指定 user message 前"""
+    from .storage_commands import cmd_undo
+
+    db = _storage_open()
+    result = cmd_undo(
+        db, session_id=session_id,
+        target_user_message_id=to_message,
+    )
+    if not result.get("ok"):
+        console.print(f"[red]undo 失败: {result.get('error')}[/red]")
+        db.close()
+        sys.exit(1)
+    console.print(f"[green]rewind 完成:[/green] {result.get('outcome')}")
+    db.close()
+
+
+@storage.command("stats")
+def cmd_storage_stats() -> None:
+    """DB 结构 + 健康快照"""
+    from .storage_commands import cmd_stats
+
+    db = _storage_open()
+    result = cmd_stats(db)
+    console.print_json(data=result)
+    db.close()
+
+
+@storage.command("health")
+def cmd_storage_health() -> None:
+    """检查 storage 健康 / corrupt 标记"""
+    from .storage_commands import cmd_health
+
+    db = _storage_open()
+    result = cmd_health(db)
+    console.print_json(data=result)
+    db.close()
+
+
+@storage.command("vacuum")
+@click.confirmation_option(prompt="确认执行 VACUUM？这会重建 DB 文件。")
+def cmd_storage_vacuum() -> None:
+    """压缩 / 重整 DB 文件"""
+    from .storage_commands import cmd_vacuum
+
+    db = _storage_open()
+    result = cmd_vacuum(db)
+    console.print_json(data=result)
+    db.close()
+
+
+@storage.command("prune")
+@click.option("--older-than-days", default=90, type=int,
+              help="删除 N 天前的行")
+@click.confirmation_option(prompt="确认删除旧消息？")
+def cmd_storage_prune(older_than_days: int) -> None:
+    """清理 N 天前的 messages（软删除）"""
+    from .storage_commands import cmd_prune
+
+    db = _storage_open()
+    result = cmd_prune(db, older_than_days=older_than_days)
+    console.print_json(data=result)
+    db.close()
+
+
+@storage.command("export")
+@click.option("--output", "-o", required=True, type=click.Path(),
+              help="导出文件路径 (JSON)")
+def cmd_storage_export(output: str) -> None:
+    """把 messages + sessions 导出为 JSON 快照"""
+    from .storage_commands import cmd_export
+
+    db = _storage_open()
+    result = cmd_export(db, Path(output))
+    if not result.get("ok"):
+        console.print(f"[red]export 失败: {result.get('error')}[/red]")
+        db.close()
+        sys.exit(1)
+    console.print(f"[green]已导出到 {output}[/green]")
+    db.close()
 
 
 if __name__ == "__main__":

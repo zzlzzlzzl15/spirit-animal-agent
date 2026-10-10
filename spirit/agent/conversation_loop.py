@@ -43,7 +43,6 @@ from spirit.agent.prompt_caching import apply_cache_control, should_use_prompt_c
 from spirit.agent.provider_switch_protection import (
     ProviderRoute,
     apply_provider_labels,
-    build_provider_switch_notice,
     protect_provider_switch,
     snapshot_agent_route,
 )
@@ -53,6 +52,10 @@ from spirit.agent.accuracy_attribution import (
     build_self_correction_prompt,
 )
 from spirit.agent.text_tool_parser import parse_text_tool_calls
+from spirit.agent.turn_truncation import (
+    build_text_continuation_prompt,
+    detect_truncation,
+)
 from spirit.config import get_config_value
 from spirit.agent.progress_notifier import (
     ProgressPhase,
@@ -195,6 +198,28 @@ def run_conversation(
         summary=_task_summary,
     )
 
+    # ── v0.4.0 turn_facade wiring ──────────────────────────
+    # 拿到 agent 已装配的 turn_facade（如已接 storage_event_bridge），
+    # 通知它一个 turn 已经开始。这一跳是 async 的，失败不主路径中断。
+    _turn_facade = getattr(agent, "turn_facade", None)
+    if _turn_facade is not None and hasattr(_turn_facade, "persist_turn_start"):
+        try:
+            _turn_facade.persist_turn_start(
+                session_id=agent.session_id,
+                user_message=user_message,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("turn_facade.persist_turn_start 失败 (非致命)", exc_info=True)
+
+    # ── v0.4.0 storage_lifecycle wiring ─────────────────────
+    # turn 层面 touch_session（每轮刷新 last_touched_at）。
+    _storage_lifecycle = getattr(agent, "storage_lifecycle", None)
+    if _storage_lifecycle is not None and hasattr(_storage_lifecycle, "on_turn_start"):
+        try:
+            _storage_lifecycle.on_turn_start(session_id=agent.session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("storage_lifecycle.on_turn_start 失败 (非致命)", exc_info=True)
+
     # ── Prompt caching 初始化 ──────────────────────────────────
     # 检测当前 provider/model 是否支持 Anthropic 风格的 cache_control
     use_cache, native_layout = should_use_prompt_caching(
@@ -224,6 +249,29 @@ def run_conversation(
     max_retries = get_config_value("agent.max_retries", 3)
     compression_attempts = 0
 
+    # ── R-P2.2：启动 turn 活性 watchdog ───────────────────────
+    # 在主循环启动前安装； turn_active=True 让 watchdog 采样，LLM/工具触摸后
+    # 推进 generation；超 600s 无活动 → _turn_liveness_aborted=True →
+    # 下轮主循环 break。try/finally 保证 turn 退出/异常时 stop() 总会调用。
+    from spirit.agent.turn_liveness import resolve_turn_liveness_settings, TurnLivenessWatchdog
+    _tl_timeout, _tl_poll = resolve_turn_liveness_settings(agent.config if hasattr(agent, "config") else None)
+    _tl_watchdog = TurnLivenessWatchdog(agent, timeout_s=_tl_timeout, poll_s=_tl_poll)
+    _tl_watchdog_active = False
+    if _tl_watchdog.enabled:
+        agent._turn_active = True
+        agent._turn_liveness_aborted = False
+        # 防御式：tests 中的 FakeAgent 可能没 _activity_lock
+        _act_lock = getattr(agent, "_activity_lock", None)
+        if _act_lock is not None:
+            with _act_lock:
+                agent._last_activity_ts = None
+                agent._turn_liveness_activity_generation = 0
+        else:
+            agent._last_activity_ts = None
+            agent._turn_liveness_activity_generation = 0
+        _tl_watchdog.start()
+        _tl_watchdog_active = True
+
     # fallback 切换等过程通知走独立回调（如有）：前端把该通道当"过程通知"，
     # 不计入流式增量——通知若混进 stream_delta 会让 streamBuffer 非空，
     # 轮末错误结论的兜底渲染会被"已流式送达"判定吞掉，失败轮静默结束。
@@ -251,8 +299,29 @@ def run_conversation(
                 summary="用户中断",
                 extra={"reason": "user_interrupt"},
             )
+            if _tl_watchdog_active:
+                _tl_watchdog.stop()
+                agent._turn_active = False
             return ConversationResult(
                 response="[已中断]",
+                messages=agent.messages,
+                iterations=api_call_count,
+                tool_calls=tool_calls_in_turn,
+            )
+
+        # R-P2.2: watchdog abort 检查
+        if _tl_watchdog_active and getattr(agent, "_turn_liveness_aborted", False):
+            logger.warning("turn 被 liveness watchdog 强制结束 (idle 超时)")
+            notify_progress(
+                ProgressPhase.TASK_ABORTED,
+                iterations=api_call_count,
+                summary="liveness watchdog timeout",
+                extra={"reason": "turn_liveness_abort"},
+            )
+            _tl_watchdog.stop()
+            agent._turn_active = False
+            return ConversationResult(
+                response="[turn 被活性 watchdog 终止]",
                 messages=agent.messages,
                 iterations=api_call_count,
                 tool_calls=tool_calls_in_turn,
@@ -319,15 +388,51 @@ def run_conversation(
                     "预压缩 #%d: ~%d tokens 超过阈值",
                     compression_attempts, approx_tokens,
                 )
-                agent._messages = compressor.compress(agent.messages, approx_tokens)
-                _emit_hook(
-                    agent, "on_context_compress",
-                    before_tokens=approx_tokens,
-                    after_tokens=estimate_messages_tokens(agent._messages),
-                    trigger="preemptive",
-                )
-                budget.refund()  # 压缩不消耗迭代
-                continue
+                # ── v0.4.0 compression lock ───────────────────────────
+                # 同一 session 同一时间只能有一个 compressor 在跑。
+                # claim 失败跳过本次压缩（与 Hermes 语义一致）。
+                _db = getattr(agent, "_session_db", None)
+                _lock_acquired = False
+                if _db is not None and hasattr(_db, "claim_compression_lock"):
+                    try:
+                        _lock_acquired = bool(_db.claim_compression_lock(
+                            session_id=agent.session_id,
+                            holder=f"cl:{id(agent)}",
+                            ttl=60.0,
+                        ))
+                    except Exception:  # noqa: BLE001
+                        _lock_acquired = False
+                if _db is None or _lock_acquired:
+                    agent._messages = compressor.compress(agent.messages, approx_tokens)
+                    _emit_hook(
+                        agent, "on_context_compress",
+                        before_tokens=approx_tokens,
+                        after_tokens=estimate_messages_tokens(agent._messages),
+                        trigger="preemptive",
+                    )
+                    # ── v0.4.0 compaction_observer hook ──────────────────
+                    try:
+                        _observer = getattr(agent, "compaction_observer", None)
+                        if _observer is not None:
+                            _observer.observe_compaction(
+                                session_id=agent.session_id,
+                                message_ids=[],
+                                compressed_summary=compressor.last_summary or "",
+                                strategy="preemptive",
+                            )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("compaction_observer.observe_compaction 失败 (非致命)",
+                                     exc_info=True)
+                    if _db is not None and hasattr(_db, "release_compression_lock"):
+                        try:
+                            _db.release_compression_lock(agent.session_id)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    budget.refund()  # 压缩不消耗迭代
+                    continue
+                else:
+                    logger.info("压缩锁被占用；跳过本轮 (session=%s)",
+                                agent.session_id[:8])
 
         # ── 构建 API 消息 ───────────────────────────────────────
         api_messages = _prepare_api_messages_safe(agent)
@@ -357,7 +462,13 @@ def run_conversation(
                     summary=f"第 {api_call_count} 轮推理",
                 )
                 _llm_started = time.monotonic()
+                # R-P2.2: 触摸活性时钟 (防御式: FakeAgent 可能没装)
+                _touch = getattr(agent, "_touch_activity", None)
+                if callable(_touch):
+                    _touch("llm_call_start")
                 response = _call_llm(agent, api_messages, tools, stream_callback)
+                if callable(_touch):
+                    _touch("llm_call_done")
                 # C-P1.1：进度推送（思考结束 + 耗时）
                 _llm_duration_ms = (time.monotonic() - _llm_started) * 1000.0
                 notify_progress(
@@ -457,6 +568,19 @@ def run_conversation(
                         after_tokens=estimate_messages_tokens(agent._messages),
                         trigger="error_recovery",
                     )
+                    # ── v0.4.0 compaction_observer hook ────────────
+                    try:
+                        _observer = getattr(agent, "compaction_observer", None)
+                        if _observer is not None:
+                            _observer.observe_compaction(
+                                session_id=agent.session_id,
+                                message_ids=[],
+                                compressed_summary=compressor.last_summary or "",
+                                strategy="error_recovery",
+                            )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("compaction_observer.observe_compaction 失败 (非致命)",
+                                     exc_info=True)
                     api_messages = _prepare_api_messages_safe(agent)
                     budget.refund()
                     break  # 跳出重试，回到主循环
@@ -634,6 +758,61 @@ def run_conversation(
             # 输出撞 max_tokens 上限（思考模型常见：推理消耗配额后可见文本与
             # 工具调用被截断），不得当作最终回答结束轮次：保存干净文本、
             # 注入续写提示后再推一轮，让模型从断点继续发出完整工具调用。
+            # R-P2.1 截断多策略检测（优先于 length 续传）
+            # - abort：思考耗尽 / repetition / 窗口填满 → 直接收尾
+            # - fallback：内容过滤 / refusal → 切换 fallback provider
+            # - continue：走原 length 续传路径（双层防御）
+            _truncation_verdict = detect_truncation(
+                agent, choice, list(getattr(agent, "messages", []) or []),
+                finish_reason=finish,
+                continuation_attempts=truncation_continuations,
+            )
+            if _truncation_verdict.action == "abort" and _truncation_verdict.final_response:
+                _tv_resp = _truncation_verdict.final_response
+                agent.add_message("assistant", _clean_for_display(_tv_resp) or _tv_resp)
+                _emit_hook(
+                    agent, "after_conversation",
+                    response=_tv_resp, iterations=api_call_count,
+                    tool_calls=tool_calls_in_turn,
+                )
+                return _tv_resp
+            if _truncation_verdict.action == "fallback":
+                logger.warning(
+                    "[R-P2.1] 内容过滤触发 fallback: reason=%s",
+                    _truncation_verdict.reason,
+                )
+                # 交由 protect_provider_switch 接管（与现有 provider 切换
+                # 路径一致；下一轮 API 调用会自动跳 fallback provider）。
+                _reason_txt = _truncation_verdict.reason or "content_filter"
+                try:
+                    _from_route = ProviderRoute(
+                        provider=getattr(agent, "provider", "primary"),
+                        model=getattr(agent, "model", ""),
+                    )
+                    _fb_chain = getattr(agent, "_fallback_chain", None) or []
+                    _to_route = (
+                        ProviderRoute(
+                            provider=str(_fb_chain[0].get("provider", "")),
+                            model=str(_fb_chain[0].get("model", "")),
+                        )
+                        if _fb_chain else _from_route
+                    )
+                    _protected, _notice = protect_provider_switch(
+                        list(getattr(agent, "_messages", []) or []),
+                        route_from=_from_route, route_to=_to_route,
+                        reason=_reason_txt,
+                    )
+                    if hasattr(agent, "_messages"):
+                        agent._messages = _protected
+                    if _notice is not None:
+                        agent.add_message("user", _notice)
+                except Exception as _fb_exc:  # noqa: BLE001 - 退化为纯续推
+                    logger.warning(
+                        "[R-P2.1] protect_provider_switch 失败，降级续推: %s",
+                        _fb_exc,
+                    )
+                continue
+
             if (
                 finish == "length"
                 and truncation_continuations < _MAX_TRUNCATION_CONTINUATIONS
@@ -647,9 +826,7 @@ def run_conversation(
                 agent.add_message("assistant", _clean_for_display(content) or content)
                 agent.add_message(
                     "user",
-                    "[系统提示] 你上一轮输出因长度上限被截断，其中的工具调用未执行。"
-                    "请直接从中断处继续任务：重新发出完整的工具调用，"
-                    "不要重复已写过的说明文字。",
+                    build_text_continuation_prompt(),
                 )
                 continue
 
@@ -779,6 +956,10 @@ def run_conversation(
         response="[max_iterations]", iterations=api_call_count,
         tool_calls=tool_calls_in_turn,
     )
+    # R-P2.2: turn 出口关闭 watchdog (仅主函数体最后 return 前)
+    if _tl_watchdog_active:
+        _tl_watchdog.stop()
+        agent._turn_active = False
     return ConversationResult(
         response=f"[达到最大迭代次数 {agent.max_iterations}]",
         messages=agent.messages,
@@ -790,7 +971,6 @@ def run_conversation(
 # =========================================================================
 # LLM 调用
 # =========================================================================
-
 def _inject_process_notifications(agent) -> int:
     """把后台进程/异步委托的完成通知回灌进对话（Phase 4.7）。
 

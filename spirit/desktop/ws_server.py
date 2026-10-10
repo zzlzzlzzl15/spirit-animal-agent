@@ -268,6 +268,25 @@ class WSServer:
         except Exception as exc:
             logger.debug("委派进度 sink 注册失败 (非致命): %s", exc)
 
+        # C-P1.1 主任务进度事件 → 广播 progress 给所有桌宠/CLI 客户端。
+        # conversation_loop.py 在关键节点调 notify_progress()，这里桥接到事件循环。
+        try:
+            from spirit.agent.progress_notifier import register_progress_sink
+
+            loop = asyncio.get_running_loop()
+
+            def _progress_sink(evt: Dict[str, Any]) -> None:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.broadcast("progress", evt), loop
+                    )
+                except Exception:
+                    pass
+
+            register_progress_sink(_progress_sink)
+        except Exception as exc:
+            logger.debug("主任务进度 sink 注册失败 (非致命): %s", exc)
+
         self._server = await websockets.server.serve(
             self._handle_client,
             self.host,
@@ -642,6 +661,12 @@ class WSServer:
                 "message": "知识库搜索功能待集成",
             }
         reg("search_knowledge", cmd_search_knowledge)
+
+        # ── v0.4.0 Hermes-aligned storage handlers ─────────────────
+        # 把 spirit/desktop/ws_storage_handlers.py 中的 8 个 handler 挂到 reg
+        # 路由表，供 Electron 桌宠前端调用。
+        from .ws_storage_handlers import register_storage_handlers
+        register_storage_handlers(reg)
 
         async def cmd_chat(client, data):
             """对话接口 — 支持工具进度推送和流式响应。"""

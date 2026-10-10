@@ -150,6 +150,27 @@ onMounted(async () => {
         if (window.electronAPI?.showBubble && !activePanel.value) {
           window.electronAPI.showBubble('🤔 探索遇到选择，打开「系统」面板帮我拍板~')
         }
+      } else if (event === 'progress') {
+        // C-P1.1 长任务进度推送 → 桌宠冒泡（复用 SpeechBubblePage 独立窗口）。
+        // 只显示阶段切换：task_start / tool_call / task_complete / task_aborted；
+        // thinking / thinking_end / tool_result 不显示 — 太频繁会烦，4s 自动关 + 重
+        // 启气泡即可。
+        const phase = data?.phase
+        let text = ''
+        if (phase === 'task_start') {
+          text = `📋 ${data.summary || '开始任务'}`
+        } else if (phase === 'tool_call') {
+          text = `🔧 调用: ${data.summary || '工具'}`
+        } else if (phase === 'task_complete') {
+          const iters = data?.iterations ?? 0
+          const tcs = data?.tool_calls ?? 0
+          text = `✨ 完成 (${iters} 轮${tcs > 0 ? `, ${tcs} 个工具` : ''})`
+        } else if (phase === 'task_aborted') {
+          text = `⛔ ${data.summary || '任务中断'}`
+        }
+        if (text && window.electronAPI?.showBubble) {
+          window.electronAPI.showBubble(text)
+        }
       }
     },
   })

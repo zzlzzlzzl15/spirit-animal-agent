@@ -465,6 +465,14 @@ def start_autonomy(
             run_on_start=run_on_start,
         )
         bridge.attach(server)
+        # C-P1.2：把 bridge.ask 注册为全局 HITL 通道 —— 让主对话循环（工具连续失败）、
+        # failover（跨 provider 切换）、evolution（经验沉淀确认）也能复用同一条 WS
+        # 广播 + autonomy_answer 答复链路发起带 kind 分类的询问（fail-open 不卡死）。
+        try:
+            from spirit.agent.hitl_channel import register_hitl_channel
+            register_hitl_channel(bridge.ask)
+        except Exception as exc:  # noqa: BLE001 - 注册失败不影响 autonomy 本身
+            logger.debug("autonomy.integration: 全局 HITL 通道注册失败（非致命）: %s", exc)
         if autostart:
             autonomy.start()
         logger.info("autonomy.integration: 常驻自主循环已挂载（autostart=%s, 间隔=%.0fs, execute=%s）",

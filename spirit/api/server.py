@@ -17,7 +17,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,8 +36,86 @@ from spirit.api.events import (
 )
 from spirit.api.context import WorkspaceContext
 from spirit.api.memora_proxy import create_memora_router
+from spirit.api.ws_storage_handlers import (
+    STORAGE_HANDLER_REGISTRY,
+    dispatch_storage,
+    is_storage_msg_type,
+    register_storage_handlers,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Storage handler dispatch — v0.4.0 §13.12
+# ---------------------------------------------------------------------------
+# 8 个 storage_* handler 在 WS 主循环里通过 storage_handler_dispatch dict
+# 注册并 dispatch（与 chat / interrupt / reset / ping 同级）。
+# 调用走 process-wide 的 _storage_db_lock 串行化（sqlite 单写、check_same_thread
+# =False + autocommit；同一进程内多 client 并发 storage 写要排队，避免锁竞争）。
+# ---------------------------------------------------------------------------
+
+# 模块级 storage handler dispatch 字典（外部可以 inject 新的 handler）
+storage_handler_dispatch: Dict[str, Callable] = {}
+register_storage_handlers(storage_handler_dispatch)
+
+# 进程级 storage 串行锁（asyncio.Lock — 跨 client 共用）
+_storage_db_lock: Optional[asyncio.Lock] = None
+
+
+def _get_storage_lock() -> asyncio.Lock:
+    """懒初始化 storage 串行锁（必须发生在 event loop 创建之后）。"""
+    global _storage_db_lock
+    if _storage_db_lock is None:
+        _storage_db_lock = asyncio.Lock()
+    return _storage_db_lock
+
+
+def _resolve_storage_db():
+    """取一个 SessionDB 单例给 storage handler 用。
+
+    优先级：每 WS 连接自己的 agent.session_db（如果有） > 进程级 default SessionDB。
+    """
+    from spirit.storage.session_db import SessionDB
+    try:
+        return SessionDB()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("WS storage: failed to open SessionDB: %s", exc)
+        return None
+
+
+async def _dispatch_storage_message(
+    websocket: WebSocket,
+    msg_type: str,
+    payload: Dict[str, Any],
+) -> None:
+    """WS 主循环调用：跑 storage handler 并 send_json 响应。
+
+    在 storage handler 跑之前 acquire 进程级锁，避免多 client 并发 sqlite 写。
+    """
+    lock = _get_storage_lock()
+    async with lock:
+        db = _resolve_storage_db()
+        if db is None:
+            await _ws_send(websocket, {
+                "type": f"{msg_type}_result",
+                "request_id": payload.get("request_id"),
+                "ok": False,
+                "data": {},
+                "error": "sessiondb_unavailable",
+                "ts": time.time(),
+                "duration_ms": 0,
+            })
+            return
+        # dispatch_storage 内部 swallow 所有异常
+        try:
+            response = dispatch_storage(db, msg_type, payload or {})
+        finally:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+    await websocket.send_json(response)
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +556,12 @@ def _register_websocket_routes(app: FastAPI, manager: AgentManager):
                             "session_id": session_id,
                         })
                         await _ws_send(websocket, StatusUpdate("idle", "会话已重置"))
+
+                # ── 存储运维 (§13.12 WS 8 handler) ──
+                elif is_storage_msg_type(msg_type):
+                    await _dispatch_storage_message(
+                        websocket, msg_type, msg
+                    )
 
                 # ── 心跳 ──
                 elif msg_type == "ping":

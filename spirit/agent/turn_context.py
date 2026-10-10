@@ -248,14 +248,14 @@ def build_turn_context(
         logger.debug("Plugin context retrieval failed (non-critical): %s", e)
     
     # ── Step 8: Prepare working messages ──────────────────────────
-    # Copy messages to working list (loop will append to this)
+    # Add user message via agent.add_message() — 这样同步落库到
+    # session_db.messages 表，让 _print_recent_tasks 能拿到首条 user 预览
+    # （v0.2.11 已修过 add_message 落库；此处是绕过该路径的另一个漏洞）。
+    # 之前 line 252 用 messages.append({"role":"user", ...}) 绕过了落库，
+    # 导致历史会话全部显示 "(空会话)"。
+    agent.add_message("user", user_message_clean)
+    # Copy messages to working list（add_message 已 append 到 agent._messages）
     messages = list(agent.messages) if agent.messages else []
-    
-    # Add user message to working list
-    messages.append({
-        "role": "user",
-        "content": user_message_clean,
-    })
     
     # ── Step 9: Determine if memory review should fire ────────────
     # Memory review triggers after certain conditions are met

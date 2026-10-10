@@ -67,6 +67,7 @@ class DesktopBridge:
         self._seq += 1
         payload = {
             "id": self._seq,
+            "kind": getattr(query, "kind", "exploration"),  # C-P1.2：决策类型分类
             "question": query.question,
             "options": list(query.options or []),
             "context": query.context,

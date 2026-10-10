@@ -81,6 +81,8 @@ class HumanQuery:
     confidence: float = 1.0     # 触发方（Curriculum/Verifier）的置信度
     is_fork: bool = False       # 是否路线分叉 / 重大决策
     task_id: str = ""
+    kind: str = "exploration"   # C-P1.2：决策类型（exploration / tool_failure /
+                                # experience_review / provider_switch），桌宠据此分类渲染
 
     def render(self) -> str:
         parts = [self.question or "（无问题描述）"]

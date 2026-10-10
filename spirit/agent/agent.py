@@ -228,6 +228,18 @@ class SpiritAgent:
         self._api_call_count = 0
         self._messages: List[Dict[str, Any]] = []
 
+        # ── R-P2.2：turn 活性时钟（turn_liveness.py watchdog 依赖）──
+        # _touch_activity() 在 LLM 调用 / 工具执行 / 子任务 checkpoint 时刷新
+        # _last_activity_ts 并推进 _turn_liveness_activity_generation (防误杀 revalidate key)
+        # _turn_liveness_aborted 由 watchdog 在 commit 阶段写 True, 主循环下轮 break
+        import threading as _threading
+        self._activity_lock: _threading.Lock = _threading.Lock()
+        self._turn_active: bool = False
+        self._last_activity_ts: Optional[float] = None
+        self._last_activity_desc: Optional[str] = None
+        self._turn_liveness_activity_generation: int = 0
+        self._turn_liveness_aborted: bool = False
+
         # ── 会话级 token 用量累加（对齐 Hermes session_*_tokens 语义）──
         # 状态栏 / debug / 计费统计共用。conversation_loop 在每次 LLM 响应成功后
         # 调用 += 累加。初始 0 表示"还没产生过 API 调用"，与 _api_call_count 配套。
@@ -260,6 +272,45 @@ class SpiritAgent:
             logger.info("会话数据库已初始化")
         except Exception as e:
             logger.warning("会话数据库初始化失败 (非致命): %s", e)
+            self._session_db = None
+
+        # v0.4.0 (Hermes-aligned) — storage middleware wiring.
+        # Build the turn-facade / lifecycle / event-bridge stack so
+        # conversation_loop and progress_notifier can persist turns
+        # without touching raw SessionDB methods.
+        self.turn_facade = None
+        self.storage_lifecycle = None
+        self.storage_bridge = None
+        self.compaction_observer = None
+        if self._session_db is not None:
+            try:
+                from .storage_turn_facade import StorageTurnFacade
+                from .storage_session_lifecycle import StorageSessionLifecycle
+                from .storage_compaction_observer import StorageCompactionObserver
+                from .storage_event_bridge import StorageEventBridge
+                self.turn_facade = StorageTurnFacade(self._session_db)
+                self.storage_lifecycle = StorageSessionLifecycle(self._session_db)
+                self.compaction_observer = StorageCompactionObserver(self._session_db)
+                # progress_notifier is owned by conversation_loop; defer
+                # .attach() until the loop is up.
+                self.storage_bridge = StorageEventBridge(
+                    db=self._session_db,
+                    turn_facade=self.turn_facade,
+                    lifecycle=self.storage_lifecycle,
+                    compaction_observer=self.compaction_observer,
+                )
+                # Attach the bridge to progress_notifier so the
+                # conversation_loop's notify_progress() calls flow
+                # into storage lifecycle (acquire/release/heartbeat).
+                try:
+                    self.storage_bridge.attach()
+                except Exception:  # noqa: BLE001
+                    logger.debug("storage bridge attach failed (non-fatal)",
+                                 exc_info=True)
+                logger.debug("storage bridge wired and attached")
+            except Exception as _sb_exc:  # noqa: BLE001
+                logger.warning("storage bridge init failed (non-fatal): %s", _sb_exc)
+                self.storage_bridge = None
 
         # ── 首启 session 幂等创建（v0.2.8） ──────────────────────
         # 之前：SpiritAgent.__init__ 只设内存 session_id，conversation_loop
@@ -601,6 +652,13 @@ class SpiritAgent:
         self._api_call_count = 0
         self._interrupt_requested = False
         self._cached_system_prompt = None
+        # ── R-P2.2：重置 turn 活性时钟 + 清除 abort 标志 ──
+        with self._activity_lock:
+            self._last_activity_ts = None
+            self._last_activity_desc = None
+            self._turn_liveness_activity_generation = 0
+            self._turn_liveness_aborted = False
+        self._turn_active = False
         self.session_id = str(uuid.uuid4())
         # 目标管理器绑定了旧 session_id —— 丢弃，让 goal_manager property 按新 id 重建。
         self._goal_manager = None
@@ -968,8 +1026,13 @@ class SpiritAgent:
         「(空会话)」。现在每条消息同步落库，db 完整记录对话历史。
         失败隔离：db 落库失败仅 log debug，不阻断主对话循环。
 
-        tool_calls 序列化：db.save_message 直接 INSERT 不做 json.dumps，
-        传 list/dict 会报 `type 'list' is not supported`。这里在调用前序列化。
+        v0.3.0 R-P2.x: assistant 消息拆 thinking 到独立列。
+        Hermes-style: content 仅存最终响应，reasoning 列存完整原文（思考文本）。
+        内存 messages 保留原文（API 回放需要原 content），db content 只存可见文本。
+        可用 strip_thinking=False 关闭（如需审计原始 content）。
+
+        tool_calls 序列化: db.save_message 接受 list/dict → 自动 json.dumps,
+        传 str 则直接使用。
         """
         msg = {"role": role, "content": content}
         msg.update(kwargs)
@@ -984,15 +1047,97 @@ class SpiritAgent:
                         _tool_calls = json.dumps(_tool_calls, ensure_ascii=False)
                     except Exception:
                         _tool_calls = None
+                # v0.3.0: assistant 拆 thinking 到独立列
+                # content 列: 仅最终响应（清洗掉<think>块）
+                # reasoning 列: 完整原文（含 <think> 块），可回放/审计
+                _persist_content = content
+                _persist_reasoning = None
+                if role == "assistant" and kwargs.get("strip_thinking", True):
+                    try:
+                        from spirit.agent.turn_truncation import _strip_think_blocks
+                        _persist_content = _strip_think_blocks(content)
+                        # 仅在原文含思考块时才填 reasoning 列，节省 db 空间
+                        if _persist_content != content:
+                            _persist_reasoning = content
+                    except Exception as _e:  # noqa: BLE001
+                        logger.debug("_strip_think_blocks 失败 (非致命): %s", _e)
                 self._session_db.save_message(
                     self.session_id,
                     role,
-                    content,
+                    _persist_content,
                     tool_calls=_tool_calls,
                     tool_call_id=kwargs.get("tool_call_id"),
+                    reasoning=_persist_reasoning,
                 )
+                # v0.3.0 Stage 5: 自动 title 生成（首条 user msg 触发）
+                if role == "user" and not getattr(self, "_title_set_done", False):
+                    try:
+                        from spirit.storage.titles import maybe_update_title
+                        maybe_update_title(self._session_db, self.session_id, content)
+                        self._title_set_done = True
+                    except Exception as _e:  # noqa: BLE001
+                        logger.debug("auto-title 失败 (非致命): %s", _e)
             except Exception as e:  # noqa: BLE001
                 logger.debug("add_message 落库失败 (非致命): %s", e)
+
+    # ── R-P2.2：turn 活性时钟接口（turn_liveness.py watchdog 调用） ──
+
+    def _touch_activity(self, desc: str = "") -> None:
+        """刷新 turn 活性时钟。在以下调用点注入：
+
+        1. LLM 调用前后（推 generation + 记 "llm_call"）
+        2. 工具执行前/出 stdout 后（记 "tool:<name>"）
+        3. 子任务 checkpoint 阶段（记 "child:progress"）
+        4. 压缩后（记 "compression"）
+        5. 任何产生新消息的时刻 (add_message 后调)
+
+        设计：generation 是单调递增的, 推进后 _last_surfaced_generation
+        失配, watchdog 不会在同一 stall 上刷重复告警。并发场景下
+        _activity_lock 防止 generation 跳号或重复 touch。
+        """
+        import time as _time
+        with self._activity_lock:
+            self._last_activity_ts = _time.time()
+            self._last_activity_desc = desc or None
+            self._turn_liveness_activity_generation += 1
+            # 推进了 generation = 已恢复, 清除被 watchdog 设的 abort 标志
+            # (下轮主循环会重新检查, 但同时进行中的 abort 不受影响)
+            if self._turn_liveness_aborted:
+                # 不重置 abort — 业务语义是“一旦被标记为 abort, 本轮 turn 结束”
+                # 下一轮 turn_start 会重置 _turn_liveness_aborted
+                pass
+
+    def _commit_turn_liveness_abort(self, snapshot, message: str) -> bool:
+        """watchdog 回调：commit abort decision.
+
+        语义: 写 _turn_liveness_aborted=True 表示“本轮 turn 应被主循环下轮 break”。
+        revalidate 防止误杀: 如果 snapshot.generation < 当前 generation,
+        说明生成期间已被触摸过, 不需要 abort。
+        """
+        with self._activity_lock:
+            current_gen = self._turn_liveness_activity_generation
+            if snapshot.generation < current_gen:
+                # 触摸已推进, 不需要 abort (活过来了)
+                logger.debug(
+                    "[R-P2.2] abort 被 veto: snapshot.gen=%d < current.gen=%d "
+                    "(touch 已推进, 表面假死实际已恢复)",
+                    snapshot.generation, current_gen,
+                )
+                return False
+            self._turn_liveness_aborted = True
+        logger.warning(
+            "[R-P2.2] turn 已被 watchdog 标记为 abort: %s (session=%s)",
+            message, self.session_id[:8],
+        )
+        return True
+
+    def _deactivate_turn(self) -> None:
+        """watchdog 回调：释放会话占用. 默认不做事 (没有 lease 概念).
+
+        保留挂载点供后续实现 session lease / Redis 占用锁时挂钩。
+        """
+        # R-P2.2 范围内不实现完整会话 lease; 仅让 watchdog 回调链完整
+        self._turn_active = False
 
     def get_system_prompt(self) -> str:
         """获取系统提示词（动态构建 + 缓存）。

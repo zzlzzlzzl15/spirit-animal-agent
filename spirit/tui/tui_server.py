@@ -5,8 +5,9 @@
 :mod:`spirit.tui.slash_worker` 三模块接成 RPC 的核心逻辑。Hermes 完整服务器里的子进程编排、
 MCP 发现、计费、审批脱敏、compute host 等不在本子集内。
 
-RPC 方法（对齐 Hermes 命名）：``ping`` · ``session.create`` · ``session.list`` ·
-``session.close`` · ``projects.tree`` · ``render.message`` · ``render.diff`` · ``slash.exec``。
+import logging
+
+logger = logging.getLogger(__name__)
 
 **可测试抽象层**：网关是**传输无关**的——:meth:`TuiGateway.handle_message` 是纯同步函数
 （``msg dict -> 响应信封 dict``），所有外部依赖（git ``resolve``、``renderer``、``slash_runner``、
@@ -111,6 +112,16 @@ class TuiGateway:
         self.register("render.message", self._rpc_render_message)
         self.register("render.diff", self._rpc_render_diff)
         self.register("slash.exec", self._rpc_slash_exec)
+
+        # v0.4.0 §13.13 — TUI 同接入 8 个 storage RPC（与 CLI / WS / Electron 同构）
+        # 设计文档要求 tui_gateway / electron / desktop 三处同接入 storage_search /
+        # export / import / rewind 等 6+ 能力。storage_tui_methods 的注册 helper
+        # 失败不回溯（避免 import 链局部断裂击穿整个 gateway）。
+        try:
+            from spirit.agent.storage_tui_methods import register_storage_methods
+            register_storage_methods(self)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("TUI storage RPC auto-registration skipped: %s", exc)
 
     # ------------------------------------------------------------------
     # 信封成形

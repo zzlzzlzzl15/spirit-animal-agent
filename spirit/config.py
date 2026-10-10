@@ -71,6 +71,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "eager_threshold": 15,            # ≤ 此数直接发所有 schema（不用 bridge，避免多跳开销）
             "manifest_budget_pct": 5.0,       # manifest 占 context 总长度的比例（5% ≈ 25.6K chars @ 128K）
         },
+        # R-P2.2：turn 活性 watchdog — LLM 推理 / 工具调度 / 子任务跨进程等全场景假死检测
+        # 单点卡死超时（秒）后弹报警 + 写 agent._turn_liveness_aborted，主循环下轮 break
+        "turn_liveness": {
+            "timeout_s": 600.0,               # 整体空闲超时 (0 = 禁用 watchdog)
+            "poll_s": 15.0,                   # watchdog 轮询间隔
+        },
     },
     # ── 上下文压缩（对话过长时自动摘要） ──────────────────────
     "compression": {

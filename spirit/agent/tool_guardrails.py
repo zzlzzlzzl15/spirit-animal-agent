@@ -71,6 +71,10 @@ class ToolCallGuardrailConfig:
     same_tool_failure_warn_after: int = 3
     same_tool_failure_halt_after: int = 8
 
+    # C-P1.2：同一工具失败达阈值 → 触发 HITL 询问（桌宠气泡让用户拍板）
+    hitl_enabled: bool = True
+    same_tool_failure_hitl_after: int = 3
+
     # 幂等工具无进展（相同结果）
     no_progress_warn_after: int = 2
     no_progress_block_after: int = 5
@@ -114,6 +118,11 @@ class ToolCallGuardrailConfig:
             no_progress_block_after=_positive_int(
                 hard_stop_after.get("idempotent_no_progress", data.get("no_progress_block_after")),
                 defaults.no_progress_block_after,
+            ),
+            hitl_enabled=_as_bool(data.get("hitl_enabled"), defaults.hitl_enabled),
+            same_tool_failure_hitl_after=_positive_int(
+                warn_after.get("same_tool_failure_hitl", data.get("same_tool_failure_hitl_after")),
+                defaults.same_tool_failure_hitl_after,
             ),
         )
 
@@ -239,10 +248,24 @@ class ToolCallGuardrailController:
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: Optional[ToolGuardrailDecision] = None
+        self._hitl_decision: Optional[ToolGuardrailDecision] = None
 
     @property
     def halt_decision(self) -> Optional[ToolGuardrailDecision]:
         return self._halt_decision
+
+    @property
+    def hitl_decision(self) -> Optional[ToolGuardrailDecision]:
+        """C-P1.2：同一工具失败达阈值时置位，供主循环触发 HITL 询问。"""
+        return self._hitl_decision
+
+    def clear_hitl_decision(self) -> None:
+        """清除 HITL 信号（用户已应答，避免同一轮重复弹问）。"""
+        self._hitl_decision = None
+
+    def force_halt(self, decision: ToolGuardrailDecision) -> None:
+        """C-P1.2：把一次 HITL 决策升级为硬停止（用户选择放弃 / fail-open 时）。"""
+        self._halt_decision = decision
 
     def before_call(self, tool_name: str, args: Optional[Mapping[str, Any]]) -> ToolGuardrailDecision:
         """工具调用前的护栏检查。"""
@@ -330,6 +353,22 @@ class ToolCallGuardrailController:
                 )
                 self._halt_decision = decision
                 return decision
+
+            # C-P1.2：同一工具失败达 HITL 阈值 → 置位信号（本轮仅一次），由主对话
+            # 循环消费触发桌宠询问。不改变 after_call 返回值语义（警告照常追加）。
+            if (
+                self.config.hitl_enabled
+                and self._hitl_decision is None
+                and same_count >= self.config.same_tool_failure_hitl_after
+            ):
+                self._hitl_decision = ToolGuardrailDecision(
+                    action="hitl",
+                    code="same_tool_failure_hitl",
+                    message=f"{tool_name} 本轮已连续失败 {same_count} 次，疑似陷入无效重试。",
+                    tool_name=tool_name,
+                    count=same_count,
+                    signature=signature,
+                )
 
             # 警告：完全相同参数失败
             if self.config.warnings_enabled and exact_count >= self.config.exact_failure_warn_after:
