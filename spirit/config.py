@@ -94,6 +94,31 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "streaming": {
         "enabled": False,                     # 是否启用流式 token 输出（逐字显示）
     },
+    # ── 终端显示（CLI / 桌宠）──────────────────────────────
+    "display": {
+        # 实时显示 LLM 中间推理内容（think / reasoning_content 块）。
+        # 默认 True：对齐 Hermes 默认 show_reasoning=True；
+        # 思考模型（ark-code-latest / MiniMax-M3 / DeepSeek R1 / GLM-5 等）下用户能看到
+        # 模型"在思考什么"，而不是只看到 "推理完成 (42s)"。
+        # False 时仅输出 THINKING / THINKING_END 耗时数字。
+        "show_reasoning": True,
+        # 思考内容折叠：>5 行只显示前 5 行 + ``... (+N more lines)``（对齐 Hermes reasoning_full=False）。
+        "reasoning_full": False,
+        # v0.4.x：工具调用详情（对齐 Hermes cli_stream_mixin._on_tool_progress）
+        # 显示工具参数预览（如 ``path=/x/foo.py, recursive=true``）。True 时
+        # TOOL_STARTED / TOOL_GEN_START 阶段打印参数；False 仅打印工具名。
+        "show_tool_args": True,
+        # 工具调用结果预览：True 时 TOOL_COMPLETED 阶段附带 result 摘要。
+        # 折叠长度由 tool_result_max_len 控制（默认 300 字符）。
+        "show_tool_result": True,
+        # 工具结果预览截断长度（字符）。超过此长度用 ``...`` 折叠。
+        "tool_result_max_len": 300,
+        # v0.4.x：流式最终回答（对齐 Hermes _fire_stream_delta）
+        # True 时 STREAM_TEXT_DELTA 事件逐 token 打印到终端（与原有
+        # stream_callback 行为一致）；False 时仅以一行 summary 收尾。
+        # 默认 True：保持现有行为，让用户实时看到模型输出。
+        "show_stream_text": True,
+    },
     # ── Prompt caching（Anthropic 风格 cache_control） ─────────
     "prompt_caching": {
         "enabled": True,                      # 是否启用 prompt caching（减少 ~75% 输入 token 成本）

@@ -144,6 +144,118 @@ def _format_tool_call_summary(tool_calls: List[Dict[str, Any]], max_args: int = 
     return "、".join(parts)
 
 
+# v0.4.x：新增 3 个工具显示辅助 — 对齐 Hermes cli_stream_mixin 风格
+# - _format_tool_args : dict → 单行 ``k=v, k=v`` 预览（与桌宠一致）
+# - _format_tool_result : 字符串 → 折叠截断（多行换行 + 长度上限）
+# - _format_cute_tool_message : 单行 cute 文案（emoji + 工具名 + 摘要 + 耗时）
+
+def _format_tool_args(args: Any, max_len: int = 200) -> str:
+    """格式化工具参数为单行 ``k=v, k=v`` 预览。
+
+    - 嵌套结构：dict / list 会被 str() 后拼接
+    - 过长按 ``max_len`` 截断 + ``...``
+    - 空 / 非 dict → ``""``（由调用方决定是否打印括号）
+    """
+    if not args:
+        return ""
+    if isinstance(args, dict):
+        parts: List[str] = []
+        for k, v in args.items():
+            v_str = "***" if v == "***" else str(v)
+            if len(v_str) > 32:
+                v_str = v_str[:31] + "…"
+            parts.append(f"{k}={v_str}")
+        s = ", ".join(parts)
+    else:
+        s = str(args)
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
+
+
+def _format_tool_result(result: Any, max_len: int = 300) -> str:
+    """把工具结果字符串折叠到 ``max_len`` 字符以内。
+
+    策略：
+    - 多行时只保留首行 + ``…``
+    - 单行过长时尾部截断 + ``…``
+    - 非字符串（list / dict）→ 先 str() 再截断
+    - 空 → ``""``
+    """
+    if result is None:
+        return ""
+    if not isinstance(result, str):
+        try:
+            import json as _json
+            result = _json.dumps(result, ensure_ascii=False)
+        except Exception:
+            result = str(result)
+    if not result:
+        return ""
+    # 多行折叠：只显示首行
+    if "\n" in result:
+        first_line = result.split("\n", 1)[0].rstrip()
+        if len(first_line) > max_len:
+            return first_line[: max_len - 1] + "…"
+        rest_len = len(result) - len(first_line)
+        return f"{first_line} …(+{rest_len} chars)"
+    if len(result) > max_len:
+        return result[: max_len - 1] + "…"
+    return result
+
+
+_CUTE_TOOL_EMOJI = {
+    "read_file": "\U0001f4c4",        # 📄
+    "write_file": "\U0001f4dd",       # 📝
+    "edit_file": "\U0001f58a",        # 🖊
+    "terminal": "\U0001f4bb",         # 💻
+    "execute_code": "\U0001f680",     # 🚀
+    "search_files": "\U0001f50d",     # 🔍
+    "grep": "\U0001f50d",
+    "web_search": "\U0001f310",       # 🌐
+    "web_fetch": "\U0001f310",
+    "delegate_task": "\U0001f465",    # 👥
+    "todo": "\U0001f4cb",             # 📋
+    "image_analysis": "\U0001f5bc",   # 🖼
+    "memora_search": "\U0001f4da",    # 📚
+    "memora_save": "\U0001f4be",      # 💾
+}
+_DEFAULT_TOOL_EMOJI = "\u26a1"        # ⚡
+
+
+def _format_cute_tool_message(
+    name: str,
+    args: Any = None,
+    duration_ms: Optional[int] = None,
+    result: Any = None,
+    is_error: bool = False,
+) -> str:
+    """单行 cute 工具消息（emoji + 工具名 + 摘要 + 耗时 + 状态）。
+
+    对齐 Hermes ``get_cute_tool_message(name, args, duration, result=...)`` 字段；
+    spirit 版额外附 is_error 时换红色 ⚠️。
+    """
+    emoji = _CUTE_TOOL_EMOJI.get(name, _DEFAULT_TOOL_EMOJI)
+    status_icon = "⚠️ " if is_error else "✓ "
+    parts: List[str] = [f"{emoji} {status_icon}{name}"]
+    arg_preview = _format_tool_args(args, max_len=120)
+    if arg_preview:
+        parts.append(f"({arg_preview})")
+    if duration_ms is not None:
+        parts.append(f"({duration_ms / 1000:.1f}s)")
+    if result is not None and not is_error:
+        result_preview = _format_tool_result(result, max_len=120)
+        if result_preview:
+            parts.append(f"→ {result_preview}")
+    return " ".join(parts)
+
+
+# v0.4.x：最终回答流式 box 管理（对齐 _ReasoningStream）
+# STREAM_TEXT_DELTA 逐 token 到达时累积到 buffer；
+# STREAM_TEXT_END 时按自然边界 flush + 折叠。
+# 单一职责：管理一个流式回答的渲染生命周期，避免重复 box 互相覆盖。
+
+
 # ---------------------------------------------------------------------------
 # 阶段进度事件渲染（register_progress_sink 的 sink 回调）
 # ---------------------------------------------------------------------------
@@ -151,6 +263,153 @@ def _format_tool_call_summary(tool_calls: List[Dict[str, Any]], max_args: int = 
 # conversation_loop 推送 7 阶段，本函数负责逐阶段渲染到 console（不在
 # Live(Spinner) 里渲染——避免 spinner 刷新覆盖阶段标题、阶段行产生越级）。
 # ---------------------------------------------------------------------------
+
+
+class _ReasoningStream:
+    """推理内容流式渲染缓冲。
+
+    REASONING_DELTA 事件按 token 粒度到达（一个词、一个标点都可能一条）。
+    直接逐条打印会刷屏——模仿 Hermes 的 _flush_reasoning_preview：累积到
+    自然边界（换行 / 句末标点 / >80 字符）才 emit 一行，REASONING_END 时 force flush。
+
+    设计：
+    - 轮次间不重置 buffer 会有跨轮泄露问题——在 REASONING_END + THINKING_END 双重信号
+      下清空，避免中途断连丢尾巴。
+    - 折叠输出：超过 5 行只显示前 5 行 + ``... (+N more lines)``（对齐 Hermes ``reasoning_full=False``）。
+    - 单例：模块级 _reasoning_stream，所有 REASONING_DELTA 事件共用一个 buffer。
+    """
+
+    def __init__(self) -> None:
+        self._buf: str = ""
+        self._active: bool = False  # 当前是否在收 reasoning delta
+        self._emitted_lines: int = 0  # 本轮已打印的行数（用于折叠）
+        self._printed_full: bool = False  # 本轮是否已打印折叠后的完整 preview（避免 REASONING_END 重复打印）
+
+    def reset(self) -> None:
+        """轮次开始时调用。"""
+        self._buf = ""
+        self._active = True
+        self._emitted_lines = 0
+        self._printed_full = False
+
+    def feed(self, piece: str) -> Optional[str]:
+        """累积一个增量。返回需要立即打印的一行（可能有，也可能没有）。"""
+        if not self._active or not piece:
+            return None
+        self._buf += piece
+        # 自然边界：换行 / 句末标点 / >80 字符强制 flush
+        target_width = 80
+        if "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip()
+            if line:
+                self._emitted_lines += 1
+                return line
+        elif len(self._buf) >= target_width:
+            # 强制按词边界切
+            cut = max(
+                self._buf.rfind(b)
+                for b in (" ", "\t", ".", "!", "?", ",", ";", ":")
+            )
+            if cut != -1 and cut >= target_width // 2:
+                line, self._buf = self._buf[: cut + 1], self._buf[cut + 1 :]
+                self._emitted_lines += 1
+                return line
+        return None
+
+    def flush(self) -> Optional[str]:
+        """轮次结束时调用——刷出尾部剩余 + 返回可选的折叠提示行。"""
+        if not self._active:
+            return None
+        self._active = False
+        tail = self._buf.strip()
+        self._buf = ""
+        if not tail:
+            return None
+        self._emitted_lines += 1
+        # 注意：本轮不再打印 tail 本身（已在中途分批发完或根本没收到），
+        # 这里只返回可能的折叠提示。
+        return None
+
+    def fold_preview(self) -> Optional[str]:
+        """轮结束后想重看完整 reasoning preview 时调用——返回 ``... (+N more lines)`` 之类的提示。
+
+        本函数暂未使用，预留给 /verbose 之类的子命令。
+        """
+        if self._emitted_lines <= 5:
+            return None
+        return f"... (+{self._emitted_lines - 5} more lines)"
+
+
+class _StreamTextBox:
+    """最终回答流式渲染缓冲（v0.4.x，对齐 _ReasoningStream）。
+
+    职责：
+    - STREAM_TEXT_DELTA 事件累积到 buffer（逐 chunk 到达）
+    - 按自然边界（换行 / 句末标点 / >120 字符）flush 一行到 console
+    - STREAM_TEXT_END 时刷出尾部剩余
+    - 重复 box / 跨轮泄漏防护：active 标志 + reset() 钩子
+
+    与 _ReasoningStream 的差异：
+    - 触发源不同：REASONING_DELTA（reasoning_content）vs STREAM_TEXT_DELTA（content）
+    - 行宽度更宽（120 vs 80，因为最终回答通常比思考长）
+    - 默认直接 console.print 而非 [dim] 灰色（最终回答要高亮）
+    """
+
+    def __init__(self) -> None:
+        self._buf: str = ""
+        self._active: bool = False
+        self._emitted_lines: int = 0
+        self._target_width: int = 120
+
+    def reset(self) -> None:
+        """轮次开始时调用（TASK_START 触发）。"""
+        self._buf = ""
+        self._active = True
+        self._emitted_lines = 0
+
+    def feed(self, piece: str) -> Optional[str]:
+        """累积一个增量；返回需要立即打印的一行（无则 None）。"""
+        if not self._active or not piece:
+            return None
+        self._buf += piece
+        if "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            line = line.rstrip()
+            if line:
+                self._emitted_lines += 1
+                return line
+        elif len(self._buf) >= self._target_width:
+            cut = max(
+                self._buf.rfind(b)
+                for b in (" ", "\t", ".", "!", "?", ",", ";", ":")
+            )
+            if cut != -1 and cut >= self._target_width // 2:
+                line, self._buf = self._buf[: cut + 1], self._buf[cut + 1 :]
+                self._emitted_lines += 1
+                return line
+        return None
+
+    def flush(self) -> Optional[str]:
+        """STREAM_TEXT_END 时调用 — 刷出剩余 buffer。返回剩余一行（可能 None）。"""
+        if not self._active:
+            return None
+        self._active = False
+        tail = self._buf.strip()
+        self._buf = ""
+        if tail:
+            self._emitted_lines += 1
+            return tail
+        return None
+
+
+# 模块级单例：所有 STREAM_TEXT_DELTA / STREAM_TEXT_END 事件共享一个 buffer
+_stream_text_box = _StreamTextBox()
+
+
+# 模块级单例：所有 REASONING_DELTA 事件共享一个 buffer
+_reasoning_stream = _ReasoningStream()
+
 
 def _render_progress(event: Dict[str, Any]) -> None:
     """progress_notifier 推送的事件 sink：渲染到 CLI 终端。
@@ -180,9 +439,47 @@ def _render_progress(event: Dict[str, Any]) -> None:
         duration_ms = _get("duration_ms")
         if phase == ProgressPhase.TASK_START.value:
             console.print(f"  [bold yellow]─── 任务开始[/bold yellow]  [dim]{_truncate(summary, 70)}[/dim]")
+            # 新一轮：重置推理 stream + 流式回答 box，准备接收本轮 events
+            _reasoning_stream.reset()
+            _stream_text_box.reset()
         elif phase == ProgressPhase.THINKING.value:
             # 思考开始——不输出独立行（Live(Spinner) 正在显示），仅记录迭代
+            _reasoning_stream.reset()
             pass
+        elif phase == ProgressPhase.REASONING_DELTA.value:
+            # 推理内容增量：累积后按自然边界打印（避免一词一行刷屏）
+            # 由 config.display.show_reasoning 控制总开关（默认 True）
+            try:
+                _show_reasoning = True
+                try:
+                    from spirit.config import load_config
+                    _cfg = load_config().get("display", {}) if isinstance(load_config(), dict) else {}
+                    if isinstance(_cfg, dict) and "show_reasoning" in _cfg:
+                        _show_reasoning = bool(_cfg["show_reasoning"])
+                except Exception:
+                    pass
+                if _show_reasoning:
+                    text = _get("text", "")
+                    if text:
+                        line = _reasoning_stream.feed(text)
+                        if line is not None:
+                            console.print(f"  [dim]💭 {line}[/dim]", highlight=False)
+            except Exception as _rd_exc:
+                # v0.4.x：避免完全静默 — 输出 dim yellow 一行（不阻塞主循环）
+                # 调试时定位到 REASONING_DELTA 渲染失败但用户看不见的问题。
+                try:
+                    console.print(
+                        f"  [dim yellow]⚠ reasoning render 异常: {_rd_exc}[/dim yellow]",
+                        highlight=False,
+                    )
+                except Exception:
+                    pass
+        elif phase == ProgressPhase.REASONING_END.value:
+            # 推理流结束：刷尾部剩余（如果有）
+            try:
+                _reasoning_stream.flush()
+            except Exception:
+                pass
         elif phase == ProgressPhase.THINKING_END.value:
             if duration_ms is not None:
                 console.print(
@@ -202,6 +499,116 @@ def _render_progress(event: Dict[str, Any]) -> None:
             console.print(
                 f"  [green]✓[/green] [dim]完成[/dim] [bold]{summary}[/bold]{count_tail} [dim]({ms / 1000:.1f}s)[/dim]"
             )
+        # ── v0.4.x：新阶段分支（对齐 Hermes 工具生命周期 / 流式回答）─────
+        elif phase == ProgressPhase.TOOL_GEN_START.value:
+            # LLM 开始生成工具参数 — 显示 preparing spinner，让长参数生成期不"面观天亮"
+            tool_name = _get("tool_name") or summary or "?"
+            console.print(
+                f"  [dim cyan]┊ ⚡ preparing {tool_name}…[/dim cyan]",
+                highlight=False,
+            )
+        elif phase == ProgressPhase.TOOL_STARTED.value:
+            # 工具启动 — 显示工具名 + 参数预览（受 show_tool_args 控制）
+            name = _get("tool_name") or summary or "?"
+            args = _get("function_args") or {}
+            display_args = _get("display_args") or args
+            preview = _get("preview") or _format_tool_args(display_args)
+            try:
+                _show_args = True
+                from spirit.config import load_config as _lc
+                _dc = _lc().get("display", {})
+                if isinstance(_dc, dict) and "show_tool_args" in _dc:
+                    _show_args = bool(_dc["show_tool_args"])
+            except Exception:
+                _show_args = True
+            if _show_args and preview:
+                console.print(
+                    f"  [dim cyan]┊ {name}[/dim cyan]([yellow]{preview}[/yellow])",
+                    highlight=False,
+                )
+            else:
+                console.print(
+                    f"  [dim cyan]┊ {name}[/dim cyan]()",
+                    highlight=False,
+                )
+        elif phase == ProgressPhase.TOOL_COMPLETED.value:
+            # 工具完成 — 单行 cute 消息（受 show_tool_result 控制）
+            name = _get("tool_name") or summary or "?"
+            duration = (_get("duration_ms") or 0) / 1000.0
+            is_error = bool(_get("is_error"))
+            result = _get("result", "")
+            try:
+                _show_result = True
+                _max_len = 300
+                from spirit.config import load_config as _lc
+                _dc = _lc().get("display", {})
+                if isinstance(_dc, dict):
+                    if "show_tool_result" in _dc:
+                        _show_result = bool(_dc["show_tool_result"])
+                    if "tool_result_max_len" in _dc:
+                        _max_len = int(_dc["tool_result_max_len"])
+            except Exception:
+                _show_result = True
+                _max_len = 300
+            icon = "✗" if is_error else "✓"
+            color = "red" if is_error else "green"
+            duration_ms = int((_get("duration_ms") or 0))
+            if _show_result:
+                cute = _format_cute_tool_message(
+                    name=name,
+                    args=_get("display_args") or _get("function_args"),
+                    duration_ms=duration_ms,
+                    result=result,
+                    is_error=is_error,
+                )
+                console.print(f"  [{color}]{cute}[/{color}]", highlight=False)
+            else:
+                # 仅显示耗时行（关闭 show_tool_result 时）
+                console.print(
+                    f"  [{color}]{icon}[/{color}] [bold]{name}[/bold] "
+                    f"[dim]({duration:.1f}s)[/dim]",
+                    highlight=False,
+                )
+        elif phase == ProgressPhase.STREAM_TEXT_DELTA.value:
+            # 最终回答流式 token — 按自然边界 flush（受 show_stream_text 控制）
+            try:
+                _show_stream = True
+                from spirit.config import load_config as _lc
+                _dc = _lc().get("display", {})
+                if isinstance(_dc, dict) and "show_stream_text" in _dc:
+                    _show_stream = bool(_dc["show_stream_text"])
+            except Exception:
+                _show_stream = True
+            if _show_stream:
+                text = _get("text", "")
+                if text:
+                    line = _stream_text_box.feed(text)
+                    if line is not None:
+                        console.print(f"  {line}", highlight=False)
+        elif phase == ProgressPhase.STREAM_TEXT_END.value:
+            # 流式结束 — 刷出尾部剩余
+            try:
+                tail = _stream_text_box.flush()
+                if tail:
+                    console.print(f"  {tail}", highlight=False)
+            except Exception:
+                pass
+        elif phase == ProgressPhase.THINKING_AVAILABLE.value:
+            # 整段思考文本落地（非流式）— 按行折叠
+            thinking_text = _get("thinking_text", "")
+            if thinking_text:
+                lines = thinking_text.split("\n")
+                for line in lines[:5]:
+                    if line.strip():
+                        console.print(
+                            f"  [dim]💭 {line.strip()}[/dim]",
+                            highlight=False,
+                        )
+                if len(lines) > 5:
+                    console.print(
+                        f"  [dim]… (+{len(lines) - 5} more lines)[/dim]",
+                        highlight=False,
+                    )
         elif phase == ProgressPhase.TASK_COMPLETE.value:
             reason = _get("reason", "")
             tail = f"  [dim]({reason})[/dim]" if reason else ""

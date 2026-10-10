@@ -99,11 +99,83 @@ class ProgressPhase(str, enum.Enum):
     THINKING_END = "thinking_end"
     """LLM 推理结束（含 duration_ms）。"""
 
+    REASONING_DELTA = "reasoning_delta"
+    """LLM 推理内容增量（reasoning_content 流式 token，含 ``text`` 字段）。
+
+    仅当上游 LLM 走原生 reasoning_content 字段时（如 DeepSeek R1 / Qwen3 thinking /
+    GLM-5 / MiniMax-M3 / 火山方舟 ark-code-latest 等）才会触发；普通非 thinking 模型
+    不会广播此事件。监听此事件即可像 Hermes 那样实时看到模型中间的思考文本，而
+    不仅有 ``THINKING`` / ``THINKING_END`` 的耗时数字。
+    """
+
+    REASONING_END = "reasoning_end"
+    """LLM 推理内容流结束（轮内 reasoning_content 已完整落地）。
+
+    用于关闭已开启的 reasoning 渲染盒子（避免下一轮 tool_call 把内容混进
+    当前 box）。"""
+
     TOOL_CALL = "tool_call"
-    """决定调用工具（含 tool_name + summary）。"""
+    """决定调用工具（含 tool_name + summary）。
+
+    Deprecated：新代码请发 :attr:`TOOL_GEN_START` + :attr:`TOOL_STARTED` +
+    :attr:`TOOL_COMPLETED` 三阶段事件（对齐 Hermes ``tool.gen_start / tool.started /
+    tool.completed``），能携带工具参数 / 预览 / 结果 / is_error。保留本枚举值是为
+    不破坏现有 sink（ws_server.py 等只看 ``count + summary`` 的旧客户端）。
+    """
 
     TOOL_RESULT = "tool_result"
-    """工具执行完成（含 tool_name + classification）。"""
+    """工具执行完成（含 tool_name + classification）。
+
+    Deprecated：见 :attr:`TOOL_CALL` 的 deprecation 说明；新代码请发
+    :attr:`TOOL_COMPLETED`（带 ``result / is_error / duration_ms`` 详情）。
+    """
+
+    # ── v0.4.x：工具生命周期三阶段（对齐 Hermes tool_progress_callback）─────
+    TOOL_GEN_START = "tool_gen_start"
+    """LLM 开始生成 tool_call 参数（Hermes ``_fire_tool_gen_started``）。
+
+    触发位置：conversation_loop 解析完 tool_calls_dicts、但尚未 execute 之前。
+    用于 CLI 显示 ``┊ ⚡ preparing <tool_name>…`` spinner（长参数生成期间不干等）。
+    extra 含 ``tool_name``（单工具时）或 ``summary``（多工具名拼接）+ ``count``。
+    """
+
+    TOOL_STARTED = "tool_started"
+    """工具启动（已收完参数 + 已 send 调度）。
+
+    extra 含 ``tool_name / function_args / preview / display_args``：
+    - ``tool_name``：函数名（如 ``read_file``）
+    - ``function_args``：完整参数字典（原始未转字符串，供桌宠折叠 / 高亮）
+    - ``preview``：单行预览字符串（如 ``path=/x/foo.py``）
+    - ``display_args``：经 ``_redact_tool_args_for_display`` 脱敏的展示用 dict
+    """
+
+    TOOL_COMPLETED = "tool_completed"
+    """工具执行完成（对齐 Hermes ``tool.completed``）。
+
+    extra 含 ``tool_name / function_args / result / is_error / duration_ms / status /
+    error_type``。``status`` 取 ``success`` / ``error``；``error_type`` 仅错误时存在
+    （如 ``timeout`` / ``exception`` / ``permission_denied``）。
+    """
+
+    # ── v0.4.x：LLM 最终回答流式事件（对齐 Hermes ``_fire_stream_delta``）──
+    STREAM_TEXT_DELTA = "stream_text_delta"
+    """LLM 最终回答的 content delta 流式 token。
+
+    仅当模型走原生 ``delta.content`` 流时触发（与 :attr:`REASONING_DELTA` 不同——
+    那个走 ``delta.reasoning_content``）。CLI 可在 STREAM_TEXT_END 时关掉 box。
+    extra 含 ``text``（增量字符串）。
+    """
+
+    STREAM_TEXT_END = "stream_text_end"
+    """LLM 最终回答流式结束（响应结束）。用于关闭 :class:`_StreamTextBox` 单例。"""
+
+    THINKING_AVAILABLE = "thinking_available"
+    """思考块整段落地（Hermes ``reasoning.available``，非流式）。
+
+    与 :attr:`REASONING_DELTA` 不同——后者是逐 token 流式（每段 reasoning 都触发）；
+    本事件是整段思考文本一次性落地（用于非思考模型回填 / 子代理向父显示）。
+    extra 含 ``thinking_text``。
+    """
 
     TASK_COMPLETE = "task_complete"
     """任务最终回答已生成（含 summary 摘要）。"""
@@ -239,7 +311,9 @@ def notify_progress(
             extra=extra,
         )
     except Exception as exc:  # noqa: BLE001
-        logger.debug("[C-P1.1] 构造 progress event 失败（非致命）: %s", exc)
+        # v0.4.x 升级：构造失败从 debug 升 warning — 之前完全静默让 REASONING_DELTA
+        # 等事件调试时找不到根因（spirit/cli/main.py 也吞，链路看不见）。
+        logger.warning("[C-P1.1] 构造 progress event 失败: phase=%s exc=%s", phase, exc)
         return
 
     with _sinks_lock:
@@ -249,7 +323,11 @@ def notify_progress(
         try:
             sink(event)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("[C-P1.1] progress sink 异常（非致命）: %s", exc)
+            # 单 sink 异常升级 warning，避免 sink bug 把整条进度链拖死但无人察觉
+            logger.warning(
+                "[C-P1.1] progress sink 异常（非致命）: phase=%s exc=%s",
+                phase, exc,
+            )
 
 
 # =========================================================================

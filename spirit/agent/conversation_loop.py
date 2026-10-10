@@ -697,6 +697,28 @@ def run_conversation(
                 extra={"count": len(_tool_names)},
             )
 
+            # v0.4.x：进度事件 — 工具参数生成阶段（TOOL_GEN_START）
+            # 对齐 Hermes _fire_tool_gen_started；多工具时透传 summary，单工具
+            # 时透传 _tool_names[0] 让 sink 可以区分多 vs 单。
+            try:
+                notify_progress(
+                    ProgressPhase.TOOL_GEN_START,
+                    iterations=api_call_count,
+                    tool_name=(
+                        _tool_names[0] if len(_tool_names) == 1 else None
+                    ),
+                    summary=_tool_summary,
+                    extra={
+                        "tool_name": (
+                            _tool_names[0] if len(_tool_names) == 1 else None
+                        ),
+                        "summary": _tool_summary,
+                        "count": len(_tool_names),
+                    },
+                )
+            except Exception:
+                logger.debug("TOOL_GEN_START 推送失败（非致命）", exc_info=True)
+
             # 执行工具（同步阻塞 — 按记忆 5d01f921：钩子 + execute 都是同步路径）
             if len(tool_calls_dicts) > 1:
                 # 并发执行
@@ -1339,6 +1361,7 @@ def _call_llm(
 
     content_parts: List[str] = []
     pushed_parts: List[str] = []
+    reasoning_parts: List[str] = []
     tc_buffers: Dict[int, Dict[str, str]] = {}
     finish_reason = None
     usage = None
@@ -1357,6 +1380,26 @@ def _call_llm(
         if delta is None:
             continue
 
+        # ── reasoning_content 增量（Hermes-style 实时思考）────────────
+        # 上游 LLM 走原生 reasoning_content 字段时（DeepSeek R1 / Qwen3 thinking /
+        # GLM-5 / MiniMax-M3 / 火山方舟 ark-code-latest 等），每个 delta 会带一段推理 token。
+        # 推到 progress_notifier 全局 sink 总线：CLI / 桌宠各自注册 sink 渲染（不写入 SQLite，
+        # 不混入 messages.content，遵循 spirit 不持久化中间思考过程的策略）。
+        reasoning_piece = getattr(delta, "reasoning_content", None)
+        if not reasoning_piece and hasattr(delta, "model_extra"):
+            _de = getattr(delta, "model_extra", None) or {}
+            if isinstance(_de, dict):
+                reasoning_piece = _de.get("reasoning_content")
+        if reasoning_piece:
+            reasoning_parts.append(reasoning_piece)
+            try:
+                notify_progress(
+                    ProgressPhase.REASONING_DELTA,
+                    extra={"text": reasoning_piece},
+                )
+            except Exception:
+                logger.debug("REASONING_DELTA 推送失败（非致命）", exc_info=True)
+
         piece = getattr(delta, "content", None) or ""
         if piece:
             content_parts.append(piece)
@@ -1369,6 +1412,16 @@ def _call_llm(
                         pushed_parts.append(piece)
                     except Exception:
                         logger.debug("流式增量推送失败", exc_info=True)
+                    # v0.4.x：进度事件 — 最终回答流式（STREAM_TEXT_DELTA）
+                    # 与 stream_callback 同一位置推送，确保 sink 看到的与终端一致
+                    # （gate 关闭 / think / tool_call 块开始时不推，避免泄露给桌宠）
+                    try:
+                        notify_progress(
+                            ProgressPhase.STREAM_TEXT_DELTA,
+                            extra={"text": piece},
+                        )
+                    except Exception:
+                        logger.debug("STREAM_TEXT_DELTA 推送失败（非致命）", exc_info=True)
 
         # 原生 tool_calls 增量累积
         if getattr(delta, "tool_calls", None):
@@ -1387,6 +1440,25 @@ def _call_llm(
     if wd["kill"]:
         # 流被 close 静默结束（未抛异常）：同样抛超时进重试循环
         raise StreamStaleTimeoutError(wd["kill"])
+
+    # ── 推理流结束信号（让 CLI / 桌宠 flush 推理尾巴）────────────────
+    # 只在本轮有 reasoning 时 emit；普通模型不会触发。
+    if reasoning_parts:
+        try:
+            notify_progress(ProgressPhase.REASONING_END)
+        except Exception:
+            logger.debug("REASONING_END 推送失败（非致命）", exc_info=True)
+
+    # v0.4.x：流式结束信号 — 最终回答（STREAM_TEXT_END）
+    # 与 REASONING_END 平行；有内容 delta 才发（避免空响应时开空 box）。
+    if content_parts:
+        try:
+            notify_progress(
+                ProgressPhase.STREAM_TEXT_END,
+                extra={"text": "".join(content_parts)},
+            )
+        except Exception:
+            logger.debug("STREAM_TEXT_END 推送失败（非致命）", exc_info=True)
 
     # 组装为与非流式一致的响应结构
     tool_calls_objs = [

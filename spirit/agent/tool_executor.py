@@ -38,7 +38,73 @@ from spirit.agent.tool_liveness import (
     create_default_liveness_detector,
 )
 
+# v0.4.x：工具进度事件总线（C-P1.1 接线）
+# spirit/agent/conversation_loop.py 在 execute 前发 TOOL_GEN_START；
+# 本模块在每个工具启动 / 完成时发 TOOL_STARTED / TOOL_COMPLETED
+# （对齐 Hermes tool.started / tool.completed）。
+from spirit.agent.progress_notifier import ProgressPhase, notify_progress
+
 logger = logging.getLogger(__name__)
+
+# v0.4.x：工具参数脱敏 + 预览拼接（CLI / 桌宠显示用）
+# 现有 spirit 还没有专门的 redact 模块；这里 inline 简单实现，避免暴露 API key
+# / 密码 / token 等敏感字段。完整脱敏矩阵可后续独立抽模块。
+_SENSITIVE_ARG_KEYS = {
+    "api_key", "apikey", "api-key",
+    "token", "access_token", "refresh_token", "auth_token", "bearer_token",
+    "password", "passwd", "secret",
+    "private_key", "client_secret",
+}
+
+
+def _redact_tool_args_for_display(args: Any) -> Any:
+    """对工具参数做键名级脱敏，供桌宠 / CLI 安全显示。
+
+    规则：
+    - 键名命中敏感集合 → 替换值为 ``"***"``（保留长度提示）
+    - 嵌套 dict 递归；list 逐项
+    - 顶层不是 dict（如 str）→ 原样返回
+    """
+    if isinstance(args, dict):
+        out: Dict[str, Any] = {}
+        for k, v in args.items():
+            if k.lower() in _SENSITIVE_ARG_KEYS:
+                out[k] = "***"
+            elif isinstance(v, (dict, list)):
+                out[k] = _redact_tool_args_for_display(v)
+            else:
+                out[k] = v
+        return out
+    if isinstance(args, list):
+        return [_redact_tool_args_for_display(item) for item in args]
+    return args
+
+
+def _format_tool_args_preview(args: Any, max_len: int = 80) -> str:
+    """把工具参数格式化为一行预览字符串（供 CLI ``┊ name(preview)`` 显示）。
+
+    - 优先用 ``key=value`` 拼接
+    - 过长按 ``max_len`` 截断 + ``...``
+    - 空参数 → ``""``
+    - 含敏感字段已先经 ``_redact_tool_args_for_display`` 处理
+    """
+    if not args:
+        return ""
+    if isinstance(args, dict):
+        parts: List[str] = []
+        for k, v in args.items():
+            v_str = "***" if v == "***" else str(v)
+            if len(v_str) > 24:
+                v_str = v_str[:23] + "…"
+            parts.append(f"{k}={v_str}")
+        s = ", ".join(parts)
+        if len(s) > max_len:
+            s = s[: max_len - 1] + "…"
+        return s
+    s = str(args)
+    if len(s) > max_len:
+        s = s[: max_len - 1] + "…"
+    return s
 
 # 最大并发工作线程
 _MAX_TOOL_WORKERS = 8
@@ -294,12 +360,61 @@ def execute_tool_calls_sequential(
         # 自定义软超时阈值
         detector.config.single_tool_soft_warn_s = single_tool_soft_warn_s
 
+        # v0.4.x：进度事件 — 工具启动（TOOL_STARTED）
+        # 解析参数、脱敏、构造预览；异常隔离，失败也不阻断执行。
+        _tcall_args, _tcall_parse_err = parse_tool_arguments(
+            tool_call.get("function", {}).get("arguments", "{}"),
+        )
+        _tcall_display_args = _redact_tool_args_for_display(_tcall_args)
+        _tcall_preview = _format_tool_args_preview(_tcall_display_args)
+        try:
+            notify_progress(
+                ProgressPhase.TOOL_STARTED,
+                tool_name=tool_name_for_detector,
+                summary=_tcall_preview or tool_name_for_detector,
+                extra={
+                    "tool_name": tool_name_for_detector,
+                    "function_args": _tcall_args,
+                    "display_args": _tcall_display_args,
+                    "preview": _tcall_preview,
+                },
+            )
+        except Exception:
+            logger.debug("TOOL_STARTED 推送失败（非致命）", exc_info=True)
+
+        _tcall_started = time.monotonic()
         result, tool_name, guardrail_decision = execute_single_tool(
             agent,
             tool_call=tool_call,
             guardrails=guardrails,
             detector=detector,
         )
+        _tcall_duration_ms = (time.monotonic() - _tcall_started) * 1000.0
+
+        # v0.4.x：进度事件 — 工具完成（TOOL_COMPLETED）
+        # is_error 不分类；与 Hermes _on_tool_progress 字段对齐。
+        _classified_for_progress = classify_tool_result(tool_name, result)
+        _is_error = bool(_classified_for_progress.is_failure)
+        try:
+            notify_progress(
+                ProgressPhase.TOOL_COMPLETED,
+                tool_name=tool_name,
+                summary=tool_name,
+                extra={
+                    "tool_name": tool_name,
+                    "function_args": _tcall_args,
+                    "result": result,
+                    "is_error": _is_error,
+                    "status": "error" if _is_error else "success",
+                    "duration_ms": _tcall_duration_ms,
+                    "error_type": (
+                        _classified_for_progress.category.value
+                        if _is_error and _classified_for_progress is not None else None
+                    ),
+                },
+            )
+        except Exception:
+            logger.debug("TOOL_COMPLETED 推送失败（非致命）", exc_info=True)
 
         # 分类工具结果（新分类器：让 LLM 看到分类指引）
         classified = classify_tool_result(tool_name, result)
@@ -413,6 +528,26 @@ def execute_tool_calls_concurrent(
         for idx, (tc, name, args) in enumerate(to_execute):
             _emit_hook(agent, "before_tool_execute", tool_name=name, tool_args=args)
             start_times[idx] = time.time()
+
+            # v0.4.x：进度事件 — 工具启动（TOOL_STARTED，并发路径）
+            # 在 submit 前发；args 已是 parse 后的 dict
+            _tcall_display_args = _redact_tool_args_for_display(args)
+            _tcall_preview = _format_tool_args_preview(_tcall_display_args)
+            try:
+                notify_progress(
+                    ProgressPhase.TOOL_STARTED,
+                    tool_name=name,
+                    summary=_tcall_preview or name,
+                    extra={
+                        "tool_name": name,
+                        "function_args": args,
+                        "display_args": _tcall_display_args,
+                        "preview": _tcall_preview,
+                    },
+                )
+            except Exception:
+                logger.debug("TOOL_STARTED 推送失败（非致命）", exc_info=True)
+
             future = executor.submit(_run_tool_safe, agent, name, args)
             future_to_idx[future] = idx
 
@@ -510,6 +645,31 @@ def execute_tool_calls_concurrent(
             tool_name=name, tool_args=args, tool_result=result,
             duration_ms=duration_ms, args=args, result=result,
         )
+
+        # v0.4.x：进度事件 — 工具完成（TOOL_COMPLETED，并发路径）
+        # 分类放在 hook 之后（沿用下方 ``classified``），但要先算好避免重分类。
+        _concurrent_classified = classify_tool_result(name, result)
+        _concurrent_is_error = bool(_concurrent_classified.is_failure)
+        try:
+            notify_progress(
+                ProgressPhase.TOOL_COMPLETED,
+                tool_name=name,
+                summary=name,
+                extra={
+                    "tool_name": name,
+                    "function_args": args,
+                    "result": result,
+                    "is_error": _concurrent_is_error,
+                    "status": "error" if _concurrent_is_error else "success",
+                    "duration_ms": duration_ms,
+                    "error_type": (
+                        _concurrent_classified.category.value
+                        if _concurrent_is_error and _concurrent_classified is not None else None
+                    ),
+                },
+            )
+        except Exception:
+            logger.debug("TOOL_COMPLETED 推送失败（非致命）", exc_info=True)
 
         # 护栏后检
         guardrail_decision = None
