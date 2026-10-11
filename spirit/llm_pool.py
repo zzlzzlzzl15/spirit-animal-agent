@@ -37,7 +37,23 @@ logger = logging.getLogger(__name__)
 _CACHE: Dict[str, Any] = {"picked": None, "ts": 0.0}
 CACHE_TTL = 300.0  # 秒
 
-_THINK_RE = re.compile(r"<think>.*?</tool_response>", re.S)
+# 思考/推理块剥离（HF-001 修复）。
+# 旧正则锚点错误：结束标签写成了 </tool_response>（那是工具调用响应的结束），
+# 真正的 think 结束标签是 </think> 等，导致纯思考块（无正文）剥不掉 → probe 误判健康。
+# 与 spirit/agent/storage_think_scrubber.py 的 5 标签分类保持一致，但本模块刻意
+# 自包含（只依赖标准库 + PyYAML，可供 Spirit/Hermes/批量三方安全引用），故内联正则。
+_THINK_TAG_NAMES = ("think", "thinking", "reasoning", "thought", "REASONING_SCRATCHPAD")
+_THINK_RE = re.compile(
+    r"<(?:" + "|".join(_THINK_TAG_NAMES) + r")\b[^>]*>.*?</(?:" + "|".join(_THINK_TAG_NAMES) + r")>",
+    re.S | re.I,
+)
+# 未闭合的残留开标签（思考模型只吐了 <think> 推理、正文被 max_tokens 截断时）。
+# 锡定响应开头（^\s*）：思考模型的推理块恒在最前面；避免误吞正文中间“提到 <think> 字样”
+# 的正常回答（如模型在解释该标签的用法）。
+_THINK_OPEN_RE = re.compile(
+    r"^\s*<(?:" + "|".join(_THINK_TAG_NAMES) + r")\b[^>]*>.*$",
+    re.S | re.I,
+)
 
 
 def _config_path() -> Path:
@@ -149,9 +165,19 @@ def probe(p: Dict[str, Any], timeout: int = 30) -> bool:
     try:
         resp = _u.urlopen(req, timeout=timeout)
         data = json.loads(resp.read().decode("utf-8"))
-        msg = (data["choices"][0]["message"].get("content") or "")
-        txt = _THINK_RE.sub("", msg).strip()
-        # Qwen3 思考模型可能把推理放 reasoning_content，content 仍应有答案
+        message = data["choices"][0].get("message") or {}
+        msg = message.get("content") or ""
+        # 剥离成对思考块 + 未闭合的残留开标签，剩下的才是可用正文
+        txt = _THINK_OPEN_RE.sub("", _THINK_RE.sub("", msg)).strip()
+        # Qwen3 / DeepSeek-R1 等思考模型把推理放 reasoning_content。
+        # 探活语义是“去思考块后正文非空才算健康”：只有 reasoning_content 而无正文，
+        # 说明该 provider “只推理没结论”，不能据此放行（HF-001）。
+        reasoning = message.get("reasoning_content") or ""
+        if not txt and reasoning:
+            logger.debug(
+                "[llm-pool] probe %s 仅返回 reasoning_content（无正文），判为不健康",
+                p.get("name"),
+            )
         return resp.status == 200 and len(txt) > 0
     except Exception as exc:  # noqa: BLE001 - 任何错误都视为不健康
         logger.debug("[llm-pool] probe %s 失败: %s", p.get("name"), exc)
