@@ -55,8 +55,15 @@ export interface AutonomyState {
 }
 
 // HITL 决策询问（对齐后端 autonomy_decision 广播事件 payload）
+export type DecisionKind =
+  | 'exploration'        // 自主探索分叉/停滞
+  | 'tool_failure'       // 工具连续失败
+  | 'experience_review'  // 经验沉淀确认
+  | 'provider_switch'    // 跨 provider 切换
+
 export interface AutonomyDecision {
   id: number
+  kind: DecisionKind
   question: string
   options: string[]
   context: string
@@ -129,6 +136,7 @@ export const useStatusStore = defineStore('status', () => {
     if (!data || typeof data !== 'object') return
     pendingDecision.value = {
       id: Number(data.id || 0),
+      kind: (String(data.kind || 'exploration') as DecisionKind),
       question: String(data.question || ''),
       options: Array.isArray(data.options) ? data.options : [],
       context: String(data.context || ''),

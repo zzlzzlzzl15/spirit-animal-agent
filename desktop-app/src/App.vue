@@ -144,11 +144,19 @@ onMounted(async () => {
         petStore.syncFromServer(data)
         statusStore.syncFromServer(data)
       } else if (event === 'autonomy_decision') {
-        // 自主探索遇到需拍板的分叉/停滞 → 存入 store（SystemPanel 渲染应答），
-        // 并让桌宠冒个泡提醒用户去「系统」面板帮它决定（超时未答则 fail-open 自主继续）
+        // 需拍板的 HITL 决策（C-P1.2：按 kind 区分——工具失败/经验确认/provider
+        // 切换/探索分叉）→ 存入 store（SystemPanel 渲染应答），并让桌宠冒个对应气泡
+        // 提醒用户去「系统」面板拍板（超时未答则后端 fail-open 自主继续）
         statusStore.setDecision(data)
         if (window.electronAPI?.showBubble && !activePanel.value) {
-          window.electronAPI.showBubble('🤔 探索遇到选择，打开「系统」面板帮我拍板~')
+          const kind = data?.kind || 'exploration'
+          const bubbles: Record<string, string> = {
+            tool_failure: '🔧 工具连续失败，打开「系统」面板帮我拍板~',
+            experience_review: '💾 有条经验想记下，打开「系统」面板确认一下~',
+            provider_switch: '🔀 当前模型不给力，要换一个吗？打开「系统」面板~',
+            exploration: '🤔 探索遇到选择，打开「系统」面板帮我拍板~',
+          }
+          window.electronAPI.showBubble(bubbles[kind] || bubbles.exploration)
         }
       } else if (event === 'progress') {
         // C-P1.1 长任务进度推送 → 桌宠冒泡（复用 SpeechBubblePage 独立窗口）。

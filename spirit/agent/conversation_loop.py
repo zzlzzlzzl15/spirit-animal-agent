@@ -31,7 +31,11 @@ from spirit.agent.error_handler import (
     FailoverReason,
     IterationBudget,
 )
-from spirit.agent.tool_guardrails import ToolCallGuardrailController
+from spirit.agent.tool_guardrails import (
+    ToolCallGuardrailController,
+    ToolGuardrailDecision,
+)
+from spirit.agent.hitl_channel import DecisionKind, has_channel, request_decision
 from spirit.agent.tool_executor import (
     execute_tool_calls_concurrent,
     execute_tool_calls_sequential,
@@ -238,6 +242,9 @@ def run_conversation(
 
     # 工具护栏
     guardrails = ToolCallGuardrailController()
+
+    # C-P1.2：本 turn 内 provider 切换 HITL 只问一次（连锁 failover 不反复弹窗）
+    agent._provider_switch_hitl_asked = False
 
     # 上下文压缩器
     compressor = getattr(agent, "_context_compressor", None)
@@ -745,6 +752,14 @@ def run_conversation(
                 },
             )
 
+            # ── C-P1.2：工具连续失败 → HITL 决策面板（桌宠拍板）──────
+            # 在 halt 检查之前消费 hitl 信号；用户选放弃会 force_halt，
+            # 下方既有护栏停止分支随即接管。任何异常 fail-open 不阻断循环。
+            try:
+                _maybe_tool_failure_hitl(agent, guardrails)
+            except Exception:  # noqa: BLE001
+                logger.debug("[C-P1.2] tool_failure HITL 接线异常 → fail-open", exc_info=True)
+
             # 检查护栏是否要求停止
             if guardrails.halt_decision and guardrails.halt_decision.should_halt:
                 logger.warning("工具护栏触发停止: %s", guardrails.halt_decision.message)
@@ -993,6 +1008,76 @@ def run_conversation(
 # =========================================================================
 # LLM 调用
 # =========================================================================
+def _maybe_tool_failure_hitl(agent, guardrails) -> None:
+    """C-P1.2：同一工具本轮连续失败达阈值 → 经全局 HITL 通道请用户拍板。
+
+    消费（并清除）``guardrails.hitl_decision`` 一次性信号：
+
+    - 无全局通道（CLI / 桌宠未连）→ fail-open，直接放行让主循环自主继续；
+    - 超时 / 通道异常 / 用户选“重试 / 换方法” → 把用户指示回灌为一条
+      user 消息，LLM 下一轮据此调整，循环继续；
+    - 用户选“放弃” → ``force_halt`` 置位一个 halt 决策，交由主循环既有的
+      护栏停止分支优雅收尾（不另造一套中断路径）。
+    任何异常都不得阻断主循环（fail-open 铁律）。
+    """
+    decision = guardrails.hitl_decision
+    if decision is None:
+        return
+    guardrails.clear_hitl_decision()
+
+    if not has_channel():
+        return  # 桌宠未连 / CLI 场景 → 自主继续
+
+    recent_error = ""
+    try:
+        for msg in reversed(getattr(agent, "_messages", []) or []):
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                recent_error = str(msg.get("content") or "")[-400:]
+                break
+    except Exception:  # noqa: BLE001 - 背景提取失败不影响询问
+        recent_error = ""
+
+    try:
+        reply = request_decision(
+            DecisionKind.TOOL_FAILURE,
+            f"{decision.tool_name} 已连续失败 {decision.count} 次，要怎么处理？",
+            options=["继续重试（我已调整思路）", "换一种方法", "放弃这个任务"],
+            context=(
+                decision.message
+                + (f"\n最近工具返回：\n{recent_error}" if recent_error else "")
+            ),
+            is_fork=True,
+            task_id=str(getattr(agent, "session_id", "") or ""),
+        )
+    except Exception:  # noqa: BLE001 - 通道异常 fail-open
+        logger.debug("[C-P1.2] tool_failure 询问异常 → fail-open", exc_info=True)
+        return
+
+    if reply is None:
+        return  # 超时 / 无响应 → 自主继续
+
+    if "放弃" in reply:
+        guardrails.force_halt(
+            ToolGuardrailDecision(
+                action="halt",
+                code="user_abandon_after_hitl",
+                message=(
+                    f"用户在 HITL 面板选择放弃：{decision.tool_name} "
+                    f"本轮连续失败 {decision.count} 次。"
+                ),
+                tool_name=decision.tool_name,
+                count=decision.count,
+            )
+        )
+        return
+
+    # 重试 / 换方法：把用户拍板指示回灌，LLM 下一轮据此调整策略
+    try:
+        agent.add_message("user", f"[用户介入指示] {reply}")
+    except Exception:  # noqa: BLE001
+        logger.debug("[C-P1.2] 回灌用户指示失败（非致命）", exc_info=True)
+
+
 def _inject_process_notifications(agent) -> int:
     """把后台进程/异步委托的完成通知回灌进对话（Phase 4.7）。
 
@@ -1065,6 +1150,44 @@ def _prepare_api_messages_safe(agent):
     return prepare_api_messages(labeled)
 
 
+def _maybe_provider_switch_hitl(agent, fb: Dict[str, Any], reason_txt: str) -> bool:
+    """C-P1.2：跨 provider 自动 failover 前，请用户拍板。
+
+    返回 True = 继续切换到 *fb*；False = 用户要求留在当前模型重试。
+
+    约束（fail-open 铁律 + 不破坏自动 failover）：
+    - 无全局通道（CLI / 桌宠未连）→ True（照原逻辑自动切）；
+    - 超时 / 异常 → True（自动切，绝不因问不到人而卡死在坏 provider 上）；
+    - 每轮最多问一次（``agent._provider_switch_hitl_asked``），避免连锁
+      failover 时反复弹窗；
+    - 询问超时较短（30s），provider 已故障时不让用户久等。
+    """
+    if getattr(agent, "_provider_switch_hitl_asked", False):
+        return True
+    agent._provider_switch_hitl_asked = True
+    if not has_channel():
+        return True
+    try:
+        cur = f"{getattr(agent, 'provider', '')}/{getattr(agent, 'model', '')}"
+        nxt = f"{fb.get('name') or fb.get('provider')}/{fb.get('model')}"
+        reply = request_decision(
+            DecisionKind.PROVIDER_SWITCH,
+            f"当前模型 {cur} 调用失败（{reason_txt}），要切换到备用模型 {nxt} 吗？",
+            options=[f"切到备用模型 {nxt}", "留在当前模型重试"],
+            context="自动故障转移会在多个备用模型间依次尝试；选“留在当前”则不切换。",
+            is_fork=True,
+            timeout=30.0,
+            task_id=str(getattr(agent, "session_id", "") or ""),
+        )
+    except Exception:  # noqa: BLE001 - 任何异常 fail-open 自动切
+        logger.debug("[C-P1.2] provider_switch 询问异常 → 自动切换", exc_info=True)
+        return True
+    if reply is None:
+        return True  # 超时 → 自动切
+    # 仅当用户明确选择“留在当前”才中止切换；其余（含切备用）一律继续
+    return "留在当前" not in reply
+
+
 def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callable[[str], None]] = None) -> bool:
     """切换到 fallback 链中下一个可用的 provider（照搬 Hermes try_activate_fallback）。
 
@@ -1107,6 +1230,14 @@ def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callabl
         ):
             logger.debug("fallback 跳过：%s 与当前后端重复", key)
             continue
+
+        # ── C-P1.2：切换前经 HITL 面板请用户拍板（无通道/超时则自动切）──
+        _reason_txt_pre = getattr(reason, "value", None) or str(reason or "") or "调用失败"
+        if not _maybe_provider_switch_hitl(agent, fb, _reason_txt_pre):
+            # 用户选择留在当前模型重试：不推进切换，回退已自增的链索引
+            agent._fallback_index = max(0, idx)
+            logger.info("[fallback] 用户在 HITL 面板选择留在当前 provider，中止切换")
+            return False
 
         # 首次切换前快照主运行时（turn 作用域：下一轮开头恢复，Hermes 语义）
         if getattr(agent, "_primary_runtime", None) is None:

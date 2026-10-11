@@ -16,8 +16,12 @@
           </span>
         </div>
 
-        <!-- HITL 决策询问：探索遇分叉/停滞时弹出，点选即应答 -->
-        <div v-if="decision" class="decision-box">
+        <!-- HITL 决策询问：按 kind 分类渲染（工具失败/经验确认/provider 切换/探索分叉） -->
+        <div v-if="decision" class="decision-box" :class="'kind-' + decisionKind">
+          <div class="decision-head">
+            <span class="decision-icon">{{ decisionMeta.icon }}</span>
+            <span class="decision-title">{{ decisionMeta.title }}</span>
+          </div>
           <div class="decision-q">{{ decision.question }}</div>
           <div v-if="decision.context" class="decision-ctx">{{ decision.context }}</div>
           <div class="decision-opts">
@@ -132,6 +136,16 @@ const { autonomy, pendingDecision: decision } = storeToRefs(statusStore)
 const direction = ref('')
 const sending = ref(false)
 const recentCycles = computed(() => (autonomy.value.cycles || []).slice(-6).reverse())
+
+// C-P1.2：按 HITL 决策 kind 分类的图标 + 面板标题（与后端 DecisionKind 对齐）
+const decisionKind = computed<string>(() => decision.value?.kind || 'exploration')
+const DECISION_META: Record<string, { icon: string; title: string; bubble: string }> = {
+  tool_failure:      { icon: '🔧', title: '工具连续失败', bubble: '🔧 工具连续失败，打开「系统」面板帮我拍板~' },
+  experience_review: { icon: '💾', title: '经验沉淀确认', bubble: '💾 有条经验想记下，打开「系统」面板确认一下~' },
+  provider_switch:   { icon: '🔀', title: '模型切换确认', bubble: '🔀 当前模型不给力，要换一个吗？打开「系统」面板~' },
+  exploration:       { icon: '🤔', title: '探索分叉',     bubble: '🤔 探索遇到选择，打开「系统」面板帮我拍板~' },
+}
+const decisionMeta = computed(() => DECISION_META[decisionKind.value] || DECISION_META.exploration)
 
 const cpuPercent = computed(() => {
   const p = statusStore.systemMetrics.cpu.percent
@@ -478,6 +492,25 @@ onUnmounted(() => {
   border-radius: 10px;
   padding: 8px 10px;
   margin-bottom: 10px;
+}
+/* C-P1.2：按 kind 区分配色（工具失败=橙/经验=绿/provider=蓝/探索=黄） */
+.decision-box.kind-tool_failure      { background: rgba(251, 146, 60, 0.1); border-color: rgba(251, 146, 60, 0.45); }
+.decision-box.kind-experience_review { background: rgba(74, 222, 128, 0.1); border-color: rgba(74, 222, 128, 0.4); }
+.decision-box.kind-provider_switch   { background: rgba(96, 165, 250, 0.1); border-color: rgba(96, 165, 250, 0.45); }
+.decision-box.kind-exploration       { background: rgba(250, 204, 21, 0.1); border-color: rgba(250, 204, 21, 0.4); }
+.decision-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+}
+.decision-icon { font-size: 13px; }
+.decision-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #ccc;
+  text-transform: uppercase;
 }
 .decision-q {
   font-size: 11px;

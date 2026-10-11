@@ -166,6 +166,37 @@ class EvolutionLoop:
         return "\n".join(parts)
 
     # -- 记忆提交（C3：仅在已验证经验边界提交）----------------------------
+    def _confirm_experience(self, text: str, task_id: str) -> bool:
+        """C-P1.2：经验沉淀确认。返回 True=存入，False=用户选跳过。
+
+        - 无全局通道（CLI / 桌宠未连）→ True（自动沉淀，保持原语义）；
+        - 超时 / 异常 → True（fail-open，不因问不到人丢失已验证经验）；
+        - 用户明确选“跳过/不存” → False。
+        """
+        try:
+            from spirit.agent.hitl_channel import (
+                DecisionKind,
+                has_channel,
+                request_decision,
+            )
+            if not has_channel():
+                return True
+            preview = (text or "").strip()
+            reply = request_decision(
+                DecisionKind.EXPERIENCE_REVIEW,
+                "我从这次任务里总结了一条经验，要记下来吗？",
+                options=["存入记忆", "跳过这条"],
+                context=preview[:500],
+                confidence=0.8,
+                task_id=task_id or "",
+            )
+        except Exception:  # noqa: BLE001 - 任何异常 fail-open
+            logger.debug("evolution.loop: experience_review 询问异常 → 自动沉淀", exc_info=True)
+            return True
+        if reply is None:
+            return True  # 超时 → 自动沉淀
+        return not ("跳过" in reply or "不存" in reply)
+
     def _commit(
         self, task_id: str, attempt: AttemptResult, verdict: Verdict, learning: ActorLearning
     ) -> None:
@@ -182,12 +213,17 @@ class EvolutionLoop:
             if learning.is_valid():
                 confidence = 0.8 if verdict.passed else 0.5
                 text = learning.memory or learning.diagnosis
-                self.memory.add_insight(
-                    text=text,
-                    confidence=confidence,
-                    source_task_id=task_id,
-                    tags=[verdict.verdict.value.lower()],
-                )
+                # C-P1.2：写入进化记忆前经 HITL 面板请用户确认（存/跳过）。
+                # fail-open：无桌宠通道 / 超时 / 异常 → 照原逻辑自动沉淀，绝不阻断闭环。
+                if not self._confirm_experience(text, task_id):
+                    logger.info("evolution.loop: 用户在 HITL 面板选择跳过该条经验")
+                else:
+                    self.memory.add_insight(
+                        text=text,
+                        confidence=confidence,
+                        source_task_id=task_id,
+                        tags=[verdict.verdict.value.lower()],
+                    )
         except Exception as exc:  # pragma: no cover - 记忆写入失败不阻断闭环
             logger.warning("evolution.loop: 记忆提交失败: %s", exc)
 
