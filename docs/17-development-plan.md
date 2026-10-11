@@ -434,7 +434,11 @@ C:\Users\Administrator\AppData\Local\Temp\
 
 ### 6.4 v0.2.12 hotfix 候选清单
 
-回归测试与生产监控发现的**单点 bug**汇总到此表，按优先级进 v0.2.12 hotfix：
+> **HF-001 已于 2026-10-11 修复 ✅**（随 v0.4.0 落地）：`spirit/llm_pool.py` think 剥离改为 5 类标签
+> （think/thinking/reasoning/thought/REASONING_SCRATCHPAD）成对块 + 锚定开头的未闭合开标签兜底，
+> 结束标签不再误用 `</tool_response>`；probe 显式读取 `reasoning_content`（仅推理无正文→判不健康）。
+
+回归测试与生产监控发现的**单点 bug**汇总到此表，按优先级进 hotfix：
 
 | 编号 | Bug | 位置 | 影响 | 优先级 |
 |------|-----|------|------|--------|
@@ -558,8 +562,8 @@ V3 不重做 V2 已完成的事，**只补缺口 + 加新能力**：
 
 ## 12. 开发状态总表（V2 + V3）
 
-> **当前真实进度**（规划视角见 §0-§11）：v0.2.4 已发布、v0.4.0 进行中（C-P1.2）
-> **最后更新**：2026-10-10（v0.3.0 R-P2.2 已交付 ✅ + Hermes↔Spirit 架构差距规划补完 v0.3.1-v0.5.5 14 项 R-P3.x/R-P4.x）
+> **当前真实进度**（规划视角见 §0-§11）：v0.2.4 已发布、v0.4.0 进行中（C-P1.1 ✅ / C-P1.2 ✅，仅剩 M-P1.1）
+> **最后更新**：2026-10-11（C-P1.2 HITL 决策面板 4 类触发全接线 ✅ + HF-001 llm_pool think 剥离修复 ✅）
 > **配套清单**：[07-development-checklist.md §6](./07-development-checklist.md)（V2 完整模块级 + 同样的总表）
 
 ### 12.1 V2 阶段（Phase 1-7）完成状态
@@ -711,7 +715,7 @@ V3 不重做 V2 已完成的事，**只补缺口 + 加新能力**：
 | 编号 | 功能 | 估算 | 状态 | 备注 |
 |------|------|------|------|------|
 | C-P1.1 | 长任务进度推送 | 1 周 | ✅ | `progress_notifier.py`（7 phase 全局 sink）+ `ws_server` 桥接 + `conversation_loop` 10 处埋点 + App.vue 气泡；E2E 28 progress 事件全验证 |
-| C-P1.2 | HITL 决策面板 | 1.5 周 | ⏳ 进行中 | 核心骨架已建：`agent/hitl_channel.py` 全局通道 + `DecisionKind` 4 类 + `HumanQuery.kind` + `bridge` payload 透传 + `start_autonomy` 注册全局通道 + `tool_guardrails` HITL 信号（`hitl_decision` / `force_halt`）。下一步：`conversation_loop` 工具失败触发 + 前端按 kind 分类 + 第 2/3 类触发（经验沉淀确认 / provider 切换）|
+| C-P1.2 | HITL 决策面板 | 1.5 周 | ✅ | 4 类决策全接线：`hitl_channel` 全局通道 + `DecisionKind`（tool_failure / provider_switch / experience_review / exploration）；conversation_loop 工具连续失败触发（放弃→force_halt / 换法→回灌指示）、fallback 切换前询问（每 turn 一次，30s，fail-open 自动切）、evolution `_commit` 经验沉淀确认（跳过→不写洞察）；前端 store+SystemPanel+App.vue 按 kind 分类图标/标题/配色/气泡。全程 fail-open |
 | M-P1.1 | BRS 广度并行接线 | 2 周 | ❌ | `spirit/autonomy/wave_runner.py`（待开始）|
 
 #### v0.5.0（❌ 计划）—— 可量化 + 桌面伴侣
@@ -743,14 +747,14 @@ V3 不重做 V2 已完成的事，**只补缺口 + 加新能力**：
 
 | 类别 | 总项 | ✅ | ⏳ | ❌ |
 |------|------|----|----|----|
-| V3 P1（v0.2.4-v0.4.0）| 8 | 6 | 1（C-P1.2）| 1（M-P1.1）|
+| V3 P1（v0.2.4-v0.4.0）| 8 | 7 | 0 | 1（M-P1.1）|
 | V3 P2（v0.3.0-v0.5.0）| 9 + 7 = 16 | 0 | 0 | 16 |
 | V3 P3（V3.0.0）| 7 + 7 = 14 | 0 | 0 | 14 |
 | **前端显示层 P0-P1**（v0.3.6-v0.3.8）| 7 | 0 | 0 | 7 |
 | **前端显示层 P2**（v0.3.9）| 3 | 0 | 0 | 3 |
 | **前端显示层 P3**（v0.3.10 + v0.4.1）| 3 | 0 | 0 | 3 |
 | **前端 UX P1-P4 §14.8**（v0.3.11 - v0.5.6）| 16 | 0 | 0 | 16 |
-| **合计** | **74** | **6** | **1** | **67** |
+| **合计** | **74** | **7** | **0** | **67** |
 
 ### 12.5 整体统计（V2 + V3）
 
@@ -758,17 +762,17 @@ V3 不重做 V2 已完成的事，**只补缺口 + 加新能力**：
 |------|------|----|----|----|
 | V2 Phase 1-7 子项 | 41 | 41 | 0 | 0 |
 | V2 仍待补完（低优先级）| 4 大类 | 0 | 0 | 4 |
-| V3 P1（v0.2.4-v0.4.0）| 8 | 6 | 1（C-P1.2）| 1（M-P1.1）|
+| V3 P1（v0.2.4-v0.4.0）| 8 | 7 | 0 | 1（M-P1.1）|
 | V3 P2（v0.3.0 + v0.3.0 补完 + v0.5.0）| 9 + 7 = 16 | 0 | 0 | 16 |
 | V3 P3（V3.0.0 + v0.5.0+ 长期）| 7 + 7 = 14 | 0 | 0 | 14 |
 | **前端显示层**（§14 P0-P3，v0.3.6-v0.4.1）| 13 | 0 | 0 | 13 |
 | **前端 UX P1-P4**（§14.8，v0.3.11 - v0.5.6）| 16 | 0 | 0 | 16 |
-| **合计** | **119** | **47** | **1** | **71** |
+| **合计** | **119** | **48** | **0** | **71** |
 
 **关键里程碑**：
 - V2 七大阶段全部完成 → 41/41 子项 + 2,698+ 测试全通 + 35,761 行后端代码
-- v0.2.4 R/M 支柱 P1 全收官 → C 支柱进度仅 C-P1.1 完成
-- 当前 v0.4.0：C-P1.2 进行中（核心骨架 ✅，子任务待做） / M-P1.1 待开始
+- v0.2.4 R/M 支柱 P1 全收官 → C 支柱 C-P1.1 / C-P1.2 已完成
+- 当前 v0.4.0：C-P1.2 已完成（4 类 HITL 触发全接线 + 前端 kind 分类），v0.4.0 仅剩 M-P1.1（BRS 广度并行接线）
 - v0.3.0 / v0.5.0 / V3.0.0 全部 P2/P3 项均未开始
 - **§14.8 P1-P4 完整缺口**：v0.3.11（2 周）→ v0.3.12（3 周）→ v0.4.1-v0.4.6（11 周）→ v0.5.6（3 周），总计 19 周将 CLI / TUI / Web 三端 UX 全面对齐 Hermes
 - V2 阶段（Phase 1-7）全部完成，详见 [07-development-checklist.md §一/§二/§三](./07-development-checklist.md)
@@ -777,7 +781,7 @@ V3 不重做 V2 已完成的事，**只补缺口 + 加新能力**：
 
 | 编号 | Bug | 测试 | 优先级 | 备注 |
 |------|-----|------|--------|------|
-| HF-001 | LLM 探活 think 块剥离正则锚点错（用 `</tool_response>` 而非 `<think></think>`）| `test_llm_pool.py::TestProbe::test_think_block_stripped_before_check`（当前 failed）| 高 | 批量场景可能误选“只输出推理没结论”的 provider，浪费整批预算 |
+| HF-001 | ~~LLM 探活 think 块剥离正则锚点错~~ **已修复 ✅ 2026-10-11** | `test_llm_pool.py::TestProbe::test_think_block_stripped_before_check` | 高 | 正则改为 5 类 think 闭合标签 + `^\s*` 未闭合开标签兜底；probe 读 `reasoning_content`，仅推理无正文判不健康 |
 
 **修复方案**：
 
