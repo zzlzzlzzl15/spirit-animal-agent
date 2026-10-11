@@ -272,6 +272,12 @@ class _ReasoningStream:
     直接逐条打印会刷屏——模仿 Hermes 的 _flush_reasoning_preview：累积到
     自然边界（换行 / 句末标点 / >80 字符）才 emit 一行，REASONING_END 时 force flush。
 
+    v0.4.x：升级为 box 框架（对齐 Hermes cli_stream_mixin._stream_reasoning_delta）：
+    - 第一次 feed() 时打印 ``┌─ Reasoning ─...─┐`` 顶部
+    - REASONING_END / close_box() 时打印 ``└─...─┘`` 底部
+    - STREAM_TEXT_DELTA 触发时协同关闭（响应到达立即收 reasoning box）
+    - 内部行不再用 💭 emoji（box label 已是标识）
+
     设计：
     - 轮次间不重置 buffer 会有跨轮泄露问题——在 REASONING_END + THINKING_END 双重信号
       下清空，避免中途断连丢尾巴。
@@ -279,11 +285,16 @@ class _ReasoningStream:
     - 单例：模块级 _reasoning_stream，所有 REASONING_DELTA 事件共用一个 buffer。
     """
 
+    # v0.4.x：box 顶部/底部宽度（对齐 Hermes scrollback box）
+    _BOX_WIDTH = 80
+
     def __init__(self) -> None:
         self._buf: str = ""
         self._active: bool = False  # 当前是否在收 reasoning delta
         self._emitted_lines: int = 0  # 本轮已打印的行数（用于折叠）
         self._printed_full: bool = False  # 本轮是否已打印折叠后的完整 preview（避免 REASONING_END 重复打印）
+        # v0.4.x：box 状态（对齐 Hermes _reasoning_box_opened）
+        self._box_opened: bool = False  # reasoning box 是否已打开
 
     def reset(self) -> None:
         """轮次开始时调用。"""
@@ -291,11 +302,19 @@ class _ReasoningStream:
         self._active = True
         self._emitted_lines = 0
         self._printed_full = False
+        # v0.4.x：上一轮 box 如果未关（异常路径），强制关掉避免泄露
+        if self._box_opened:
+            self._emit_box_bottom()
+        self._box_opened = False
 
     def feed(self, piece: str) -> Optional[str]:
         """累积一个增量。返回需要立即打印的一行（可能有，也可能没有）。"""
         if not self._active or not piece:
             return None
+        # v0.4.x：第一次 feed 时打开 reasoning box（对齐 Hermes _stream_reasoning_delta）
+        if not self._box_opened:
+            self._box_opened = True
+            self._emit_box_top()
         self._buf += piece
         # 自然边界：换行 / 句末标点 / >80 字符强制 flush
         target_width = 80
@@ -317,11 +336,38 @@ class _ReasoningStream:
                 return line
         return None
 
+    def close_box(self) -> None:
+        """关闭 reasoning box（响应 box 打开时 / REASONING_END 时调用）。
+
+        对齐 Hermes cli_stream_mixin._close_reasoning_box:
+        - 刷出剩余 buffer
+        - 打印底部 ┌─...─┐
+        - 重置 _box_opened 状态
+        """
+        if not self._box_opened:
+            return
+        # 刷尾部剩余
+        tail = self._buf.strip()
+        if tail:
+            console.print(f"  [dim]{tail}[/dim]", highlight=False)
+        self._buf = ""
+        self._emit_box_bottom()
+        self._box_opened = False
+
     def flush(self) -> Optional[str]:
-        """轮次结束时调用——刷出尾部剩余 + 返回可选的折叠提示行。"""
+        """轮次结束时调用——刷出尾部剩余 + 返回可选的折叠提示行。
+
+        v0.4.x：同时关闭 box（调 close_box）。
+        """
         if not self._active:
             return None
         self._active = False
+        # v0.4.x：关闭 box 框架（之前 box_opened=True 现在会折叠，所以需关掉）
+        # 只在还有未刷尾 buffer 时关 box——避免空 box 打印
+        try:
+            self.close_box()
+        except Exception:
+            pass
         tail = self._buf.strip()
         self._buf = ""
         if not tail:
@@ -330,6 +376,26 @@ class _ReasoningStream:
         # 注意：本轮不再打印 tail 本身（已在中途分批发完或根本没收到），
         # 这里只返回可能的折叠提示。
         return None
+
+    def _emit_box_top(self) -> None:
+        """打印 reasoning box 顶部 ┌─ Reasoning ─...─┐（对齐 Hermes scrollback box）。"""
+        w = self._BOX_WIDTH
+        label = " Reasoning "
+        fill = w - 2 - len(label)
+        if fill < 0:
+            fill = 0
+        console.print(
+            f"  [dim]┌─{label}{'─' * fill}┐[/dim]",
+            highlight=False,
+        )
+
+    def _emit_box_bottom(self) -> None:
+        """打印 reasoning box 底部 └─...─┘。"""
+        w = self._BOX_WIDTH
+        console.print(
+            f"  [dim]└{'─' * (w - 2)}┘[/dim]",
+            highlight=False,
+        )
 
     def fold_preview(self) -> Optional[str]:
         """轮结束后想重看完整 reasoning preview 时调用——返回 ``... (+N more lines)`` 之类的提示。
@@ -463,7 +529,9 @@ def _render_progress(event: Dict[str, Any]) -> None:
                     if text:
                         line = _reasoning_stream.feed(text)
                         if line is not None:
-                            console.print(f"  [dim]💭 {line}[/dim]", highlight=False)
+                            # v0.4.x：去掉 💭 emoji，box label " Reasoning " 已是标识
+                            # 对齐 Hermes cli_stream_mixin._stream_reasoning_delta
+                            console.print(f"  [dim]{line}[/dim]", highlight=False)
             except Exception as _rd_exc:
                 # v0.4.x：避免完全静默 — 输出 dim yellow 一行（不阻塞主循环）
                 # 调试时定位到 REASONING_DELTA 渲染失败但用户看不见的问题。
@@ -571,6 +639,11 @@ def _render_progress(event: Dict[str, Any]) -> None:
                 )
         elif phase == ProgressPhase.STREAM_TEXT_DELTA.value:
             # 最终回答流式 token — 按自然边界 flush（受 show_stream_text 控制）
+            # v0.4.x：响应到达时协同关闭 reasoning box（对齐 Hermes _close_reasoning_box）
+            try:
+                _reasoning_stream.close_box()
+            except Exception:
+                pass
             try:
                 _show_stream = True
                 from spirit.config import load_config as _lc
