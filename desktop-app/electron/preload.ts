@@ -14,11 +14,11 @@ import { contextBridge, ipcRenderer, clipboard } from 'electron'
 contextBridge.exposeInMainWorld('electronAPI', {
   // ── 配置 ──────────────────────────────────────────────────
 
-  /** 获取持久化配置（窗口位置、缩放、当前宠物） */
+  /** 获取持久化配置（窗口位置、宠物大小、当前宠物） */
   getSavedConfig: (): Promise<{
     windowX: number
     windowY: number
-    petScale: number
+    petSize: number
     activePetSlug: string
     wsPort: number
   }> => ipcRenderer.invoke('get-saved-config'),
@@ -55,6 +55,13 @@ contextBridge.exposeInMainWorld('electronAPI', {
   closeCLITerminal: (): Promise<boolean> =>
     ipcRenderer.invoke('close-cli-terminal'),
 
+  /**
+   * 打开系统真终端（macOS Terminal.app / Windows cmd / Linux xterm）并执行 `spirit`。
+   * 区别于 `openCLITerminal`：那个是内置 xterm.js 窗口。
+   */
+  openSystemTerminal: (): Promise<boolean> =>
+    ipcRenderer.invoke('open-system-terminal'),
+
   /** 显示气泡对话（独立窗口） */
   showBubble: (text: string): Promise<boolean> =>
     ipcRenderer.invoke('show-bubble', { text }),
@@ -89,9 +96,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     ipcRenderer.send('save-position', { x, y })
   },
 
-  /** 保存缩放 */
-  saveScale: (scale: number): void => {
-    ipcRenderer.send('save-scale', { scale })
+  /** 保存气泡大小（CSS px）。主进程收到后立即 resize 窗口 + 持久化。 */
+  saveSize: (size: number): void => {
+    ipcRenderer.send('save-size', { size })
   },
 
   /** 移动窗口（相对偏移） */
@@ -137,7 +144,7 @@ declare global {
       getSavedConfig: () => Promise<{
         windowX: number
         windowY: number
-        petScale: number
+        petSize: number
         activePetSlug: string
         wsPort: number
       }>
@@ -149,6 +156,7 @@ declare global {
       closeSystemWindow: () => Promise<boolean>
       openCLITerminal: () => Promise<boolean>
       closeCLITerminal: () => Promise<boolean>
+      openSystemTerminal: () => Promise<boolean>
       showBubble: (text: string) => Promise<boolean>
       hideBubble: () => Promise<boolean>
       openMemora: () => Promise<boolean>
@@ -156,7 +164,7 @@ declare global {
       clipboardWrite: (text: string) => void
       petHeartbeat: (frames: number) => void
       savePosition: (x: number, y: number) => void
-      saveScale: (scale: number) => void
+      saveSize: (size: number) => void
       moveWindow: (deltaX: number, deltaY: number) => void
       resizeWindow: (width: number, height: number) => void
       setForceCapture: (force: boolean) => void

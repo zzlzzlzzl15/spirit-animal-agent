@@ -107,6 +107,29 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 
+def _fold_summary_single_line(s: Any, max_len: int = 70) -> str:
+    """折叠 summary 为单行（避免 task_start 多行渲染后让用户以为是“重复块”）。
+
+    策略：
+    - 空 → ""
+    - 不含 ``\\n`` → 照原值，仅过 _truncate(max_len)
+    - 含 ``\\n`` → 只保留首行，如果总长超出 max_len 追加 ``... (+N 行)`` 提示
+    """
+    if not s:
+        return ""
+    text = str(s)
+    if "\n" not in text:
+        return _truncate(text, max_len)
+    first, _, rest = text.partition("\n")
+    first = first.rstrip()
+    rest_lines = [ln for ln in rest.split("\n") if ln.strip()]
+    n_more = len(rest_lines)
+    head = _truncate(first, max_len - 12)  # 预留 "… (+N 行)" 位置
+    if n_more == 0:
+        return head + ("…" if len(first) > len(head) else "")
+    return f"{head}… (+{n_more} 行)"
+
+
 def _format_tool_call_summary(tool_calls: List[Dict[str, Any]], max_args: int = 3) -> str:
     """拼接工具调用摘要：函数名 + 简化参数（参数 > max_args 个时标 +N more）。
 
@@ -504,7 +527,30 @@ def _render_progress(event: Dict[str, Any]) -> None:
 
         duration_ms = _get("duration_ms")
         if phase == ProgressPhase.TASK_START.value:
-            console.print(f"  [bold yellow]─── 任务开始[/bold yellow]  [dim]{_truncate(summary, 70)}[/dim]")
+            # v0.4.x：区分主代理 vs 子代理 task_start + 折叠多行 summary
+            #
+            # 背景：
+            # - 每次 run_conversation() 入口都会发一次 task_start。
+            # - 主代理 session_id = UUID（config.session_id 或 uuid.uuid4()）；
+            #   子代理 session_id = f"child-{child_id}-a{attempt}"（delegate_tool._run_attempt）。
+            # - 如果不区分，子代理的 task_start 会被视为“重复任务”迷惑用户，
+            #   因为子代理的 user_message 模板是 "上下文:\n...\n\n任务: ..."，渲染后看起来和上下文块一模一样。
+            # - 另外，summary 原本走 _truncate(s, 70) 截字符串，
+            #   但 Rich console.print 会把 \n 渲染为换行，导致一个 task_start 被排成多行。
+            #
+            # 这里根据 session_id 前缀（"child-" 是子代理）区分标符，
+            # 并把多行 summary 折叠成单行（首行 + (+N 行) 提示）。
+            sid = _get("session_id", "") or ""
+            is_child = sid.startswith("child-")
+            folded = _fold_summary_single_line(summary, max_len=70)
+            if is_child:
+                console.print(
+                    f"  [bold cyan]─── 👥 子任务开始[/bold cyan]  [dim]{folded}[/dim]"
+                )
+            else:
+                console.print(
+                    f"  [bold yellow]─── 任务开始[/bold yellow]  [dim]{folded}[/dim]"
+                )
             # 新一轮：重置推理 stream + 流式回答 box，准备接收本轮 events
             _reasoning_stream.reset()
             _stream_text_box.reset()
@@ -831,14 +877,25 @@ def setup_logging(verbose: bool = False):
         logging.getLogger(noisy).setLevel(logging.ERROR)
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.option("-v", "--verbose", is_flag=True, help="详细日志")
 @click.pass_context
 def cli(ctx, verbose):
-    """Spirit Agent — 统一后端 AI Agent 服务"""
+    """Spirit Agent — 统一后端 AI Agent 服务
+
+    \b
+    不带子命令直接调用 ``spirit`` 会默认进入交互式对话（与 Windows 行为一致）。
+    其他子命令（start / sessions / tools / storage ...）仍可显式指定。
+    """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
     setup_logging(verbose)
+
+    # 默认行为: ``spirit`` 无子命令 → 自动进入对话模式
+    # （跨平台一致：Windows / macOS / Linux 直接 ``spirit`` 都进入 chat）
+    if ctx.invoked_subcommand is None:
+        # chat 子命令的可选参数都有 default=None，透传即可
+        ctx.invoke(chat, model=None, api_key=None, base_url=None)
 
 
 @cli.command()
@@ -1289,61 +1346,99 @@ def _handle_slash_command(cmd: str, agent) -> bool:
         # 桌宠是 Electron 应用 + Python 后端（端口 9877）。
         # 检测：端口 9877 是否已监听 → Electron 已在跑。
         import subprocess
+        import platform
+        is_windows = platform.system() == "Windows"
+    
+        running_pid = ""
         try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-Command",
-                 "Get-NetTCPConnection -State Listen -LocalPort 9877 "
-                 "-ErrorAction SilentlyContinue | "
-                 "Select-Object -ExpandProperty OwningProcess"],
-                capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=5,
-            )
-            running_pid = r.stdout.strip()
+            if is_windows:
+                r = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-NetTCPConnection -State Listen -LocalPort 9877 "
+                     "-ErrorAction SilentlyContinue | "
+                     "Select-Object -ExpandProperty OwningProcess"],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=5,
+                )
+                running_pid = r.stdout.strip()
+            else:
+                # macOS / Linux: 用 lsof 检查端口
+                r = subprocess.run(
+                    ["lsof", "-ti", ":9877", "-sTCP:LISTEN"],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", timeout=5,
+                )
+                running_pid = r.stdout.strip()
         except Exception:
             running_pid = ""
-
+    
         if running_pid:
             # 后端已在跑 → 桌宠 Electron 也在跑。
             # 提示用户；如果窗口被隐藏，告诉他右键托盘「显示/隐藏」。
-            console.print(Panel(
-                "[bold yellow]小狐狸已经在桌面上[/bold yellow]\n"
-                f"WebSocket 端口 9877 已监听（Python 后端 PID [cyan]{running_pid}[/cyan]）\n\n"
-                "[dim]如果桌面看不到：[/dim]\n"
-                "[dim]  - 右键系统托盘的 Spirit 图标 → 显示/隐藏[/dim]\n"
-                "[dim]  - 托盘图标可能在“隐藏的图标”里，点系统托盘右下小箭头展开[/dim]",
-                border_style="yellow",
-            ))
+            if is_windows:
+                console.print(Panel(
+                    "[bold yellow]小狐狸已经在桌面上[/bold yellow]\n"
+                    f"WebSocket 端口 9877 已监听（Python 后端 PID [cyan]{running_pid}[/cyan]）\n\n"
+                    "[dim]如果桌面看不到：[/dim]\n"
+                    "[dim]  - 右键系统托盘的 Spirit 图标 → 显示/隐藏[/dim]\n"
+                    "[dim]  - 托盘图标可能在\u201c隐藏的图标\u201d里，点系统托盘右下小箭头展开[/dim]",
+                    border_style="yellow",
+                ))
+            else:
+                console.print(Panel(
+                    "[bold yellow]小狐狸已经在桌面上[/bold yellow]\n"
+                    f"WebSocket 端口 9877 已监听（Python 后端 PID [cyan]{running_pid}[/cyan]）\n\n"
+                    "[dim]如果桌面看不到，请检查 Dock 或切换窗口（Cmd+Tab）[/dim]",
+                    border_style="yellow",
+                ))
         else:
-            # 后端不在 → 调 'spirit pet' 启动 Electron 桌宠（新窗口）。
-            # 路径解析：优先在当前 PATH + 用户级 PATH 找 spirit.cmd，
-            # 兑底硬编码路径（PowerShell 进程 $env:PATH 可能没继承用户 PATH）。
+            # 后端不在 → 启动桌宠后端（Python WebSocket 服务）。
             import shutil
+            spirit_cmd = "spirit.cmd" if is_windows else "spirit"
             spirit_path = (
-                shutil.which("spirit.cmd")
+                shutil.which(spirit_cmd)
                 or shutil.which("spirit")
-                or shutil.which("spirit.cmd", path=r"C:\Users\Administrator\bin;" + os.environ.get("PATH", ""))
-                or r"C:\Users\Administrator\bin\spirit.cmd"
+                or (r"C:\Users\Administrator\bin\spirit.cmd" if is_windows else None)
             )
+            if spirit_path is None:
+                console.print(Panel(
+                    "[bold red]找不到 'spirit' 命令[/bold red]\n"
+                    "[dim]请确认 spirit 已安装且在 PATH 中[/dim]",
+                    border_style="red",
+                ))
+                return True
             try:
-                subprocess.Popen(
-                    [spirit_path, "pet"],
+                popen_kwargs = dict(
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     stdin=subprocess.DEVNULL,
-                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
-                console.print(Panel(
-                    "[bold green]小狐狸已启动到桌面[/bold green]\n\n"
-                    "[dim]查看新打开的窗口（小狐狸会出现在桌面上）。[/dim]\n"
-                    "[dim]关闭：右键系统托盘的 Spirit 图标 → 退出[/dim]",
-                    border_style="green",
-                ))
+                if is_windows:
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                else:
+                    popen_kwargs["start_new_session"] = True
+                subprocess.Popen(
+                    [spirit_path, "pet"],
+                    **popen_kwargs,
+                )
+                if is_windows:
+                    console.print(Panel(
+                        "[bold green]小狐狸已启动到桌面[/bold green]\n\n"
+                        "[dim]查看新打开的窗口（小狐狸会出现在桌面上）。[/dim]\n"
+                        "[dim]关闭：右键系统托盘的 Spirit 图标 → 退出[/dim]",
+                        border_style="green",
+                    ))
+                else:
+                    console.print(Panel(
+                        "[bold green]小狐狸桌宠后端已启动[/bold green]\n\n"
+                        "[dim]WebSocket 服务运行在 ws://127.0.0.1:9877[/dim]\n"
+                        "[dim]如需 Electron 桌面应用，请在 desktop-app 目录运行 npm run dev[/dim]",
+                        border_style="green",
+                    ))
             except FileNotFoundError:
                 console.print(Panel(
                     f"[bold red]找不到 'spirit' 命令[/bold red]\n"
-                    f"[dim]尝试了路径: {spirit_path}\n"
-                    "[dim]请检查 C:\\Users\\Administrator\\bin 是否在 PATH 中，"
-                    "或 spirit.cmd 是否存在。[/dim]",
+                    f"[dim]尝试了路径: {spirit_path}[/dim]",
                     border_style="red",
                 ))
 

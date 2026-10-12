@@ -99,6 +99,11 @@ def _fetch_provider_usage(name: str, provider: str, base_url: str, api_key: str)
         # 官方无 key 级查询 API（OpenAPI 需 AK/SK 签名），如实标注
         return {"name": name, "available": False, "window": "month",
                 "reason": "月度Credits·控制台查"}
+    if "volces.com" in base or api_key.startswith("ark-"):
+        # 火山方舟按 token 计费（在线推理 / 体验中心按量），不提供 5h / 周 / 月 5h 窗口
+        # 的 key 级订阅查询 API（需要 AK/SK 调 GetCreditUsage）。如实标注，不静默丢弃。
+        return {"name": name, "available": False, "window": "month",
+                "reason": "按量计费·火山方舟控制台查"}
     return None
 
 # 尝试导入 websockets（可选依赖）

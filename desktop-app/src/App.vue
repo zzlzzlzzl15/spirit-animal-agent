@@ -17,7 +17,7 @@
     <PetSprite
       ref="spriteRef"
       :state="petStore.currentState"
-      :scale="petStore.scale"
+      :size="petStore.size"
       :pet-slug="petStore.activeSlug"
       :paused="isDragging"
       @click="onSpriteClick"
@@ -28,9 +28,10 @@
       @wheel="onWheel"
     />
 
-    <!-- 右键径向菜单 -->
+    <!-- 右键径向菜单（4 个功能按钮，改为左侧垂直排列） -->
     <RadialMenu
       v-if="showMenu"
+      :bubble-size="petStore.size"
       @close="showMenu = false"
       @action="onMenuAction"
     />
@@ -128,6 +129,22 @@ const IDLE_BUBBLES = [
 ]
 
 onMounted(async () => {
+  // ── 首次启动：根据屏幕宽度计算初始气泡大小 ──
+  // 主进程在窗口创建时不知道屏幕宽度（只在 electron.app 启动时同步过），
+  // 这里由前端在 onMounted 时拿到屏幕尺寸后下发，主进程 resize + 持久化。
+  if (petStore.size <= 0 || !Number.isFinite(petStore.size)) {
+    try {
+      const screen = await window.electronAPI?.getScreenSize?.()
+      if (screen && screen.width > 0) {
+        const initSize = petStore.computeInitialSize(screen.width)
+        petStore.setSize(initSize)  // 下发给主进程 → resize + save
+        console.log('[App] Initial bubble size from screen:', initSize, '(screen', screen.width, 'x', screen.height, ')')
+      }
+    } catch (e) {
+      console.warn('[App] Failed to get screen size for initial bubble:', e)
+    }
+  }
+
   // 与主进程同步初始捕获态：页面重载/渲染进程自愈后，主进程可能残留
   // “强制捕获”标记，会把整窗鼠标捕获卡死（透明区又开始吞屏幕点击）
   releaseForceCapture()
@@ -261,9 +278,11 @@ function onMenuAction(action: string) {
       }
       break
     case 'cli':
-      // CLI → 打开独立的 CMD 终端窗口
-      if (window.electronAPI?.openCLITerminal) {
-        window.electronAPI.openCLITerminal()
+      // CLI → 打开**系统真终端**（macOS Terminal.app / Windows cmd / Linux xterm）
+      // 并自动执行 `spirit` 命令。区别于 xterm 内置窗口：本机 shell 习惯、
+      // 历史/补全/剪贴板都是系统原生的。
+      if (window.electronAPI?.openSystemTerminal) {
+        window.electronAPI.openSystemTerminal()
       }
       break
     case 'voice':
@@ -322,15 +341,18 @@ function onDragEnd() {
 
 function onWheel(e: WheelEvent) {
   e.preventDefault()
-  const delta = e.deltaY > 0 ? -0.05 : 0.05
-  const newScale = Math.max(0.2, Math.min(3.0, petStore.scale + delta))
-  petStore.setScale(newScale)
-  // 同步服务端 prefs（重启后的唯一真相源），避免重启后缩放回滚
-  send('set_scale', { scale: newScale }).catch(() => {})
+  // 滚轮每次 ±4px
+  const delta = e.deltaY > 0 ? -4 : 4
+  const newSize = Math.max(44, Math.min(140, petStore.size + delta))
+  petStore.setSize(newSize)
+  // 同步服务端 prefs（重启后的唯一真相源），避免重启后尺寸回滚
+  send('set_size', { size: newSize }).catch(() => {})
 }
 </script>
 
 <style>
+/* 桌宠主界面：PetSprite 在窗口内居中，菜单 4 方向环绕展开。
+   窗口尺寸由主进程按 size + 2*MENU_PADDING 算好，前端无需关心边距 */
 #pet-app {
   position: relative;
   width: 100vw;

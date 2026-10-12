@@ -1499,6 +1499,15 @@ def _call_llm(
     gate_open = True
 
     for chunk in _watched_chunks():
+        # R-P2.2：每次 chunk 到达都刷新 turn 活性时钟。
+        # 背景是 _call_llm 入口只 touch 了一次（llm_call_start），如果 LLM 调用跑
+        # 超 600s（流式 thinking 模型/长输出/服务商拉跨），turn_liveness watchdog 会
+        # 认为 turn 卡死，从而误杀本轮——这是用户在 MiniMax-M3 / 双丝务线程
+        # “思考 10 分钟才出内容”场景下主/子代理被强制结束的根因。
+        # stream 看门狗仍走 120s stale 误杀流，这里只在 chunk 到位时补加 touch。
+        _touch = getattr(agent, "_touch_activity", None)
+        if callable(_touch):
+            _touch("stream_chunk")
         u = getattr(chunk, "usage", None)
         if u:
             usage = u

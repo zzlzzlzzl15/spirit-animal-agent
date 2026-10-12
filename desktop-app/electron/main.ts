@@ -27,7 +27,8 @@ const store = new Store({
   defaults: {
     windowX: -1,
     windowY: -1,
-    petScale: 0.75,
+    // petSize: 0 表示“首次启动，由前端根据屏幕宽度计算初始 size”
+    petSize: 0,
     activePetSlug: '',
   },
 })
@@ -49,18 +50,12 @@ app.whenReady().then(async () => {
   // 3. 创建桌宠窗口
   const savedX = store.get('windowX') as number
   const savedY = store.get('windowY') as number
-  let savedScale = store.get('petScale') as number
-  // 越界保护（与滚轮缩放同界）；不再抬高下限——用户保存的小缩放被强制
-  // 放大后窗口矩形随之变大，透明边距吞点击的范围也会变大
-  if (savedScale < 0.2 || savedScale > 3.0) {
-    savedScale = 0.75
-    store.set('petScale', savedScale)
-  }
-
+  const savedSize = store.get('petSize') as number
+  // petSize=0 表示首次启动，让 createPetWindow 用默认值；前端连接后会用真实 size 覆盖
   createPetWindow({
     x: savedX >= 0 ? savedX : undefined,
     y: savedY >= 0 ? savedY : undefined,
-    scale: savedScale,
+    size: savedSize > 0 ? savedSize : undefined,
   })
 
   // 4. 创建系统托盘
@@ -98,7 +93,7 @@ app.whenReady().then(async () => {
   startPetWatchdog(() => ({
     x: store.get('windowX') as number,
     y: store.get('windowY') as number,
-    scale: store.get('petScale') as number,
+    size: store.get('petSize') as number,
   }))
 })
 
@@ -199,11 +194,11 @@ function registerIPC(): void {
     store.set('windowY', y)
   })
 
-  // 保存缩放
-  ipcMain.on('save-scale', (_event, { scale }: { scale: number }) => {
-    store.set('petScale', scale)
-    // 实时调整桌宠窗口尺寸，匹配新缩放
-    resizePetWindow(scale)
+  // 保存气泡大小（CSS px）
+  ipcMain.on('save-size', (_event, { size }: { size: number }) => {
+    store.set('petSize', size)
+    // 实时调整桌宠窗口尺寸，匹配新 size
+    resizePetWindow(size)
   })
 
   // 获取保存的配置
@@ -211,7 +206,7 @@ function registerIPC(): void {
     return {
       windowX: store.get('windowX'),
       windowY: store.get('windowY'),
-      petScale: store.get('petScale'),
+      petSize: store.get('petSize'),
       activePetSlug: store.get('activePetSlug'),
       wsPort: WS_PORT,
     }
@@ -299,6 +294,55 @@ function registerIPC(): void {
     return true
   })
 
+  // 打开系统终端（macOS Terminal.app / Windows cmd / Linux xterm）并执行 `spirit`。
+  // 区别于 IPC `open-cli-terminal`：后者打开内置 xterm.js 窗口；
+  // 这个走系统真终端，便于用户使用本机 shell 习惯（zsh/bash/cmd/powershell）。
+  ipcMain.handle('open-system-terminal', () => {
+    const platform = process.platform
+    // 终端内预热：明确告知用户 spirit 命令已激活、且会话连续到 shell 不退出
+    // （这样 `spirit` 退出后，窗口不会闪没，UX 更顺）
+    const bootstrap = platform === 'win32'
+      ? 'echo ==== Spirit Agent CLI ==== && spirit && echo. && echo (spirit exit code: %errorlevel%)'
+      : 'echo "==== Spirit Agent CLI ===="; spirit; echo "(spirit exit code: $?)"; exec $SHELL'
+
+    try {
+      if (platform === 'darwin') {
+        // macOS：让 Terminal.app 新开一个窗口并执行命令
+        // do script 的字符串需转义反斜杠与双引号；换行用 \n (AppleScript 语法)
+        const escaped = bootstrap.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '" & return & "')
+        spawn('osascript', [
+          '-e', `tell application "Terminal" to do script "${escaped}"`,
+          '-e', 'tell application "Terminal" to activate',
+        ], { detached: true, stdio: 'ignore' }).unref()
+        return true
+      }
+      if (platform === 'win32') {
+        // Windows：start 启动新 cmd 窗口
+        // /k = 执行后保留窗口；&& pause 让 spirit 退出后等待用户按键关闭窗口
+        spawn('cmd', ['/c', 'start', '""', 'cmd', '/k', bootstrap], {
+          detached: true,
+          stdio: 'ignore',
+        }).unref()
+        return true
+      }
+      // Linux：探测常见终端模拟器（whichSync 需在文件顶部额外 import，
+      // 这里直接 execSync 'command -v'，避免多一个 import 引入循环依赖）
+      const { execSync } = require('child_process') as typeof import('child_process')
+      const candidates = ['x-terminal-emulator', 'gnome-terminal', 'konsole', 'xterm']
+      for (const c of candidates) {
+        try {
+          execSync(`command -v ${c}`, { stdio: 'ignore' })
+          spawn(c, ['-e', 'bash', '-c', bootstrap], { detached: true, stdio: 'ignore' }).unref()
+          return true
+        } catch { /* not found, try next */ }
+      }
+      return false
+    } catch (e) {
+      console.error('[main] open-system-terminal failed:', e)
+      return false
+    }
+  })
+
   // 显示气泡对话（独立窗口，在宠物上方）
   ipcMain.handle('show-bubble', (_event, { text }: { text: string }) => {
     const win = getPetWindow()
@@ -334,8 +378,12 @@ async function startPythonBackend(): Promise<void> {
 
   const scriptPath = path.join(projectRoot, 'spirit', 'desktop', '_launcher.py')
 
+  // 使用虚拟环境中的 Python
+  const venvPython = path.join(projectRoot, 'venv', 'bin', 'python')
+  const pythonCmd = require('fs').existsSync(venvPython) ? venvPython : 'python3'
+
   try {
-    pythonProcess = spawn('python', [scriptPath, '--ws-port', String(WS_PORT)], {
+    pythonProcess = spawn(pythonCmd, [scriptPath, '--ws-port', String(WS_PORT)], {
       cwd: projectRoot,
       env: { ...process.env, SPIRIT_WS_PORT: String(WS_PORT), PYTHONUTF8: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],

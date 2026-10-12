@@ -1,15 +1,25 @@
 <template>
-  <canvas
-    ref="canvasRef"
-    class="pet-canvas"
+  <!-- 圆形气泡容器：CSS 圆角 + 阴影 + 内部画狐狸精灵 -->
+  <div
+    ref="bubbleRef"
+    class="pet-bubble"
     :class="{ dragging: props.paused }"
-    :width="displayW"
-    :height="displayH"
-    :style="{ width: displayW + 'px', height: displayH + 'px' }"
+    :style="bubbleStyle"
     @mousedown="onMouseDown"
     @click="handleClick"
     @contextmenu.prevent="handleContextMenu"
-  />
+    @wheel="onWheel"
+  >
+    <canvas
+      ref="canvasRef"
+      class="pet-canvas"
+      :width="displayW"
+      :height="displayH"
+      :style="{ width: displayW + 'px', height: displayH + 'px' }"
+    />
+    <!-- 圆形高光叠加层：让气泡有点 3D 感（可选，不抢狐狸的可见性） -->
+    <div class="pet-bubble-shine"></div>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -17,8 +27,9 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { usePetAnimation } from '../composables/usePetAnimation'
 
 const props = defineProps<{
+  /** 气泡直径（CSS px），由 App.vue 根据屏幕尺寸计算 */
+  size: number
   state: string
-  scale: number
   petSlug: string
   paused?: boolean
 }>()
@@ -32,28 +43,27 @@ const emit = defineEmits<{
   (e: 'wheel', event: WheelEvent): void
 }>()
 
-// 事件处理函数
-function handleClick(e: MouseEvent) {
-  console.log('[Canvas] click', displayW.value, displayH.value)
-  emit('click', e)
-}
-
-function handleContextMenu(e: MouseEvent) {
-  console.log('[Canvas] contextmenu')
-  emit('contextmenu', e)
-}
-
+const bubbleRef = ref<HTMLDivElement>()
 const canvasRef = ref<HTMLCanvasElement>()
 const { FRAME_W, FRAME_H, setState, startAnimation, stopAnimation, drawFrame } = usePetAnimation()
 
-// 显示尺寸
-const displayW = computed(() => Math.round(FRAME_W * props.scale))
-const displayH = computed(() => Math.round(FRAME_H * props.scale))
+/** canvas 显示尺寸：max(1, size) 避免 size=0 初始态触发 drawImage 错误。
+ *  父组件 onMounted 中会调 computeInitialSize 把 size 设成正常值，UI 不会卡在 size=0 */
+const displayW = computed(() => Math.max(1, props.size))
+const displayH = computed(() => Math.max(1, props.size))
+
+/** 气泡容器样式：size=0 时容器不显示（避免渲染空白圆） */
+const bubbleStyle = computed(() => ({
+  width: `${Math.max(1, props.size)}px`,
+  height: `${Math.max(1, props.size)}px`,
+  opacity: props.size > 0 ? 1 : 0,
+  pointerEvents: props.size > 0 ? 'auto' : 'none',
+}))
 
 // 精灵图
 const spriteImage = ref<HTMLImageElement | null>(null)
 
-// 离屏画布（双缓冲，防闪烁）
+// 离屏画布（双缓冲）
 let offscreen: HTMLCanvasElement | null = null
 let offCtx: CanvasRenderingContext2D | null = null
 
@@ -65,9 +75,12 @@ watch(() => props.state, (newState) => {
 // 加载精灵图
 function loadSprite(slug: string): void {
   const img = new Image()
-  // 使用相对路径，适配 Electron file:// 协议
-  img.src = `./assets/pets/${slug || 'spirit-fox'}/spritesheet.png?t=${Date.now()}`
+  // Vite dev server 模式下使用根路径，Electron file:// 模式下也走相对路径
+  const spritePath = `/assets/pets/${slug || 'spirit-fox'}/spritesheet.png`
+  img.src = `${spritePath}?t=${Date.now()}`
+  console.log('[PetSprite] Loading sprite:', img.src)
   img.onload = () => {
+    console.log('[PetSprite] Sprite loaded successfully:', img.width, 'x', img.height)
     spriteImage.value = img
   }
   img.onerror = () => {
@@ -84,24 +97,33 @@ function loadSprite(slug: string): void {
 let isDragging = false
 
 function onMouseDown(e: MouseEvent) {
-  if (e.button === 0) {
-    isDragging = true
-    emit('drag-start', e)
+  if (e.button !== 0) return
+  isDragging = true
+  emit('drag-start', e)
 
-    const onMove = (ev: MouseEvent) => {
-      if (isDragging) {
-        emit('drag-move', ev)
-      }
-    }
-    const onUp = (ev: MouseEvent) => {
-      isDragging = false
-      emit('drag-end', ev)
-      document.removeEventListener('mousemove', onMove)
-      document.removeEventListener('mouseup', onUp)
-    }
-    document.addEventListener('mousemove', onMove)
-    document.addEventListener('mouseup', onUp)
+  const onMove = (ev: MouseEvent) => {
+    if (isDragging) emit('drag-move', ev)
   }
+  const onUp = (ev: MouseEvent) => {
+    isDragging = false
+    emit('drag-end', ev)
+    document.removeEventListener('mousemove', onMove)
+    document.removeEventListener('mouseup', onUp)
+  }
+  document.addEventListener('mousemove', onMove)
+  document.addEventListener('mouseup', onUp)
+}
+
+function handleClick(e: MouseEvent) {
+  emit('click', e)
+}
+
+function handleContextMenu(e: MouseEvent) {
+  emit('contextmenu', e)
+}
+
+function onWheel(e: WheelEvent) {
+  emit('wheel', e)
 }
 
 // ── 渲染（双缓冲） ────────────────────────────────────────
@@ -124,23 +146,31 @@ function renderFrame() {
   const w = canvas.width
   const h = canvas.height
 
-  // 在离屏画布上绘制
   ensureOffscreen(w, h)
-  // 局部引用便于 TS 收窄类型（模块级 let 无法保证非空）
   const buffer = offscreen
   if (!offCtx || !buffer) return
 
   offCtx.clearRect(0, 0, w, h)
 
   if (spriteImage.value) {
-    // 直接使用 canvas 尺寸作为目标尺寸，确保完整显示
-    const targetScale = Math.min(w / FRAME_W, h / FRAME_H)
-    drawFrame(offCtx, spriteImage.value, 0, 0, targetScale)
+    // 狐狸精灵图按帧原始比例缩放适配到圆形容器：
+    // 帧 192x208 → 容器正方形 → 取 min 缩放保证完整显示，留点 padding
+    const padding = 0.04  // 4% 内边距，避免狐狸贴边被圆形剪裁
+    const targetScale = Math.min(w / FRAME_W, h / FRAME_H) * (1 - padding)
+    // 居中绘制
+    const drawW = FRAME_W * targetScale
+    const drawH = FRAME_H * targetScale
+    const ox = (w - drawW) / 2
+    const oy = (h - drawH) / 2
+    drawFrame(offCtx, spriteImage.value, ox, oy, targetScale)
   } else {
-    drawPlaceholder(offCtx, w, h)
+    // 精灵图未加载完成 → 画一个橙色占位圆
+    offCtx.fillStyle = 'rgba(251, 146, 60, 0.4)'
+    offCtx.beginPath()
+    offCtx.arc(w / 2, h / 2, Math.min(w, h) * 0.35, 0, Math.PI * 2)
+    offCtx.fill()
   }
 
-  // 一次性拷贝到主画布（减少闪烁）
   ctx.clearRect(0, 0, w, h)
   ctx.drawImage(buffer, 0, 0)
 }
@@ -149,7 +179,6 @@ function renderFrame() {
 let rafId: number | null = null
 
 function renderLoop() {
-  // 拖拽时暂停动画，只渲染静态帧
   if (!props.paused) {
     renderFrame()
   }
@@ -162,149 +191,6 @@ watch(() => props.paused, (paused) => {
     renderFrame()
   }
 })
-
-function drawPlaceholder(ctx: CanvasRenderingContext2D, w: number, h: number) {
-  const cx = w / 2
-  const cy = h / 2
-  const unit = Math.min(w, h) / 10 // 基准单位
-
-  // ── 尾巴（身后） ──
-  ctx.fillStyle = '#f09030'
-  ctx.beginPath()
-  ctx.ellipse(cx + unit * 2.8, cy + unit * 1.5, unit * 2.2, unit * 1.2, 0.4, 0, Math.PI * 2)
-  ctx.fill()
-  // 尾巴尖白色
-  ctx.fillStyle = '#fff5e6'
-  ctx.beginPath()
-  ctx.ellipse(cx + unit * 3.8, cy + unit * 0.8, unit * 0.8, unit * 0.6, 0.6, 0, Math.PI * 2)
-  ctx.fill()
-
-  // ── 身体 ──
-  ctx.fillStyle = '#f5a623'
-  ctx.beginPath()
-  ctx.ellipse(cx, cy + unit * 1.8, unit * 2.8, unit * 2.2, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // 白色肚子
-  ctx.fillStyle = '#fff5e6'
-  ctx.beginPath()
-  ctx.ellipse(cx, cy + unit * 2.2, unit * 1.6, unit * 1.4, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // ── 头部 ──
-  ctx.fillStyle = '#f5a623'
-  ctx.beginPath()
-  ctx.ellipse(cx, cy - unit * 0.5, unit * 2.5, unit * 2.2, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // 白色面部
-  ctx.fillStyle = '#fff5e6'
-  ctx.beginPath()
-  ctx.ellipse(cx, cy + unit * 0.3, unit * 1.8, unit * 1.5, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // ── 耳朵 ──
-  // 左耳
-  ctx.fillStyle = '#f5a623'
-  ctx.beginPath()
-  ctx.moveTo(cx - unit * 1.8, cy - unit * 1.5)
-  ctx.lineTo(cx - unit * 2.5, cy - unit * 3.5)
-  ctx.lineTo(cx - unit * 0.5, cy - unit * 2.2)
-  ctx.closePath()
-  ctx.fill()
-  // 左耳内耳
-  ctx.fillStyle = '#ffb6c1'
-  ctx.beginPath()
-  ctx.moveTo(cx - unit * 1.6, cy - unit * 1.7)
-  ctx.lineTo(cx - unit * 2.1, cy - unit * 3.0)
-  ctx.lineTo(cx - unit * 0.8, cy - unit * 2.1)
-  ctx.closePath()
-  ctx.fill()
-
-  // 右耳
-  ctx.fillStyle = '#f5a623'
-  ctx.beginPath()
-  ctx.moveTo(cx + unit * 1.8, cy - unit * 1.5)
-  ctx.lineTo(cx + unit * 2.5, cy - unit * 3.5)
-  ctx.lineTo(cx + unit * 0.5, cy - unit * 2.2)
-  ctx.closePath()
-  ctx.fill()
-  // 右耳内耳
-  ctx.fillStyle = '#ffb6c1'
-  ctx.beginPath()
-  ctx.moveTo(cx + unit * 1.6, cy - unit * 1.7)
-  ctx.lineTo(cx + unit * 2.1, cy - unit * 3.0)
-  ctx.lineTo(cx + unit * 0.8, cy - unit * 2.1)
-  ctx.closePath()
-  ctx.fill()
-
-  // ── 眼睛 ──
-  const eyeY = cy - unit * 0.3
-  const eyeSpacing = unit * 1.0
-  const eyeR = unit * 0.55
-
-  // 眼白
-  ctx.fillStyle = '#fff'
-  ctx.beginPath()
-  ctx.ellipse(cx - eyeSpacing, eyeY, eyeR, eyeR * 1.1, 0, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.beginPath()
-  ctx.ellipse(cx + eyeSpacing, eyeY, eyeR, eyeR * 1.1, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // 瞳孔（大而有神）
-  ctx.fillStyle = '#2d1b00'
-  ctx.beginPath()
-  ctx.ellipse(cx - eyeSpacing, eyeY + unit * 0.1, eyeR * 0.6, eyeR * 0.7, 0, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.beginPath()
-  ctx.ellipse(cx + eyeSpacing, eyeY + unit * 0.1, eyeR * 0.6, eyeR * 0.7, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // 高光
-  ctx.fillStyle = '#fff'
-  ctx.beginPath()
-  ctx.arc(cx - eyeSpacing - unit * 0.15, eyeY - unit * 0.15, eyeR * 0.25, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.beginPath()
-  ctx.arc(cx + eyeSpacing - unit * 0.15, eyeY - unit * 0.15, eyeR * 0.25, 0, Math.PI * 2)
-  ctx.fill()
-
-  // ─ 鼻子 ──
-  ctx.fillStyle = '#ff6b8a'
-  ctx.beginPath()
-  ctx.ellipse(cx, cy + unit * 0.5, unit * 0.3, unit * 0.22, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // ─ 嘴巴（ω 形） ─
-  ctx.strokeStyle = '#8b5e3c'
-  ctx.lineWidth = Math.max(1.5, unit * 0.12)
-  ctx.lineCap = 'round'
-  ctx.beginPath()
-  ctx.arc(cx - unit * 0.35, cy + unit * 0.65, unit * 0.35, -0.2 * Math.PI, 0.7 * Math.PI)
-  ctx.stroke()
-  ctx.beginPath()
-  ctx.arc(cx + unit * 0.35, cy + unit * 0.65, unit * 0.35, 0.3 * Math.PI, 1.2 * Math.PI)
-  ctx.stroke()
-
-  // ── 腮红 ─
-  ctx.fillStyle = 'rgba(255, 150, 150, 0.35)'
-  ctx.beginPath()
-  ctx.ellipse(cx - unit * 1.6, cy + unit * 0.4, unit * 0.5, unit * 0.3, 0, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.beginPath()
-  ctx.ellipse(cx + unit * 1.6, cy + unit * 0.4, unit * 0.5, unit * 0.3, 0, 0, Math.PI * 2)
-  ctx.fill()
-
-  // ── 小爪子 ─
-  ctx.fillStyle = '#fff5e6'
-  ctx.beginPath()
-  ctx.ellipse(cx - unit * 1.2, cy + unit * 3.2, unit * 0.6, unit * 0.4, -0.2, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.beginPath()
-  ctx.ellipse(cx + unit * 1.2, cy + unit * 3.2, unit * 0.6, unit * 0.4, 0.2, 0, Math.PI * 2)
-  ctx.fill()
-}
 
 onMounted(() => {
   loadSprite(props.petSlug)
@@ -323,18 +209,67 @@ watch(() => props.petSlug, (newSlug) => {
 </script>
 
 <style scoped>
-.pet-canvas {
-  cursor: pointer;
-  background: transparent;
+.pet-bubble {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+  /* 容器：白底 + 细描边 + 柔光阴影，圆形剪裁 */
+  background: rgba(255, 255, 255, 0.96);
+  border: 1.5px solid rgba(251, 146, 60, 0.35);
+  box-shadow:
+    0 4px 14px rgba(0, 0, 0, 0.18),
+    0 1px 3px rgba(0, 0, 0, 0.08),
+    inset 0 1px 2px rgba(255, 255, 255, 0.6);
+  overflow: hidden;
+  transition: transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1),
+              box-shadow 0.18s ease;
   will-change: transform;
-  /* 平滑缩放 */
-  image-rendering: auto;
   -webkit-backface-visibility: hidden;
   backface-visibility: hidden;
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
 }
-.pet-canvas.dragging {
+
+.pet-bubble:hover {
+  transform: scale(1.05);
+  box-shadow:
+    0 6px 20px rgba(0, 0, 0, 0.22),
+    0 2px 6px rgba(0, 0, 0, 0.1),
+    inset 0 1px 2px rgba(255, 255, 255, 0.7);
+}
+
+.pet-bubble.dragging {
   cursor: grabbing;
-  /* 拖拽时禁用合成优化 */
-  opacity: 0.999;
+  transform: scale(0.97);
+  box-shadow:
+    0 2px 8px rgba(0, 0, 0, 0.18),
+    inset 0 1px 2px rgba(255, 255, 255, 0.5);
+}
+
+.pet-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+  background: transparent;
+  pointer-events: none;
+}
+
+/* 圆形顶部高光：增强立体感 */
+.pet-bubble-shine {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(
+    ellipse at 30% 20%,
+    rgba(255, 255, 255, 0.55) 0%,
+    rgba(255, 255, 255, 0) 45%
+  );
+  pointer-events: none;
+  z-index: 1;
 }
 </style>

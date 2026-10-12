@@ -16,28 +16,27 @@ import path from 'path'
 // 窗口常量
 // ---------------------------------------------------------------------------
 
-/** 精灵帧原始尺寸 */
-const FRAME_W = 192
-const FRAME_H = 208
-
-/** 默认缩放 */
-const DEFAULT_SCALE = 0.75
-
-/** 窗口额外边距（防止精灵被裁剪） */
-const PADDING = 4
+/** 最小气泡直径（CSS px）——极其小巧（与 petStore.MIN_SIZE 同步） */
+const MIN_SIZE = 24
+/** 最大气泡直径（CSS px，与 petStore.MAX_SIZE 同步） */
+const MAX_SIZE = 80
+/** 默认气泡直径（主进程 init 时使用；前端连接后会上发真实 size 覆盖） */
+const DEFAULT_SIZE = 28
 
 /**
- * 径向菜单外扩留白（每侧）：4 个按钮在半径 55 + 按钮半宽 22 之外还要 3px 余量。
- * 此前 PADDING=4 时窗口 148×160，左右按钮中心 ±77 已超过窗口半宽 74，被裁 3px。
- * 加大到 80 后窗口 308×320，按钮完全落在窗口内。
+ * 径向菜单的外扩留白：每侧要装下“按钮 + 间距 + 功能名 label”。
+ * 按钮 30px + 间距 10px + 按钮半径 15px + label 间距 8px + label 宽 ~60px ≈ 123px，
+ * 取 130px。窗口 = 气泡 + 2*130 = 上下左右都多 130px。
  */
-const MENU_PADDING = 80
+const MENU_PADDING = 130
+
+/** 距离桌面边缘的留白（首次启动默认位置） */
+const EDGE_MARGIN = 30
 
 /**
- * 狐狸可见包围盒（帧内坐标，按 spritesheet alpha 通道实测 (28,6)-(178,202)）。
- * 包围盒之外全是帧的透明边距——这块隐形矩形正是“看不见却挡住点击”的区域。
+ * 圆形气泡的命中检测：光标在圆内才视为命中。圆心在窗口中心（窗口公式决定），
+ * 半径 = size/2。计算时把光标屏幕坐标先转窗口 DIP 坐标，再判点到圆心距离。
  */
-const FOX_BBOX = { x: 28, y: 6, w: 151, h: 197 }
 
 /** 光标命中轮询间隔（ms）：光标移到狐狸上后收回鼠标捕获的最大延迟 */
 const HIT_POLL_MS = 50
@@ -50,6 +49,9 @@ const FORCE_CAPTURE_GUARD_MS = 5000
 // ---------------------------------------------------------------------------
 
 let petWindow: BrowserWindow | null = null
+
+/** 当前气泡直径（CSS px），窗口尺寸和命中判定都依赖这个值 */
+let currentSize = 28
 
 /** 用户是否主动隐藏了宠物（托盘切换）；可见性看门狗不得覆盖用户意图自动显示 */
 let petUserHidden = false
@@ -65,7 +67,8 @@ export function isPetUserHidden(): boolean {
 interface PetWindowOptions {
   x?: number
   y?: number
-  scale?: number
+  /** 气泡直径（CSS px）。0 表示使用默认值（前端在 init 时会下发真实值） */
+  size?: number
 }
 
 /**
@@ -73,16 +76,16 @@ interface PetWindowOptions {
  */
 export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
   petUserHidden = false  // 新窗口处于可见状态
-  const scale = options.scale || DEFAULT_SCALE
-  // 窗口 = 精灵 + 精灵防裁剪留白 + 径向菜单外扩留白（每侧 MENU_PADDING）
-  // 精灵在窗口内居中，四周各留 (PADDING/2 + MENU_PADDING) 的透明边距
-  const contentW = Math.round(FRAME_W * scale) + PADDING + 2 * MENU_PADDING
-  const contentH = Math.round(FRAME_H * scale) + PADDING + 2 * MENU_PADDING
+  const size = clampSize(options.size ?? DEFAULT_SIZE)
+  currentSize = size
+  // 窗口 = 气泡 + 4 方向外推空间（每侧 MENU_PADDING=80）
+  const contentW = size + 2 * MENU_PADDING
+  const contentH = size + 2 * MENU_PADDING
 
-  // 默认位置：屏幕底部居中
+  // 默认位置：屏幕右下角边缘（贴边）
   const display = screen.getPrimaryDisplay()
-  let x = options.x ?? Math.floor(display.workAreaSize.width / 2 - contentW / 2)
-  let y = options.y ?? Math.floor(display.workAreaSize.height - contentH - 50)
+  let x = options.x ?? Math.floor(display.workAreaSize.width - contentW - EDGE_MARGIN)
+  let y = options.y ?? Math.floor(display.workAreaSize.height - contentH - EDGE_MARGIN)
 
   // 恢复位置校验：保存的坐标若已完全落在屏幕外（拔显示器/分辨率变化），
   // 回退到主屏底部居中，避免桌宠“消失”
@@ -94,8 +97,8 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
     )
   })
   if (!onScreen) {
-    x = Math.floor(display.workAreaSize.width / 2 - contentW / 2)
-    y = Math.floor(display.workAreaSize.height - contentH - 50)
+    x = Math.floor(display.workAreaSize.width - contentW - EDGE_MARGIN)
+    y = Math.floor(display.workAreaSize.height - contentH - EDGE_MARGIN)
   }
 
   petWindow = new BrowserWindow({
@@ -154,10 +157,31 @@ export function createPetWindow(options: PetWindowOptions = {}): BrowserWindow {
 
   // 开发模式加载 Vite dev server，生产模式加载构建产物
   if (process.env.VITE_DEV_SERVER_URL) {
+    console.log('[pet] Loading Vite dev server:', process.env.VITE_DEV_SERVER_URL)
     petWindow.loadURL(process.env.VITE_DEV_SERVER_URL)
   } else {
+    console.log('[pet] Loading local file:', path.join(__dirname, '..', 'dist', 'index.html'))
     petWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'))
   }
+
+  // 渲染层 console 管道：前端渲染异常时可在主进程日志直接看到
+  petWindow.webContents.on('console-message', (_event, level, message) => {
+    const prefix = ['[pet renderer]', '[pet renderer WARN]', '[pet renderer ERR]'][level] || '[pet renderer]'
+    console.log(`${prefix} ${message}`)
+  })
+
+  // 调试：页面加载完成
+  petWindow.webContents.on('did-finish-load', () => {
+    console.log('[pet] Page loaded successfully')
+    // 打开 DevTools 以便调试（开发模式）
+    if (process.env.VITE_DEV_SERVER_URL) {
+      petWindow!.webContents.openDevTools({ mode: 'detach' })
+      console.log('[pet] DevTools opened')
+    }
+  })
+  petWindow.webContents.on('did-fail-load', (_event, code, desc) => {
+    console.error('[pet] Page load failed:', code, desc)
+  })
 
   // 窗口关闭事件
   petWindow.on('closed', () => {
@@ -187,16 +211,23 @@ export function getPetWindow(): BrowserWindow | null {
 }
 
 /**
- * 更新窗口大小（缩放变化时调用）。
+ * 更新窗口大小（气泡 size 变化时调用）。
+ * @param size 新的气泡直径（CSS px），会被钳制到合法区间
  */
-export function resizePetWindow(scale: number): void {
+export function resizePetWindow(size: number): void {
   if (!petWindow) return
-
-  // 同步 createPetWindow 的尺寸公式：精灵 + PADDING + 2*MENU_PADDING
-  const contentW = Math.round(FRAME_W * scale) + PADDING + 2 * MENU_PADDING
-  const contentH = Math.round(FRAME_H * scale) + PADDING + 2 * MENU_PADDING
-
+  const newSize = clampSize(size)
+  currentSize = newSize
+  // 同步 createPetWindow 的尺寸公式：4 方向外推
+  const contentW = newSize + 2 * MENU_PADDING
+  const contentH = newSize + 2 * MENU_PADDING
   petWindow.setSize(contentW, contentH)
+}
+
+/** 把 size 钳制到合法区间 */
+function clampSize(n: number): number {
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_SIZE
+  return Math.max(MIN_SIZE, Math.min(MAX_SIZE, Math.round(n)))
 }
 
 // ---------------------------------------------------------------------------
@@ -215,8 +246,12 @@ let hitTimer: ReturnType<typeof setInterval> | null = null
 /** 渲染层交互态（菜单/面板/拖拽）要求整窗收回捕获 */
 let forceCapture = false
 
-/** 当前 OS 层鼠标忽略状态（缓存，避免每轮重复调用 setIgnoreMouseEvents） */
-let ignoring = true
+/** 当前 OS 层鼠标忽略状态（缓存，避免每轮重复调用 setIgnoreMouseEvents）。
+ *  初始 null 很重要：表示“还没真正下发过状态”，第一次 applyMouseIgnore 必须执行。
+ *  之前用 true 初始化导致 createPetWindow 里 applyMouseIgnore(true) 被缓存命中
+ *  跳过，窗口从未被设置过忽略鼠标，整片透明区都在拦截点击（用户反映“隐形块”）。
+ */
+let ignoring: boolean | null = null
 
 /** 菜单/面板按钮屏幕坐标列表（由渲染层 RadialMenu/Panel 推送到主进程，屏幕绝对坐标） */
 let hitBoxes: Array<{ x: number; y: number; w: number; h: number }> = []
@@ -231,26 +266,23 @@ function applyMouseIgnore(ignore: boolean): void {
   petWindow.setIgnoreMouseEvents(ignore)
 }
 
-/** 光标是否落在狐狸可见包围盒内（窗口 DIP 坐标 → 精灵帧内坐标）。 */
-function cursorOnFox(): boolean {
+/** 光标是否落在气泡圆形区域内（窗口 DIP 坐标 → 圆心距离判定）。
+ *  圆心 = 窗口中心（窗口公式：size + 2*MENU_PADDING），半径 = size/2。
+ */
+function cursorOnBubble(): boolean {
   if (!petWindow || petWindow.isDestroyed() || !petWindow.isVisible()) return false
   const b = petWindow.getBounds()
   const p = screen.getCursorScreenPoint()
   const lx = p.x - b.x
   const ly = p.y - b.y
   if (lx < 0 || ly < 0 || lx >= b.width || ly >= b.height) return false
-  // 画布在窗口内居中：反解缩放 = (窗口宽 - 全部留白) / 帧宽
-  const scale = (b.width - PADDING - 2 * MENU_PADDING) / FRAME_W
-  if (scale <= 0) return false
-  // 精灵相对窗口左上角的偏移（窗口内居中）
-  const offsetX = (b.width - FRAME_W * scale) / 2
-  const offsetY = (b.height - FRAME_H * scale) / 2
-  const fx = (lx - offsetX) / scale
-  const fy = (ly - offsetY) / scale
-  return (
-    fx >= FOX_BBOX.x && fx <= FOX_BBOX.x + FOX_BBOX.w &&
-    fy >= FOX_BBOX.y && fy <= FOX_BBOX.y + FOX_BBOX.h
-  )
+  // 圆心 = 窗口中心
+  const cx = b.width / 2
+  const cy = b.height / 2
+  const r = currentSize / 2
+  const dx = lx - cx
+  const dy = ly - cy
+  return (dx * dx + dy * dy) <= (r * r)
 }
 
 /**
@@ -258,7 +290,7 @@ function cursorOnFox(): boolean {
  * 主进程轮询以这个为唯一判定——让 forceCapture=true 期间仍能在按钮外穿透。
  */
 function cursorOnHitTarget(): boolean {
-  if (cursorOnFox()) return true
+  if (cursorOnBubble()) return true
   if (hitBoxes.length === 0) return false
   const p = screen.getCursorScreenPoint()
   for (let i = 0; i < hitBoxes.length; i++) {
@@ -333,7 +365,7 @@ export function setPetForceCapture(force: boolean): void {
       forceCapture = false
       hitBoxes = []
       if (!petWindow || petWindow.isDestroyed()) return
-      applyMouseIgnore(!cursorOnFox())
+      applyMouseIgnore(!cursorOnBubble())
     }, FORCE_CAPTURE_GUARD_MS)
   }
   if (!petWindow || petWindow.isDestroyed()) return
@@ -352,7 +384,7 @@ export function resetPetClickCapture(): void {
     forceGuardTimer = null
   }
   if (!petWindow || petWindow.isDestroyed()) return
-  applyMouseIgnore(!cursorOnFox())
+  applyMouseIgnore(!cursorOnBubble())
 }
 
 /**
@@ -464,7 +496,7 @@ let watchdogCycles = 0
  * - z-order 掉层        → moveTop 夺回置顶
  * - 合成层停绘（rAF 停摆，连续 2 个心跳周期帧数不涨）→ 强制重建合成层
  */
-export function startPetWatchdog(getSavedPosition: () => { x: number; y: number; scale: number }): void {
+export function startPetWatchdog(getSavedPosition: () => { x: number; y: number; size: number }): void {
   // 渲染进程心跳：rAF 帧数（仅桌宠主视图窗口上报）
   if (!watchdogRegistered) {
     watchdogRegistered = true
@@ -485,8 +517,8 @@ export function startPetWatchdog(getSavedPosition: () => { x: number; y: number;
     if (!petWindow || petWindow.isDestroyed()) {
       if (!petUserHidden) {
         console.warn('[pet watchdog] window missing — recreating')
-        const { x, y, scale } = getSavedPosition()
-        createPetWindow({ x, y, scale })
+        const { x, y, size } = getSavedPosition()
+        createPetWindow({ x, y, size })
       }
       lastHeartbeatFrames = -1
       stalledCycles = 0
@@ -746,19 +778,18 @@ export function createBubbleWindow(
 
   const bubbleW = 220
   const bubbleH = 60
-  const gap = 10  // 气泡底部与狐狸头顶的视觉间距（之前是 2px 在窗口顶部，看着像悬空）
+  const gap = 10  // 对话气泡与桌宠气泡顶部的视觉间距
 
-  // 反算精灵缩放：窗口宽 = round(FRAME_W*scale) + PADDING + 2*MENU_PADDING
-  // （含 MENU_PADDING=80 的径向菜单外扩留白——之前按窗口顶部定位会离狐狸 ~84px 远）
-  const scale = (petBounds.w - PADDING - 2 * MENU_PADDING) / FRAME_W
-  const spriteH = Math.round(FRAME_H * scale)
-  // 精灵在窗口内顶部偏移 = (窗口高 - 精灵高) / 2
-  const spriteTopOffset = Math.round((petBounds.h - spriteH) / 2)
+  // 桌面气泡在窗口内居中：圆心 = (W/2, H/2)
+  // 气泡顶部 = 圆心 y - size/2
+  const bubbleCenterX = petBounds.x + petBounds.w / 2
+  const bubbleCenterY = petBounds.y + petBounds.h / 2
+  const bubbleTopY = bubbleCenterY - currentSize / 2
 
-  // 气泡显示在狐狸头顶上方，水平居中
-  const x = petBounds.x + Math.round(petBounds.w / 2) - Math.round(bubbleW / 2)
-  // 气泡底部 = 精灵顶部 - gap
-  const y = petBounds.y + spriteTopOffset - bubbleH - gap
+  // 对话气泡显示在桌宠气泡头顶上方，水平居中于桌宠气泡
+  const x = bubbleCenterX - Math.round(bubbleW / 2)
+  // 气泡底部 = 桌宠气泡顶部 - gap
+  const y = bubbleTopY - bubbleH - gap
 
   // 确保不超出屏幕左边界
   const finalX = Math.max(0, x)
