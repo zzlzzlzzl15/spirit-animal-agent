@@ -708,12 +708,13 @@ FOX_LOGO = r"""
 
 
 def _print_welcome_panel(agent, tool_count: int) -> None:
-    """顶部黄色欢迎面板 — Spirit CLI v1.0 + 小狐狸 + 命令提示。"""
+    """顶部黄色欢迎面板 — 命令提示（无 ASCII 狐狸，避免与外层 TUI wrapper 重复显示）。
+
+    v0.4.x 改动：去掉 FOX_LOGO + body 里的 "Spirit Agent CLI v1.0" 标题（Panel title
+    已经是 "Spirit Agent CLI"），避免与外层 TUI 启动器（Spirit Agent + SPIRIT 大字）
+    在终端重复显示两次图标。命令提示保持不变。
+    """
     body = Text()
-    body.append(FOX_LOGO, style="bold yellow")
-    body.append("\n")
-    body.append("Spirit Agent CLI ", style="bold yellow")
-    body.append("v1.0\n\n", style="dim yellow")
     body.append("输入 ", style="white")
     body.append("/help", style="bold yellow")
     body.append(" 查看可用命令\n", style="white")
