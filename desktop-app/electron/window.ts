@@ -778,23 +778,36 @@ export function createBubbleWindow(
 
   const bubbleW = 220
   const bubbleH = 60
-  const gap = 10  // 对话气泡与桌宠气泡顶部的视觉间距
+  const gap = 10  // 对话气泡 tail 底与小狐狸圆顶的视觉间距
 
-  // 桌面气泡在窗口内居中：圆心 = (W/2, H/2)
-  // 气泡顶部 = 圆心 y - size/2
+  // v0.3.4 fix: 之前 tail 底 = 圆心 y - size/2 - gap = 圆顶 y - gap，
+  // 几何上 gap=10 完全对齐。但 SpeechBubblePage 用 flex 居中让
+  // .bubble-wrapper 在 60px BrowserWindow 内居中后撑满整个窗口高度，
+  // 导致 content 矩形顶在窗口顶（屏幕看像漂在小狐狸头顶上方 70px）。
+  // CSS 已改成 align-items: flex-end 让 wrapper 底贴窗口底，
+  // tail 底紧贴 BrowserWindow 底，content 紧贴 tail 顶。
   const bubbleCenterX = petBounds.x + petBounds.w / 2
   const bubbleCenterY = petBounds.y + petBounds.h / 2
-  const bubbleTopY = bubbleCenterY - currentSize / 2
-
-  // 对话气泡显示在桌宠气泡头顶上方，水平居中于桌宠气泡
+  const bubbleTopY = bubbleCenterY - currentSize / 2  // 圆顶部 y
+  // tail 底 = 圆顶 y - gap（距小狐狸圆顶 10px）
+  // BrowserWindow y + bubbleH = 圆顶 y - gap
+  //   → BrowserWindow y = 圆顶 y - bubbleH - gap
   const x = bubbleCenterX - Math.round(bubbleW / 2)
-  // 气泡底部 = 桌宠气泡顶部 - gap
   const y = bubbleTopY - bubbleH - gap
 
   // 确保不超出屏幕左边界
   const finalX = Math.max(0, x)
-  // 确保不超出屏幕上边界
+  // 确保不超出屏幕上边界（若桌宠贴顶，钳到屏幕顶，气泡会被裁但不会负坐标）
   const finalY = Math.max(0, y)
+
+  // 调试日志（生产保留：用于诊断气泡位置 bug；如需静音可移除）
+  if (process.env.SPIRIT_DEV_VERBOSE === '1') {
+    console.log('[bubble] petBounds=', petBounds, 'currentSize=', currentSize,
+      'bubbleCenter=', { x: bubbleCenterX, y: bubbleCenterY },
+      'final=', { x: finalX, y: finalY, w: bubbleW, h: bubbleH },
+      'petCenter=', { x: bubbleCenterX, y: bubbleCenterY },
+      'petTopY=', bubbleTopY)
+  }
 
   bubbleWindow = new BrowserWindow({
     x: finalX,
@@ -834,6 +847,20 @@ export function createBubbleWindow(
   // 以“非激活”方式显示：不夺取系统焦点，不打断用户在任何窗口的输入
   bubbleWindow.showInactive()
 
+  // v0.3.4 调试：截图气泡窗口
+  // 保留供未来调试；生产用户用时由环境变量 gate
+  if (process.env.SPIRIT_DEV_SHOT === '1') {
+    setTimeout(() => {
+      if (bubbleWindow && !bubbleWindow.isDestroyed()) {
+        bubbleWindow.webContents.capturePage().then((img) => {
+          const fs = require('fs')
+          fs.writeFileSync('/tmp/spirit_bubble_shot.png', img.toPNG())
+          console.log('[bubble-shot] saved size=', img.getSize())
+        }).catch(() => {})
+      }
+    }, 1500)
+  }
+
   // 4 秒后自动关闭
   bubbleAutoTimer = setTimeout(() => {
     closeBubbleWindow()
@@ -854,6 +881,19 @@ export function closeBubbleWindow(): void {
     bubbleWindow.close()
     bubbleWindow = null
   }
+}
+
+/**
+ * 同步移动气泡窗口（v0.3.3 修复：桌宠拖动后气泡不跟手）。
+ *
+ * 桌宠拖动是一个连续的 delta（每帧 mousemove 累加），气泡只需偏移相同向量
+ * 就能保持“始终在桌宠正上方”的视觉关系。重新计算“相对桌宠中心”很容易跟丢，
+ * 因此这里直接对气泡窗口 setPosition 增 delta，保持相对位移不变。
+ */
+export function moveBubbleWindow(deltaX: number, deltaY: number): void {
+  if (!bubbleWindow || bubbleWindow.isDestroyed()) return
+  const [x, y] = bubbleWindow.getPosition()
+  bubbleWindow.setPosition(x + deltaX, y + deltaY)
 }
 
 // ---------------------------------------------------------------------------

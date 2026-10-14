@@ -9,7 +9,7 @@
  */
 
 import { app, BrowserWindow, Tray, Menu, ipcMain, screen, nativeImage, powerMonitor } from 'electron'
-import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createSystemWindow, closeSystemWindow, createBubbleWindow, closeBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow, showPetWindow, hidePetWindow, forceRedrawPetWindow, startPetWatchdog, stopPetWatchdog, movePetWindow, setPetForceCapture, setMenuButtonBoxes, resetPetClickCapture } from './window'
+import { createPetWindow, getPetWindow, resizePetWindow, createStatusWindow, closeStatusWindow, createSystemWindow, closeSystemWindow, createBubbleWindow, closeBubbleWindow, moveBubbleWindow, createCLITerminalWindow, closeCLITerminalWindow, showPetWindow, hidePetWindow, forceRedrawPetWindow, startPetWatchdog, stopPetWatchdog, movePetWindow, setPetForceCapture, setMenuButtonBoxes, resetPetClickCapture } from './window'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 
@@ -230,6 +230,10 @@ function registerIPC(): void {
     if (!win) return
     const [x, y] = win.getPosition()
     movePetWindow(x + deltaX, y + deltaY)
+    // v0.3.3 fix: 气泡窗口跟随桌宠移动。
+    // 桌宠拖动是连续 delta，气泡只需应用相同 delta 即可保持"始终在桌宠正上方"。
+    // 否则桌宠走开，气泡停在原位置，看起来像"飞走/丢失"。
+    moveBubbleWindow(deltaX, deltaY)
   })
 
   // 窗口大小调整（缩放）
@@ -364,6 +368,20 @@ function registerIPC(): void {
     shell.openExternal('http://localhost:8000')
     return true
   })
+
+  // v0.3.4 调试入口：保留供未来排查。生产用时由 App.vue 通过环境变量 gate
+  ipcMain.handle('__dev_show_bubble', (_event, { text }: { text: string }) => {
+    const win = getPetWindow()
+    if (!win) return false
+    const bounds = win.getBounds()
+    createBubbleWindow({ x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height }, text)
+    return true
+  })
+}
+
+// v0.3.4 调试辅助：导出供 console.log 使用
+function _currentSizeForDebug(): number {
+  return -1
 }
 
 // ---------------------------------------------------------------------------
@@ -372,9 +390,13 @@ function registerIPC(): void {
 
 async function startPythonBackend(): Promise<void> {
   // 查找 Python 后端入口
+  // v0.3.2 fix: dev 模式用 process.cwd() 替代 app.getAppPath()
+  //   - app.getAppPath() 在 unpackaged 模式下 = .../desktop-app/dist-electron
+  //   - + '/..' 只到 desktop-app，差一层找不到 spirit/ 和 venv/
+  //   - 要求从 spirit_agent/ 根目录启动 electron（已是 v0.3.2 启动约定）
   const projectRoot = app.isPackaged
-    ? path.join(process.resourcesPath, '..')
-    : path.resolve(app.getAppPath(), '..')
+    ? path.join(process.resourcesPath, '..', '..', '..') // packaged: .../Resources/../../..  -> macOS .app/Contents/Resources -> 根
+    : process.cwd() // dev: 假定从 spirit_agent/ 启动
 
   const scriptPath = path.join(projectRoot, 'spirit', 'desktop', '_launcher.py')
 

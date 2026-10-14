@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import click
@@ -1342,105 +1343,35 @@ def _handle_slash_command(cmd: str, agent) -> bool:
             console.print(f"  [red]查询失败: {e}[/red]")
 
     elif command == "/pet":
-        # 启动/唤起桌面小狐狸。
-        # 桌宠是 Electron 应用 + Python 后端（端口 9877）。
-        # 检测：端口 9877 是否已监听 → Electron 已在跑。
+        # 启动/唤起桌面小狐狸。委托给 ``spirit pet`` 子命令（v0.3.3 修复）。
+        # 原 v0.3.2 逻辑是 “if 端口已听 → 提示；else → spawn spirit pet （无此子命令），
+        # 被 DEVNULL 吞掉 click 报错”，造成“提示已启动但什么都不发生”的假象。
         import subprocess
+        import shutil
         import platform
+    
         is_windows = platform.system() == "Windows"
-    
-        running_pid = ""
+        spirit_cmd = "spirit.cmd" if is_windows else "spirit"
+        spirit_path = (
+            shutil.which(spirit_cmd)
+            or shutil.which("spirit")
+            or (r"C:\Users\Administrator\bin\spirit.cmd" if is_windows else None)
+        )
+        if spirit_path is None:
+            console.print(Panel(
+                "[bold red]找不到 'spirit' 命令[/bold red]\n"
+                "[dim]请确认 spirit 已安装且在 PATH 中[/dim]",
+                border_style="red",
+            ))
+            return True
         try:
-            if is_windows:
-                r = subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     "Get-NetTCPConnection -State Listen -LocalPort 9877 "
-                     "-ErrorAction SilentlyContinue | "
-                     "Select-Object -ExpandProperty OwningProcess"],
-                    capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=5,
-                )
-                running_pid = r.stdout.strip()
-            else:
-                # macOS / Linux: 用 lsof 检查端口
-                r = subprocess.run(
-                    ["lsof", "-ti", ":9877", "-sTCP:LISTEN"],
-                    capture_output=True, text=True,
-                    encoding="utf-8", errors="replace", timeout=5,
-                )
-                running_pid = r.stdout.strip()
-        except Exception:
-            running_pid = ""
-    
-        if running_pid:
-            # 后端已在跑 → 桌宠 Electron 也在跑。
-            # 提示用户；如果窗口被隐藏，告诉他右键托盘「显示/隐藏」。
-            if is_windows:
-                console.print(Panel(
-                    "[bold yellow]小狐狸已经在桌面上[/bold yellow]\n"
-                    f"WebSocket 端口 9877 已监听（Python 后端 PID [cyan]{running_pid}[/cyan]）\n\n"
-                    "[dim]如果桌面看不到：[/dim]\n"
-                    "[dim]  - 右键系统托盘的 Spirit 图标 → 显示/隐藏[/dim]\n"
-                    "[dim]  - 托盘图标可能在\u201c隐藏的图标\u201d里，点系统托盘右下小箭头展开[/dim]",
-                    border_style="yellow",
-                ))
-            else:
-                console.print(Panel(
-                    "[bold yellow]小狐狸已经在桌面上[/bold yellow]\n"
-                    f"WebSocket 端口 9877 已监听（Python 后端 PID [cyan]{running_pid}[/cyan]）\n\n"
-                    "[dim]如果桌面看不到，请检查 Dock 或切换窗口（Cmd+Tab）[/dim]",
-                    border_style="yellow",
-                ))
-        else:
-            # 后端不在 → 启动桌宠后端（Python WebSocket 服务）。
-            import shutil
-            spirit_cmd = "spirit.cmd" if is_windows else "spirit"
-            spirit_path = (
-                shutil.which(spirit_cmd)
-                or shutil.which("spirit")
-                or (r"C:\Users\Administrator\bin\spirit.cmd" if is_windows else None)
-            )
-            if spirit_path is None:
-                console.print(Panel(
-                    "[bold red]找不到 'spirit' 命令[/bold red]\n"
-                    "[dim]请确认 spirit 已安装且在 PATH 中[/dim]",
-                    border_style="red",
-                ))
-                return True
-            try:
-                popen_kwargs = dict(
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    stdin=subprocess.DEVNULL,
-                )
-                if is_windows:
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-                else:
-                    popen_kwargs["start_new_session"] = True
-                subprocess.Popen(
-                    [spirit_path, "pet"],
-                    **popen_kwargs,
-                )
-                if is_windows:
-                    console.print(Panel(
-                        "[bold green]小狐狸已启动到桌面[/bold green]\n\n"
-                        "[dim]查看新打开的窗口（小狐狸会出现在桌面上）。[/dim]\n"
-                        "[dim]关闭：右键系统托盘的 Spirit 图标 → 退出[/dim]",
-                        border_style="green",
-                    ))
-                else:
-                    console.print(Panel(
-                        "[bold green]小狐狸桌宠后端已启动[/bold green]\n\n"
-                        "[dim]WebSocket 服务运行在 ws://127.0.0.1:9877[/dim]\n"
-                        "[dim]如需 Electron 桌面应用，请在 desktop-app 目录运行 npm run dev[/dim]",
-                        border_style="green",
-                    ))
-            except FileNotFoundError:
-                console.print(Panel(
-                    f"[bold red]找不到 'spirit' 命令[/bold red]\n"
-                    f"[dim]尝试了路径: {spirit_path}[/dim]",
-                    border_style="red",
-                ))
+            # sync 走 pet 子命令，等看到端口起来再回来
+            subprocess.run([spirit_path, "pet", "--wait"], check=False)
+        except FileNotFoundError:
+            console.print(Panel(
+                f"[bold red]执行 spirit pet 失败[/bold red]\n[dim]尝试了路径: {spirit_path}[/dim]",
+                border_style="red",
+            ))
 
     else:
         console.print(f"[red]未知命令: {command}[/red] 输入 /help 查看帮助")
@@ -1498,6 +1429,284 @@ def tools():
             console.print(f"{entry.emoji} [bold]{entry.name}[/bold] [dim]({entry.toolset})[/dim]")
     else:
         console.print("[dim]暂无已注册工具[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# v0.3.3 pet 子命令：启动 Electron 桌宠（v0.3.2 只是 CLI 提示，桌宠本身未启动）
+# ---------------------------------------------------------------------------
+
+def _resolve_spirit_project_root() -> Optional[Path]:
+    """定位 spirit_agent 项目根（与 spirit/desktop/_launcher.py 的算法一致）。
+
+    算法：__file__ 向上跳 3 层（.../spirit/cli/main.py -> .../spirit/cli -> .../spirit -> .../spirit_agent）。
+    失败时返回 None（安装后可能被移到 site-packages，根不再可用）。
+    """
+    try:
+        here = Path(__file__).resolve()
+        # .../spirit_agent/spirit/cli/main.py
+        root = here.parent.parent.parent
+        if (root / "desktop-app" / "dist-electron" / "main.js").exists():
+            return root
+    except Exception:
+        pass
+    return None
+
+
+@cli.command()
+@click.option("--wait/--no-wait", default=True,
+              help="是否等待桌宠 WebSocket 端口启动后退出（默认等 10s）")
+def pet(wait: bool):
+    """启动桌面小狐狸（Electron 桌宠 + Python WebSocket 后端）。
+
+    与 ``/pet`` 斜杠命令的差异：本子命令是桌宠的真正启动入口，
+    它会 spawn Electron 二进制，Electron 主进程会负责启动 Python WebSocket 后端。
+    如果桌宠已经在跑，提示用户复用现有窗口。
+    """
+    import subprocess
+    import platform
+
+    is_windows = platform.system() == "Windows"
+    ws_port = int(os.environ.get("SPIRIT_WS_PORT", "9877"))
+
+    # 1. 端口已在听 -> 桌宠应该已起，提示用户复用 / 重启
+    try:
+        if is_windows:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-NetTCPConnection -State Listen -LocalPort {ws_port} "
+                 "-ErrorAction SilentlyContinue | "
+                 "Select-Object -ExpandProperty OwningProcess"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            )
+            running_pid = r.stdout.strip()
+        else:
+            r = subprocess.run(
+                ["lsof", "-ti", f":{ws_port}", "-sTCP:LISTEN"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            )
+            running_pid = r.stdout.strip()
+    except Exception:
+        running_pid = ""
+
+    # v0.3.6: 额外检测 Electron 渲染进程。之前只看 launcher 端口，
+    # 一旦 Electron GUI 死了但 launcher 还在，命令会误判 "已运行" 什么都不做
+    # （用户会看到“桌宠已在运行”但实际窗口没了）。
+    electron_pids = _find_electron_main_pids()
+
+    if running_pid and electron_pids:
+        # 状态 B: launcher + Electron 都健康 -> 提示已运行
+        if is_windows:
+            msg = (
+                f"[bold yellow]桌宠已在运行[/bold yellow]（后端 PID [cyan]{running_pid}[/cyan]，"
+                f"Electron PID [cyan]{','.join(electron_pids)}[/cyan]）\n\n"
+                "[dim]看不到桌宠？右键系统托盘 Spirit 图标 → 显 示/隐藏[/dim]\n"
+                "[dim]仍看不到？托盘图标可能在「隐藏的图标」里，点右下小箭头展开[/dim]"
+            )
+        else:
+            msg = (
+                f"[bold yellow]桌宠已在运行[/bold yellow]（后端 PID [cyan]{running_pid}[/cyan]，"
+                f"Electron PID [cyan]{','.join(electron_pids)}[/cyan]）\n\n"
+                "[dim]看不到桌宠？检查 Dock 或切换窗口（Cmd+Tab）[/dim]\n"
+                "[dim]仍看不到？托盘菜单 → 重置位置 ，可把桌宠拉到右下角可见位置[/dim]"
+            )
+        console.print(Panel(msg, border_style="yellow"))
+        return
+
+    if running_pid and not electron_pids:
+        # 状态 C: launcher 在但 Electron 死了 -> 自动只重启 Electron（保留后端）
+        console.print(Panel(
+            f"[bold yellow]检测到后端 launcher 在跑但 Electron GUI 已退出[/bold yellow]\n"
+            f"（后端 PID [cyan]{running_pid}[/cyan]）\n\n"
+            "[dim]正在自动重启桌宠窗口（保留后端进程）…[/dim]",
+            border_style="yellow"
+        ))
+        _spawn_electron_only(wait=wait, ws_port=ws_port, is_windows=is_windows)
+        return
+
+    if not running_pid and electron_pids:
+        # 状态 D: 罕见 — Electron 在但 launcher 没起（崩溃中）。杀 electron 走完整重启。
+        console.print(Panel(
+            f"[bold yellow]检测到 Electron 渲染进程在跑但后端 9877 未起[/bold yellow]\n"
+            f"（Electron PID [cyan]{','.join(electron_pids)}[/cyan]）\n\n"
+            "[dim]正在清理并完整重启桌宠…[/dim]",
+            border_style="yellow"
+        ))
+        for pid in electron_pids:
+            try:
+                os.kill(int(pid), 15)  # SIGTERM
+            except Exception:
+                pass
+        # 走下面的状态 A 完整启动
+    else:
+        # 状态 A: 都没起 -> 完整启动
+        pass
+
+    # 2. 端口未听 -> 查 project root 与 electron 二进制
+    project_root = _resolve_spirit_project_root()
+    if project_root is None:
+        console.print(Panel(
+            "[bold red]找不到 spirit_agent 项目根[/bold red]\n"
+            "[dim]只支持从源码仓库运行 spirit pet；wheel/pip 安装后请手动启动 desktop-app。[/dim]",
+            border_style="red",
+        ))
+        raise click.exceptions.Exit(code=1)
+
+    electron_bin = project_root / "desktop-app" / "node_modules" / ".bin" / "electron"
+    electron_main = project_root / "desktop-app" / "dist-electron" / "main.js"
+    if not electron_bin.exists():
+        console.print(Panel(
+            f"[bold red]未找到 electron 二进制[/bold red]\n[dim]{electron_bin}[/dim]\n\n"
+            "[dim]请在 desktop-app/ 目录运行：[/dim]\n"
+            "[dim]  npm install[/dim]\n"
+            "[dim]  npm run build:vite[/dim]",
+            border_style="red",
+        ))
+        raise click.exceptions.Exit(code=1)
+    if not electron_main.exists():
+        console.print(Panel(
+            f"[bold red]未找到 dist-electron/main.js[/bold red]\n[dim]{electron_main}[/dim]\n\n"
+            "[dim]请在 desktop-app/ 目录运行：npm run build:vite[/dim]",
+            border_style="red",
+        ))
+        raise click.exceptions.Exit(code=1)
+
+    # 3. spawn Electron。cwd = spirit_agent 根（与手动启动一致）
+    _spawn_electron_and_wait(wait=wait, ws_port=ws_port, is_windows=is_windows,
+                              project_root=project_root,
+                              electron_bin=electron_bin, electron_main=electron_main)
+
+
+def _find_electron_main_pids() -> list:
+    """检测桌宠 Electron 主进程是否还活着。
+
+    返回所有包含 ``desktop-app/dist-electron/main.js`` 命令行的 PID 列表。
+    macOS / Linux 通用（用 ``ps -eo pid,command``）。
+    Windows 暂未实现（返回空，靠 launcher 端口检测兜底）。
+    """
+    import subprocess
+    import platform
+    if platform.system() == "Windows":
+        return []
+    try:
+        r = subprocess.run(  # noqa: PLW1509 — local import in function
+            ["ps", "-eo", "pid,command"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=5,
+        )
+        pids = []
+        for line in r.stdout.splitlines():
+            if "dist-electron/main.js" in line and "grep" not in line:
+                parts = line.split(None, 1)
+                if parts and parts[0].isdigit():
+                    pids.append(parts[0])
+        return pids
+    except Exception:
+        return []
+
+
+def _spawn_electron_and_wait(
+    wait: bool,
+    ws_port: int,
+    is_windows: bool,
+    project_root: Any,
+    electron_bin: Any,
+    electron_main: Any,
+) -> None:
+    """实际 spawn Electron + 等待 ws 端口起来的 helper。"""
+    import subprocess
+    import time as _time
+    console.print(f"[cyan]正在启动桌宠…[/cyan] electron = {electron_bin}")
+    try:
+        popen_kwargs = dict(
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        if is_windows:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen(
+            [str(electron_bin), str(electron_main)],
+            cwd=str(project_root),
+            **popen_kwargs,
+        )
+    except FileNotFoundError as e:
+        console.print(Panel(
+            f"[bold red]spawn electron 失败[/bold red]\n[dim]{e}[/dim]",
+            border_style="red",
+        ))
+        raise click.exceptions.Exit(code=1)
+
+    if not wait:
+        console.print(Panel(
+            "[bold green]桌宠已在后台启动[/bold green]\n"
+            "[dim]WebSocket 端口稍后会起于 9877。[/dim]",
+            border_style="green",
+        ))
+        return
+
+    # 4. 等待 9877 端口起来（超时 10s）
+    deadline = _time.monotonic() + 10.0
+    while _time.monotonic() < deadline:
+        _time.sleep(0.5)
+        try:
+            r = subprocess.run(
+                ["lsof", "-ti", f":{ws_port}", "-sTCP:LISTEN"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.stdout.strip():
+                if is_windows:
+                    tail = (
+                        "[dim]看不到？右键系统托盘 Spirit 图标 → 显 示/隐藏[/dim]\n"
+                        "[dim]仍看不到？托盘图标可能在「隐藏的图标」里，点右下小箭头展开[/dim]"
+                    )
+                else:
+                    tail = (
+                        "[dim]看不到？检查 Dock 或 Cmd+Tab 切换窗口[/dim]\n"
+                        "[dim]仍看不到？托盘菜单 → 重置位置[/dim]"
+                    )
+                console.print(Panel(
+                    f"[bold green]小狐狸已上桌[/bold green]\n"
+                    f"WebSocket: [cyan]ws://127.0.0.1:{ws_port}[/cyan]\n\n"
+                    + tail,
+                    border_style="green",
+                ))
+                return
+        except Exception:
+            pass
+
+    console.print(Panel(
+        f"[bold yellow]桌宠已启动但 10s 内未检测到 9877 端口[/bold yellow]\n"
+        f"[dim]请查看 desktop-app 日志或手动检查：lsof -iTCP:{ws_port} -sTCP:LISTEN[/dim]",
+        border_style="yellow",
+    ))
+    raise click.exceptions.Exit(code=1)
+
+
+def _spawn_electron_only(wait: bool, ws_port: int, is_windows: bool) -> None:
+    """状态 C 用：launcher 已健康，只重新 spawn Electron 接到现成 launcher。"""
+    project_root = _resolve_spirit_project_root()
+    if project_root is None:
+        console.print(Panel(
+            "[bold red]找不到 spirit_agent 项目根[/bold red]\n"
+            "[dim]无法单独 spawn Electron。[/dim]",
+            border_style="red",
+        ))
+        raise click.exceptions.Exit(code=1)
+    electron_bin = project_root / "desktop-app" / "node_modules" / ".bin" / "electron"
+    electron_main = project_root / "desktop-app" / "dist-electron" / "main.js"
+    if not electron_bin.exists() or not electron_main.exists():
+        console.print(Panel(
+            f"[bold red]未找到 electron 二进制或 main.js[/bold red]\n",
+            border_style="red",
+        ))
+        raise click.exceptions.Exit(code=1)
+    _spawn_electron_and_wait(
+        wait=wait, ws_port=ws_port, is_windows=is_windows,
+        project_root=project_root,
+        electron_bin=electron_bin, electron_main=electron_main,
+    )
 
 
 # ── v0.4.0 storage subcommand group ─────────────────────────────

@@ -75,8 +75,10 @@ watch(() => props.state, (newState) => {
 // 加载精灵图
 function loadSprite(slug: string): void {
   const img = new Image()
-  // Vite dev server 模式下使用根路径，Electron file:// 模式下也走相对路径
-  const spritePath = `/assets/pets/${slug || 'spirit-fox'}/spritesheet.png`
+  // v0.3.2 fix: 用相对路径（去掉前导 /），让 file:// 加载时基于 dist/ 目录解析
+  //   - 之前 /assets/... 在 file:// 协议下变成 file:///assets/...（指向 macOS / 根）
+  //   - 现在 ./assets/... 会从 dist/index.html 所在目录找
+  const spritePath = `./assets/pets/${slug || 'spirit-fox'}/spritesheet.png`
   img.src = `${spritePath}?t=${Date.now()}`
   console.log('[PetSprite] Loading sprite:', img.src)
   img.onload = () => {

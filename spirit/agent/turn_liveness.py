@@ -308,9 +308,14 @@ class TurnLivenessWatchdog:
         )
 
     def _surface_committed_abort(self, snapshot: ActivitySnapshot) -> None:
-        """abort 已 commit 的最终 log. 仅在 commit 成功后调用一次."""
+        """abort 已 commit 的最终 log. 仅在 commit 成功后调用一次.
+
+        v0.3.5: 降级为 logger.info — watchdog 强制结束 turn 是设计内的资源回收机制
+        （idle 超时或 stall 保护），不是异常。CLI 默认 level=ERROR 下不会被渲染到
+        终端，避免用户以为是 crash。verbose 模式 (DEBUG) 下仍能看到。
+        """
         session_id = agent_ref_session(self._agent)
-        logger.error(
+        logger.info(
             "[R-P2.2] turn 已被 watchdog 强制结束: session=%s idle=%.1fs. "
             "run_conversation 主循环将在下个检查点 break.",
             session_id, snapshot.idle_seconds,

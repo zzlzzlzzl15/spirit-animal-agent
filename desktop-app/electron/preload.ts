@@ -74,6 +74,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   openMemora: (): Promise<boolean> =>
     ipcRenderer.invoke('open-memora'),
 
+  /** v0.3.4 调试：进程内直接触发 show-bubble（无需用户交互） */
+  __devShowBubble: (text: string): Promise<boolean> =>
+    ipcRenderer.invoke('__dev_show_bubble', { text }),
+
   // ── 剪贴板 ────────────────────────────────────────────────
 
   /** 读取系统剪贴板文本（同步，供 CLI 终端 Ctrl+V 粘贴） */
@@ -160,6 +164,7 @@ declare global {
       showBubble: (text: string) => Promise<boolean>
       hideBubble: () => Promise<boolean>
       openMemora: () => Promise<boolean>
+      __devShowBubble: (text: string) => Promise<boolean>
       clipboardRead: () => string
       clipboardWrite: (text: string) => void
       petHeartbeat: (frames: number) => void

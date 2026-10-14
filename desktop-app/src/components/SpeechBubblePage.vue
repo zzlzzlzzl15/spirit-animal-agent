@@ -31,6 +31,17 @@ html, body {
   padding: 0;
   background: transparent;
   overflow: hidden;
+  width: 100%;
+  height: 100%;
+  /* v0.3.4 fix: 改用 flex-end — 让 .bubble-wrapper 底边贴窗口底。
+     之前 center 居中让整个气泡（content + tail）填满 60px 窗口，
+     视觉上白底矩形飘在桌宠上方 70px。改后 content 紧贴 tail、
+     tail 底紧贴 BrowserWindow 底（即圆顶上方 10px gap），让气泡
+     看起来“站在”小狐狸头顶。 */
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  box-sizing: border-box;
 }
 </style>
 
