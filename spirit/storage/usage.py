@@ -24,11 +24,11 @@ logger = logging.getLogger(__name__)
 
 _RECORD_USAGE_SQL = """
 INSERT INTO session_model_usage (session_id, model, input_tokens, output_tokens, updated_at)
-VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+VALUES (?, ?, ?, ?, datetime('now', 'localtime'))
 ON CONFLICT(session_id, model) DO UPDATE SET
     input_tokens = input_tokens + excluded.input_tokens,
     output_tokens = output_tokens + excluded.output_tokens,
-    updated_at = CURRENT_TIMESTAMP
+    updated_at = datetime('now', 'localtime')
 """
 
 _GET_SESSION_USAGE_SQL = """

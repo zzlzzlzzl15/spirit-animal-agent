@@ -18,18 +18,21 @@ import logging
 import sqlite3
 import time
 import uuid
+# v0.3.4 fix: create_session 显式传入本地时间 started_at
+from datetime import datetime
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 # SQL constants used across the mixin.
+# v0.3.4 fix: 显式传入 started_at = 本地时间（不再依赖表 default CURRENT_TIMESTAMP=UTC）
 _CREATE_SESSION_SQL = """
 INSERT INTO sessions (
     id, source, model, system_prompt_hash, cwd,
     parent_session_id, metadata, tags, branch_label, fork_of,
-    title, title_source, last_touched_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    title, title_source, last_touched_at, started_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _GET_SESSION_SQL = "SELECT * FROM sessions WHERE id = ?"
@@ -42,7 +45,7 @@ LIMIT ?
 """
 
 _END_SESSION_SQL = """
-UPDATE sessions SET ended_at = CURRENT_TIMESTAMP, end_reason = ?
+UPDATE sessions SET ended_at = datetime('now', 'localtime'), end_reason = ?
 WHERE id = ? AND ended_at IS NULL
 """
 
@@ -106,6 +109,8 @@ class SessionSessionsMixin:
         tags_json = json.dumps(tags or [], ensure_ascii=False)
 
         now = time.time()
+        # v0.3.4 fix: 显式传本地时间 started_at（避免表 default CURRENT_TIMESTAMP=UTC）
+        started_at_local = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.conn.execute(
             _CREATE_SESSION_SQL,
             (
@@ -122,6 +127,7 @@ class SessionSessionsMixin:
                 title,
                 title_source,
                 now,
+                started_at_local,  # 新增
             ),
         )
         self.conn.commit()

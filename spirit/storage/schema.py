@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     fork_of TEXT,
 
     -- timing
-    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),  # v0.3.4 fix: 存本地时间（旧库 CURRENT_TIMESTAMP 返回 UTC，导致少 8h）
     ended_at TIMESTAMP,
     end_reason TEXT,
     last_touched_at REAL,
@@ -187,7 +187,7 @@ CREATE TABLE IF NOT EXISTS messages (
     display_order INTEGER,
 
     -- audit timestamp
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),  # v0.3.4 fix: 本地时间
 );
 """
 
@@ -196,7 +196,7 @@ _SYSTEM_PROMPTS_SQL = """
 CREATE TABLE IF NOT EXISTS system_prompts (
     hash TEXT PRIMARY KEY,
     prompt TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),  # v0.3.4 fix
 );
 """
 
@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     cost_source TEXT,
     first_seen REAL,
     last_seen REAL,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),  # v0.3.4 fix
     UNIQUE(session_id, model, billing_provider, billing_mode, task)
 );
 """
@@ -233,7 +233,7 @@ _STATE_META_SQL = """
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),  # v0.3.4 fix
 );
 """
 
@@ -354,7 +354,7 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     payload TEXT,
     result_payload TEXT,
     child_session_id TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT (datetime('now', 'localtime')),  # v0.3.4 fix
 );
 -- async_delegations indexes are created lazily by
 -- SchemaCoordinationMixin._create_legacy_aware_indexes() after

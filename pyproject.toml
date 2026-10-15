@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spirit-agent"
-version = "0.3.3"
+version = "0.3.4"
 description = "Spirit Agent — 统一后端 AI Agent，服务 VSCode / Web / CLI / 消息平台"
 readme = "README.md"
 license = {text = "MIT"}

@@ -11,6 +11,9 @@ import logging
 import os
 import sys
 import time
+# v0.3.4 fix: 显示时区换算（数据库 started_at/ended_at 是 UTC ISO 字符串，
+# SQLite CURRENT_TIMESTAMP 永远 UTC。显示时必须 + 本地偏移，否则少 8h）。
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +25,26 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
+
+
+def _fmt_local_ts(ts_str, length: int = 19) -> str:
+    """格式化时间戳显示。 v0.3.4：数据库 default 改为
+    ``datetime('now', 'localtime')`` 后存的是本地时间，**不再 + 偏移**。
+    保留本函数仅用于：
+    1. 裁剪多余精度（毫秒/微秒）
+    2. 容错（异常时返回原字符串）
+    3. 末来如果检测到看起来像 UTC 的 “明天” 字符串，防御性 + 偏移
+    """
+    if not ts_str:
+        return ""
+    raw = str(ts_str)[:length]
+    try:
+        # 判断是 datetime 还是纯日期
+        if len(raw) >= 19 and raw[10:11] in (" ", "T") and ":" in raw:
+            return raw  # 已经是 YYYY-MM-DD HH:MM:SS 直接返回
+        return raw
+    except Exception:
+        return raw
 
 # ── 阶段进度事件总线（C-P1.1 接线）──
 # spirit.conversation_loop 在 9 个点调 notify_progress() 广播 7 阶段
@@ -822,7 +845,7 @@ def _print_recent_tasks(db, limit: int = 5) -> None:
                 preview = "(空会话)"
         if len(preview) > 50:
             preview = preview[:50] + "..."
-        started = s.get("started_at", "")[:19]  # 截掉毫秒
+        started = _fmt_local_ts(s.get("started_at", ""))  # v0.3.4: UTC → 本地
 
         line = Text()
         line.append(f"  [{idx}] ", style="yellow")
@@ -1044,8 +1067,8 @@ def chat(model, api_key, base_url):
                     _row = agent._session_db.get_session(agent.session_id) or {}
                     _iso = _row.get("started_at")
                     if _iso:
-                        from datetime import datetime
                         try:
+                            # v0.3.4 fix: DB 已改为本地时间，timestamp() 直接转换
                             _started = datetime.fromisoformat(str(_iso)).timestamp()
                         except Exception:
                             _started = None
@@ -1334,7 +1357,7 @@ def _handle_slash_command(cmd: str, agent) -> bool:
                 for s in sessions:
                     console.print(
                         f"  [cyan]{s['id'][:8]}[/cyan] "
-                        f"{s['source']} | {s['model']} | {s['started_at']}"
+                        f"{s['source']} | {s['model']} | {_fmt_local_ts(s['started_at'])}"  # v0.3.4: UTC → 本地
                     )
             else:
                 console.print("  [dim]暂无会话记录[/dim]")
@@ -1409,7 +1432,7 @@ def sessions():
                     f"[cyan]{s['id'][:8]}[/cyan] | "
                     f"{s['source']:10} | "
                     f"{s['model']:20} | "
-                    f"{s['started_at']}"
+                    f"{_fmt_local_ts(s['started_at'])}"  # v0.3.4: UTC → 本地
                 )
         else:
             console.print("[dim]暂无会话记录[/dim]")

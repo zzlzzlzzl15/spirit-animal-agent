@@ -21,6 +21,9 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
+# v0.3.4 fix: insert_message 显式传入本地时间 created_at
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from .errors import classify_persistence_error
@@ -30,7 +33,8 @@ logger = logging.getLogger(__name__)
 
 # Single INSERT for one message — matches Hermes 26-column layout.
 # Column count: 4 base + 3 tool + 3 stats + 5 reasoning + 2 replay +
-# 4 compression + 2 active + 1 api + 4 display = 26 columns = 26 placeholders.
+# 4 compression + 2 active + 1 api + 4 display + 1 created_at = 27 columns.
+# v0.3.4 fix: 显式传入 created_at = 本地时间（不再依赖表 default CURRENT_TIMESTAMP=UTC）
 _INSERT_MESSAGE_SQL = """
 INSERT INTO messages (
     session_id, role, content, tool_call_id,
@@ -39,11 +43,12 @@ INSERT INTO messages (
     reasoning, reasoning_content, reasoning_details, codex_reasoning_items, codex_message_items,
     platform_message_id, observed, _compressed_summary, compressed_summary,
     active, compacted, api_content,
-    display_kind, display_metadata, display_identity, display_order
+    display_kind, display_metadata, display_identity, display_order,
+    created_at
 ) VALUES (
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-    ?, ?, ?, ?, ?, ?
+    ?, ?, ?, ?, ?, ?, ?
 )
 """
 
@@ -138,6 +143,7 @@ class SessionMessagesMixin:
                     1, compacted,  # active=1, compacted=0
                     api_content,
                     display_kind, display_metadata, display_identity, display_order,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # v0.3.4 fix: created_at = 本地时间
                 ),
             )
             self.conn.commit()
@@ -207,6 +213,7 @@ class SessionMessagesMixin:
                         platform_message_id, 0, _compressed_summary, compressed_summary,
                         1, compacted, api_content,
                         display_kind, display_metadata, display_identity, display_order,
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # v0.3.4 fix
                     ),
                 )
             self.conn.commit()
@@ -434,6 +441,7 @@ class SessionMessagesMixin:
                         m.get("api_content"),
                         m.get("display_kind"), display_metadata,
                         display_identity, m.get("display_order"),
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),  # v0.3.4 fix
                     ))
                 self.conn.executemany(_INSERT_MESSAGE_SQL, rows)
             self.conn.commit()
