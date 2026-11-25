@@ -7,14 +7,12 @@
     spirit tools         查看可用工具
 """
 
-import logging
 import os
 import sys
 import re
 
 import click
 from rich.console import Console
-from rich.logging import RichHandler
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -23,13 +21,11 @@ console = Console()
 
 
 def setup_logging(verbose: bool = False):
-    """配置日志。"""
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        handlers=[RichHandler(console=console, rich_tracebacks=True)],
-    )
+    """配置日志 — 委托给统一日志系统（v0.3.5）。"""
+    from spirit.logging_setup import setup_logging as _setup, install_excepthook
+
+    _setup(verbose=verbose, rich_console=console)
+    install_excepthook()
 
 
 def _clean_think_tags(text: str) -> str:
@@ -146,17 +142,20 @@ def cli(ctx, verbose):
 @click.option("--base-url", envvar="SPIRIT_BASE_URL", help="API Base URL")
 def chat(model, api_key, base_url):
     """开始交互式对话"""
-    from spirit.agent.agent import AgentConfig, SpiritAgent
+    from spirit.agent.agent import SpiritAgent
 
     # 构建配置 — 统一走集中式配置系统
     from spirit.config import load_config
-    raw = load_config()
-    llm_cfg = raw.get("llm", {})
+    from spirit.agent.agent_init import build_agent_config
 
-    config = AgentConfig(
-        model=model or llm_cfg.get("model", ""),
-        api_key=api_key or llm_cfg.get("api_key", ""),
-        base_url=base_url or llm_cfg.get("base_url", ""),
+    raw = load_config()
+
+    config = build_agent_config(
+        raw,
+        model=model or None,
+        api_key=api_key or None,
+        base_url=base_url or None,
+        platform="cli",
     )
 
     if not config.api_key:

@@ -250,7 +250,8 @@ class SessionSessionsMixin:
                 parent_session_id,
                 None,  # title
                 None,  # title_source
-                now,
+                now,   # last_touched_at
+                now,   # started_at — v0.3.5 修复：此前缺这个绑定（SQL 14 占位只给 13 值）
             ),
         )
 

@@ -360,10 +360,13 @@ class GatewayRunner:
             return agent
 
         # 创建新 Agent
-        from spirit.agent.agent import SpiritAgent, AgentConfig
+        from spirit.agent.agent import SpiritAgent
+        from spirit.agent.agent_init import build_agent_config
 
         platform_config = self.config.get_platform_config(ctx.source.platform)
-        config = AgentConfig(
+        # v0.3.5：gateway 此前只传 session_id/platform，model/api_key/base_url/
+        # context_length 全是默认空值 → 实际无法调 LLM。统一走配置系统。
+        config = build_agent_config(
             session_id=ctx.session_id,
             platform=ctx.source.platform.value,
         )

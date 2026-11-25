@@ -185,7 +185,7 @@ class TestAgentManager:
         assert m.active_count == 1
 
     def test_get_or_create_passes_model(self):
-        """get_or_create 应把 model 传给 AgentConfig。"""
+        """get_or_create 应把 model 传给配置构建（v0.3.5 起走 build_agent_config）。"""
         from spirit.api.server import AgentManager
         m = AgentManager()
         mock_agent = MagicMock()
@@ -196,10 +196,10 @@ class TestAgentManager:
         mock_agent.session_id = "s"
 
         with patch("spirit.agent.agent.SpiritAgent", return_value=mock_agent), \
-             patch("spirit.agent.agent.AgentConfig") as mock_cfg:
+             patch("spirit.agent.agent_init.build_agent_config") as mock_build:
             m.get_or_create(session_id="s", model="custom-model")
-            assert mock_cfg.called
-            call_kwargs = mock_cfg.call_args.kwargs
+            assert mock_build.called
+            call_kwargs = mock_build.call_args.kwargs
             assert call_kwargs.get("model") == "custom-model"
 
     def test_list_sessions_after_creates(self):
@@ -254,9 +254,9 @@ class TestAgentManager:
         mock_agent.session_id = "s"
 
         with patch("spirit.agent.agent.SpiritAgent", return_value=mock_agent), \
-             patch("spirit.agent.agent.AgentConfig") as mock_cfg:
+             patch("spirit.agent.agent_init.build_agent_config") as mock_build:
             m.get_or_create(session_id="s")
-            assert mock_cfg.call_args.kwargs.get("platform") == "api"
+            assert mock_build.call_args.kwargs.get("platform") == "api"
 
     def test_custom_platform(self):
         from spirit.api.server import AgentManager
@@ -269,9 +269,9 @@ class TestAgentManager:
         mock_agent.session_id = "s"
 
         with patch("spirit.agent.agent.SpiritAgent", return_value=mock_agent), \
-             patch("spirit.agent.agent.AgentConfig") as mock_cfg:
+             patch("spirit.agent.agent_init.build_agent_config") as mock_build:
             m.get_or_create(session_id="s", platform="vscode")
-            assert mock_cfg.call_args.kwargs.get("platform") == "vscode"
+            assert mock_build.call_args.kwargs.get("platform") == "vscode"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -300,7 +300,9 @@ class TestCreateApp:
     def test_routes_registered(self):
         from spirit.api.server import create_app
         app = create_app()
-        paths = [r.path for r in app.routes]
+        # v0.3.5：新版 FastAPI（≥0.141）用 _IncludedRouter 承载 include_router，
+        # 它没有 .path 属性 —— 只收集真正的路由对象。
+        paths = [r.path for r in app.routes if hasattr(r, "path")]
         # REST 路由
         assert "/api/status" in paths
         assert "/api/chat" in paths
@@ -308,26 +310,40 @@ class TestCreateApp:
         assert "/api/tools" in paths
         # WebSocket
         assert "/ws/chat" in paths
-        # Memora 代理
-        assert any(p.startswith("/memora") for p in paths)
+        # Memora 代理：新版 FastAPI 把 include_router 包进 _IncludedRouter，
+        # 前缀在 include_context.prefix 上，而不是展平后的 route.path。
+        memora_prefixes = [
+            getattr(getattr(r, "include_context", None), "prefix", "")
+            for r in app.routes
+            if type(r).__name__ == "_IncludedRouter"
+        ]
+        assert any(
+            p.startswith("/memora") for p in paths + memora_prefixes
+        )
 
     def test_chat_route_uses_post(self):
         from spirit.api.server import create_app
         app = create_app()
-        chat_route = next(r for r in app.routes if r.path == "/api/chat")
+        chat_route = next(
+            r for r in app.routes
+            if hasattr(r, "path") and r.path == "/api/chat"
+        )
         assert "POST" in chat_route.methods
 
     def test_sessions_get(self):
         from spirit.api.server import create_app
         app = create_app()
         # GET /api/sessions
-        list_route = next(r for r in app.routes if r.path == "/api/sessions")
+        list_route = next(
+            r for r in app.routes
+            if hasattr(r, "path") and r.path == "/api/sessions"
+        )
         assert "GET" in list_route.methods
 
         # GET /api/sessions/{session_id}
         detail_route = next(
             r for r in app.routes
-            if r.path == "/api/sessions/{session_id}" and "GET" in r.methods
+            if hasattr(r, "path") and r.path == "/api/sessions/{session_id}" and "GET" in r.methods
         )
         assert detail_route is not None
 
@@ -337,7 +353,7 @@ class TestCreateApp:
         # DELETE /api/sessions/{session_id}
         del_route = next(
             r for r in app.routes
-            if r.path == "/api/sessions/{session_id}" and "DELETE" in r.methods
+            if hasattr(r, "path") and r.path == "/api/sessions/{session_id}" and "DELETE" in r.methods
         )
         assert del_route is not None
 
@@ -347,7 +363,7 @@ class TestCreateApp:
         app = create_app()
         all_methods = set()
         for r in app.routes:
-            if r.path == "/api/sessions/{session_id}":
+            if hasattr(r, "path") and r.path == "/api/sessions/{session_id}":
                 all_methods |= r.methods
         assert "GET" in all_methods
         assert "DELETE" in all_methods

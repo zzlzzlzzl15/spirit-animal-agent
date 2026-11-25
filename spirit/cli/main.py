@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional
 import click
 from rich.console import Console
 from rich.live import Live
-from rich.logging import RichHandler
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.spinner import Spinner
@@ -882,20 +881,23 @@ def _resolve_resume_index(db, user_input: str, limit: int = 5) -> Optional[str]:
 
 
 def setup_logging(verbose: bool = False):
-    """配置日志 — 默认 ERROR（仅错误），verbose 时开 INFO（看 LLM 链路）。
+    """配置日志 — 默认终端仅 ERROR（verbose 时 DEBUG），文件日志全量落盘。
 
-    设计原则：用户不需要看 WARNING/INFO 噪声。任务里需要的关键 WARNING
-    （如 LLM 思考中的提示）由 progress_notifier 推送到可视化层；全量日志
-    仅 verbose 模式开。
+    v0.3.5：委托给统一日志系统 ``spirit.logging_setup``：
+      - 终端 RichHandler（复用本模块的 console），默认 ERROR；
+      - ``~/.spirit/logs/agent.log`` 全量滚动文件（INFO，10MB×5）；
+      - ``~/.spirit/logs/errors.log`` 仅 ERROR+；
+      - ``~/.spirit/logs/events.jsonl`` 结构化事件（供 ``spirit logs`` 查询）。
+
+    设计原则：终端保持干净，用户不需要看 WARNING/INFO 噪声；任务里的关键
+    WARNING 由 progress_notifier 推送可视化层；全量细节始终落盘可查。
     """
+    from spirit.logging_setup import setup_logging as _setup, install_excepthook
+
+    _setup(verbose=verbose, rich_console=console)
+    install_excepthook()
+
     level = logging.DEBUG if verbose else logging.ERROR
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        handlers=[RichHandler(console=console, rich_tracebacks=True)],
-    )
-    # spirit.* 命名空间 logger 兜底（防止子模块继承 root 后仍输出 INFO）
-    logging.getLogger("spirit").setLevel(level)
     # 库级 logger 也不在终端暴露（urllib3 / httpcore / openai 等）
     for noisy in ("urllib3", "httpcore", "httpx", "openai", "anthropic", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.ERROR)
@@ -928,17 +930,23 @@ def cli(ctx, verbose):
 @click.option("--base-url", envvar="SPIRIT_BASE_URL", help="API Base URL")
 def chat(model, api_key, base_url):
     """开始交互式对话"""
-    from spirit.agent.agent import AgentConfig, SpiritAgent
+    from spirit.agent.agent import SpiritAgent
 
     # 构建配置 — 统一走集中式配置系统
     from spirit.config import load_config
-    raw = load_config()
-    llm_cfg = raw.get("llm", {})
 
-    config = AgentConfig(
-        model=model or llm_cfg.get("model", ""),
-        api_key=api_key or llm_cfg.get("api_key", ""),
-        base_url=base_url or llm_cfg.get("base_url", ""),
+    raw = load_config()
+
+    # v0.3.5：统一走 AgentConfig.from_dict（含 context_length / max_iterations /
+    # compression / streaming 等），CLI 参数仅在显式给出时覆盖
+    from spirit.agent.agent_init import build_agent_config
+
+    config = build_agent_config(
+        raw,
+        model=model or None,
+        api_key=api_key or None,
+        base_url=base_url or None,
+        platform="cli",
     )
 
     if not config.api_key:
@@ -1317,6 +1325,7 @@ def _handle_slash_command(cmd: str, agent) -> bool:
             "  /status      显示状态\n"
             "  /tools       列出工具\n"
             "  /sessions    会话历史\n"
+            "  /logs        最近错误日志（/logs doctor 一键诊断）\n"
             "  /pet         启动桌面小狐狸\n"
             "  /quit        退出",
             title="帮助",
@@ -1364,6 +1373,34 @@ def _handle_slash_command(cmd: str, agent) -> bool:
             db.close()
         except Exception as e:
             console.print(f"  [red]查询失败: {e}[/red]")
+
+    elif command == "/logs":
+        # v0.3.5：交互式查看错误日志 / 一键诊断
+        from spirit.cli.logs_commands import cmd_errors, cmd_doctor
+        if args.strip().lower() == "doctor":
+            report = cmd_doctor()
+            for check in report.get("checks", []):
+                status = check["status"]
+                color = {"ok": "green", "warn": "yellow", "error": "red"}.get(status, "white")
+                console.print(f"[{color}]●[/{color}] [bold]{check['name']}[/bold]  [dim]{str(check.get('detail'))[:160]}[/dim]")
+        else:
+            # 支持 /logs 1h 之类的时间窗
+            result = cmd_errors(since=(args.strip() or "24h"), limit=15)
+            if not result.get("ok"):
+                console.print(f"  [red]查询失败: {result.get('error')}[/red]")
+            elif not result.get("events"):
+                console.print("  [dim]近 24h 无错误事件[/dim]")
+            else:
+                console.print(f"  [bold]最近 {result['count']} 条错误[/bold]  [dim]{result.get('path','')}[/dim]")
+                for ev in result["events"]:
+                    ts = (ev.get("ts") or "")[:19]
+                    ctx = []
+                    for k in ("reason", "provider", "model", "tool", "exc_type"):
+                        if ev.get(k):
+                            ctx.append(f"{k}={ev[k]}")
+                    console.print(f"  [red]{ts}[/red] {ev.get('kind')}  [dim]{' | '.join(ctx)}[/dim]")
+                    if ev.get("error") or ev.get("message"):
+                        console.print(f"    [dim]{str(ev.get('error') or ev.get('message'))[:160]}[/dim]")
 
     elif command == "/pet":
         # 启动/唤起桌面小狐狸。委托给 ``spirit pet`` 子命令（v0.3.3 修复）。
@@ -1882,6 +1919,116 @@ def cmd_storage_export(output: str) -> None:
         sys.exit(1)
     console.print(f"[green]已导出到 {output}[/green]")
     db.close()
+
+
+# ===========================================================================
+# spirit logs — 日志查询（v0.3.5）
+# ===========================================================================
+
+@cli.group()
+def logs():
+    """查看运行日志与错误（~/.spirit/logs/）"""
+
+
+def _print_events(result) -> None:
+    if not result.get("ok"):
+        console.print(f"[red]查询失败: {result.get('error')}[/red]")
+        sys.exit(1)
+    events = result.get("events", [])
+    if result.get("note"):
+        console.print(f"[dim]{result['note']}[/dim]")
+    if not events:
+        console.print("[dim]没有匹配的事件[/dim]")
+        return
+    console.print(f"[bold cyan]{result.get('count', len(events))} 条事件[/bold cyan]  "
+                  f"[dim]{result.get('path', '')}[/dim]")
+    for ev in events:
+        ts = (ev.get("ts") or "")[:19]
+        kind = ev.get("kind", "?")
+        level = ev.get("level", "")
+        color = {"ERROR": "red", "WARNING": "yellow"}.get(level, "cyan")
+        head = f"[{color}]{ts} {level:<7} {kind}[/{color}]"
+        console.print(head)
+        # 关键上下文字段
+        ctx_keys = (
+            "provider", "model", "reason", "status_code", "iteration", "retry",
+            "tool", "trigger", "from_provider", "to_provider", "detail",
+            "exc_type", "error", "message",
+        )
+        ctx = []
+        for k in ctx_keys:
+            if k in ev and ev[k] not in (None, ""):
+                v = str(ev[k])
+                ctx.append(f"{k}={v[:120]}")
+        if ctx:
+            console.print(f"    [dim]{' | '.join(ctx)}[/dim]")
+
+
+@logs.command("errors")
+@click.option("--since", default="24h", help="时间窗口（如 30m / 2h / 1d）或 ISO 时间")
+@click.option("--level", default="WARNING", help="最低级别")
+@click.option("--session", "-s", default=None, help="session_id 子串")
+@click.option("--reason", default=None, help="FailoverReason 子串（如 invalid_request）")
+@click.option("--grep", default=None, help="关键字（匹配整条事件）")
+@click.option("--limit", "-n", default=50, help="最多显示条数")
+def cmd_logs_errors(since, level, session, reason, grep, limit):
+    """查询错误类事件（api_error / payload_invalid / storage_error ...）"""
+    from .logs_commands import cmd_errors
+    result = cmd_errors(
+        since=since, level=level, session=session, reason=reason,
+        grep=grep, limit=limit,
+    )
+    _print_events(result)
+
+
+@logs.command("events")
+@click.option("--kind", "-k", default=None, help="按 kind 过滤（逗号分隔多个）")
+@click.option("--since", default=None, help="时间窗口（如 1h）")
+@click.option("--limit", "-n", default=50, help="最多显示条数")
+def cmd_logs_events(kind, since, limit):
+    """查询全部结构化事件"""
+    from .logs_commands import cmd_events
+    result = cmd_events(kind=kind, since=since, limit=limit)
+    _print_events(result)
+
+
+@logs.command("tail")
+@click.argument("name", default="agent.log")
+@click.option("--lines", "-n", default=80, help="显示末尾 N 行")
+def cmd_logs_tail(name, lines):
+    """查看日志文件末尾（agent.log / errors.log / events.jsonl）"""
+    from .logs_commands import read_log_tail
+    result = read_log_tail(name, lines=lines)
+    if not result.get("ok"):
+        console.print(f"[red]读取失败: {result.get('error')}[/red]")
+        sys.exit(1)
+    if result.get("note"):
+        console.print(f"[dim]{result['note']}[/dim]")
+    console.print(f"[bold cyan]{result.get('path')}[/bold cyan]")
+    for line in result.get("lines", []):
+        console.print(line)
+
+
+@logs.command("doctor")
+def cmd_logs_doctor():
+    """一键诊断：配置生效值与来源、存储层、日志、配对自检"""
+    from .logs_commands import cmd_doctor
+    report = cmd_doctor()
+    for check in report.get("checks", []):
+        status = check["status"]
+        color = {"ok": "green", "warn": "yellow", "error": "red"}.get(status, "white")
+        console.print(f"[{color}]●[/{color}] [bold]{check['name']}[/bold]")
+        detail = check.get("detail")
+        if isinstance(detail, dict):
+            if check["name"] == "config":
+                console.print(f"    配置文件: {detail.get('path')} (存在={detail.get('yaml_exists')})")
+                for row in detail.get("values", []):
+                    tag = "[yellow]yaml/env[/yellow]" if row["source"] != "default" else "[dim]default[/dim]"
+                    console.print(f"    {row['key']:<34} = {str(row['value'])[:50]:<50} {tag}")
+            else:
+                console.print_json(data=detail)
+        elif detail:
+            console.print(f"    [dim]{detail}[/dim]")
 
 
 if __name__ == "__main__":

@@ -276,10 +276,14 @@ def _run_attempt(
     external_kill（父级中断：chat 超时等）直接收敛不重启。超限尝试的
     工作线程为 daemon 遗弃：interrupt 后在迭代边界自然退出，不阻塞进程。
     """
-    from spirit.agent.agent import AgentConfig, SpiritAgent
+    from spirit.agent.agent import SpiritAgent
+    from spirit.agent.agent_init import build_agent_config
 
     child_id = meta["id"]
-    config = AgentConfig(
+    # v0.3.5：子代理此前只传 session_id/platform/max_iterations，没带
+    # model/api_key/base_url/context_length —— 统一走配置系统，再覆盖子代理
+    # 专属的三项。
+    config = build_agent_config(
         session_id=f"child-{child_id}-a{attempt}",
         platform="delegate",
         max_iterations=30,  # 子 Agent 迭代次数限制

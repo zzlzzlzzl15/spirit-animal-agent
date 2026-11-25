@@ -94,6 +94,19 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "streaming": {
         "enabled": False,                     # 是否启用流式 token 输出（逐字显示）
     },
+    # ── 统一日志（v0.3.5）─────────────────────────────────────
+    # 终端级别由 -v 控制（默认 ERROR）；这里控制文件日志。
+    # 产物：$SPIRIT_HOME/logs/agent.log（全量滚动）、errors.log（仅 ERROR+）、
+    #       events.jsonl（结构化业务事件，供 `spirit logs` 查询）。
+    "logging": {
+        "enabled": True,                      # 是否落盘文件日志（关闭则只打终端）
+        "level": "INFO",                     # agent.log 级别
+        "max_bytes": 10 * 1024 * 1024,       # 单文件 10MB
+        "backup_count": 5,                   # 保留 5 个滚动文件
+        "events": True,                      # 是否写 events.jsonl
+        "traceback": True,                   # api_error 等是否带 traceback
+        "event_preview_chars": 500,          # 事件正文字段截断长度
+    },
     # ── 终端显示（CLI / 桌宠）──────────────────────────────
     "display": {
         # 实时显示 LLM 中间推理内容（think / reasoning_content 块）。
@@ -435,6 +448,94 @@ def get_env_path() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# 生效配置（DEFAULT_CONFIG ← YAML ← 环境变量，带缓存）
+# ---------------------------------------------------------------------------
+# v0.3.5：之前 get_config_value() 只读 DEFAULT_CONFIG，~/.spirit/config.yaml 里
+# 写的 context_length / max_retries / protect_first_n / max_tokens 等全部不生效。
+# 这里加载"默认值 ← YAML ← SPIRIT_ 环境变量"的合并视图（**不**跑 failover 探测，
+# 避免在 import 期发网络请求），供 get_config_value() 使用。
+# 测试进程（argv 含 pytest）不读用户 YAML，保证套件确定性 —— 与 storage 层
+# _running_under_pytest 的隔离策略一致。
+
+_EFFECTIVE_CACHE: Dict[str, Any] = {"path": None, "yaml": None}
+
+
+def _running_under_pytest() -> bool:
+    try:
+        import sys
+        return "pytest" in sys.argv[0] or any("pytest" in a for a in sys.argv)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _load_yaml_overlay() -> Dict[str, Any]:
+    """读取 YAML 覆盖层（进程内缓存；env 不缓存，保持对 monkeypatch 敏感）。"""
+    cfg_path = get_config_path()
+    cached = _EFFECTIVE_CACHE["yaml"]
+    if (
+        cached is not None
+        and _EFFECTIVE_CACHE["path"] == str(cfg_path)
+    ):
+        return copy.deepcopy(cached)
+
+    overlay: Dict[str, Any] = {}
+    if not _running_under_pytest():
+        try:
+            file_config = _load_yaml(cfg_path)
+            _deep_merge(overlay, file_config)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("YAML 读取失败，忽略用户配置: %s", exc)
+
+    _EFFECTIVE_CACHE["path"] = str(cfg_path)
+    _EFFECTIVE_CACHE["yaml"] = copy.deepcopy(overlay)
+    return copy.deepcopy(overlay)
+
+
+def load_effective_config(*, force: bool = False) -> Dict[str, Any]:
+    """返回 DEFAULT_CONFIG ← YAML ← 环境变量的合并配置。
+
+    与 :func:`load_config` 的区别：不执行 failover 探测 / provider 解析（那两步
+    可能发网络请求且会改写主连接字段），只做静态合并。
+
+    关键语义：
+    - 以**活体** ``DEFAULT_CONFIG`` 为基底（测试 monkeypatch 直接改
+      DEFAULT_CONFIG 的键能立即被看到）；
+    - YAML 覆盖层按配置文件路径缓存；
+    - SPIRIT_* 环境变量每次实时合并（对 monkeypatch.setenv 敏感）；
+    - **测试进程（argv 含 pytest）不读 YAML 且不缓存** —— 各测试会把
+      ``config.SPIRIT_HOME`` monkeypatch 到不同 tmp_path，跨测试共享缓存会把
+      一个 HOME 的配置漏给另一个（全量跑时的串味问题）；
+    - 任何失败都回退 DEFAULT_CONFIG，绝不抛异常。
+
+    Args:
+        force: 跳过 YAML 缓存重新加载（非测试进程的配置热更新用）
+
+    Returns:
+        合并后的配置字典（深拷贝，调用方可安全修改）
+    """
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    try:
+        if _running_under_pytest():
+            # 测试：只叠加实时环境变量，不读 YAML、不缓存（确定性 + 隔离）
+            _deep_merge(config, _load_env_config())
+            return config
+
+        if force:
+            _EFFECTIVE_CACHE["yaml"] = None
+        _deep_merge(config, _load_yaml_overlay())
+        _deep_merge(config, _load_env_config())
+    except Exception as exc:  # noqa: BLE001 - 配置读取失败必须回退默认，不能崩热路径
+        logger.debug("effective config 加载失败，回退 DEFAULT_CONFIG: %s", exc)
+        config = copy.deepcopy(DEFAULT_CONFIG)
+    return config
+
+
+def reload_effective_config() -> Dict[str, Any]:
+    """清空缓存并重载生效配置（测试 / 配置变更后调用）。"""
+    return load_effective_config(force=True)
+
+
+# ---------------------------------------------------------------------------
 # 加载
 # ---------------------------------------------------------------------------
 
@@ -655,15 +756,19 @@ def get_spirit_home() -> Path:
 
 
 def get_config_value(dotted_key: str, default: Any = None) -> Any:
-    """通过点号路径读取配置值。
+    """通过点号路径读取**生效**配置值。
+
+    v0.3.5：之前只读 DEFAULT_CONFIG，~/.spirit/config.yaml 里写的键全部不生效。
+    现在读 DEFAULT_CONFIG ← YAML ← 环境变量的合并视图（基底是活体
+    DEFAULT_CONFIG，测试 monkeypatch 直接改 DEFAULT_CONFIG 依然生效）。
 
     例: get_config_value("timeouts.terminal_default") → 120
-    无需加载 YAML — 直接读 DEFAULT_CONFIG（模块级缓存）。
-    调用方可按需覆盖。
     """
-    keys = dotted_key.split(".")
-    value: Any = DEFAULT_CONFIG
-    for k in keys:
+    try:
+        value: Any = load_effective_config()
+    except Exception:  # noqa: BLE001 - 任何异常都退回 DEFAULT_CONFIG
+        value = copy.deepcopy(DEFAULT_CONFIG)
+    for k in dotted_key.split("."):
         if isinstance(value, dict) and k in value:
             value = value[k]
         else:

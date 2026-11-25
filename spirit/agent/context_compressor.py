@@ -44,6 +44,7 @@ SUMMARY_END_MARKER = (
 
 # 粗略 token 估算：1 token ≈ 3.5 字符（来自集中式配置）
 from spirit.config import get_config_value
+from spirit.agent.message_pairing import repair_tool_pairing
 from spirit.agent.context_compressor_v2 import (
     CompressorV2Hooks,
     StallConfig,
@@ -208,6 +209,21 @@ class ContextCompressor(ContextEngine):
         }
 
         compressed = head + [summary_message] + tail
+
+        # ── v0.3.5：修复 tool_call / tool_result 配对 ──────────────
+        # head + 摘要 + tail 的拼法会把 assistant(tool_calls) 与它对应的
+        # tool 结果切到不同区段，产出 provider 直接拒绝的 400：
+        #   "tool result's tool id(call_N) not found" / "tool call result
+        #    does not follow tool call"
+        # 该 400 会被归类为可重试的 unknown → 同一个非法 payload 被重发 3 次，
+        # 且坏列表已写回 agent 内存 → 此后每轮都复现同一失败（只能重启进程）。
+        # 这里在压缩出口处把配对修好，保证 payload 恒合法。
+        compressed, _pairing = repair_tool_pairing(compressed)
+        if not _pairing.ok or _pairing.dropped_messages or _pairing.repaired_tool_calls:
+            logger.warning(
+                "上下文压缩后修复 tool 配对: %s",
+                _pairing.summary(),
+            )
 
         logger.info(
             "上下文压缩 #%d: %d 条消息 → %d 条 (保护头 %d + 尾 %d)",

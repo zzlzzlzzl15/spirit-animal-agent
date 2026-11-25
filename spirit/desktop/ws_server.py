@@ -961,6 +961,20 @@ class WSServer:
                     "timeout": True,
                 }
             except Exception as exc:
+                # v0.3.5：此前这里完全无日志，桌宠侧的 LLM 失败只把 error
+                # 字符串返回给前端，服务端无任何痕迹可查。
+                logger.error("chat 处理失败: %s", exc, exc_info=True)
+                try:
+                    from spirit.logging_setup import log_event
+                    log_event(
+                        "chat_error",
+                        level=logging.ERROR,
+                        component="ws_server",
+                        exc_type=type(exc).__name__,
+                        error=str(exc)[:500],
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 return {"error": str(exc)}
             finally:
                 # 恢复原始回调（覆盖正常/超时续跑封顶/异常全部退出路径）

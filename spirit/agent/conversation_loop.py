@@ -293,6 +293,9 @@ def run_conversation(
     # 空结论收尾提示计数（最终回复为空时注入收尾提示再推一轮）
     empty_final_nudges = 0
 
+    # v0.3.5：请求体非法（tool 配对断裂）时，本轮最多自愈重发一次
+    invalid_request_repaired = False
+
     # ── 主循环 ──────────────────────────────────────────────────
 
     while budget.remaining > 0:
@@ -410,13 +413,33 @@ def run_conversation(
                     except Exception:  # noqa: BLE001
                         _lock_acquired = False
                 if _db is None or _lock_acquired:
+                    _msgs_before = len(agent.messages)
+                    _tokens_before = approx_tokens
                     agent._messages = compressor.compress(agent.messages, approx_tokens)
+                    _tokens_after = estimate_messages_tokens(agent._messages)
                     _emit_hook(
                         agent, "on_context_compress",
                         before_tokens=approx_tokens,
-                        after_tokens=estimate_messages_tokens(agent._messages),
+                        after_tokens=_tokens_after,
                         trigger="preemptive",
                     )
+                    try:
+                        from spirit.logging_setup import log_event
+                        from spirit.agent.message_pairing import validate_tool_pairing
+                        log_event(
+                            "compression",
+                            level=logging.INFO,
+                            session_id=getattr(agent, "session_id", ""),
+                            trigger="preemptive",
+                            attempt=compression_attempts,
+                            before_msgs=_msgs_before,
+                            after_msgs=len(agent.messages),
+                            before_tokens=_tokens_before,
+                            after_tokens=_tokens_after,
+                            pairing=validate_tool_pairing(agent.messages).to_dict(),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     # ── v0.4.0 compaction_observer hook ──────────────────
                     try:
                         _observer = getattr(agent, "compaction_observer", None)
@@ -473,6 +496,23 @@ def run_conversation(
                 _touch = getattr(agent, "_touch_activity", None)
                 if callable(_touch):
                     _touch("llm_call_start")
+                # ── v0.3.5：结构化事件 llm_request（排查长任务的请求规模）──
+                try:
+                    from spirit.logging_setup import log_event
+                    log_event(
+                        "llm_request",
+                        level=logging.DEBUG,
+                        session_id=getattr(agent, "session_id", ""),
+                        iteration=api_call_count,
+                        retry=retry_count,
+                        provider=getattr(agent, "provider", ""),
+                        model=getattr(agent, "model", ""),
+                        message_count=len(api_messages),
+                        approx_prompt_tokens=estimate_messages_tokens(api_messages),
+                        tool_count=len(tools or []),
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 response = _call_llm(agent, api_messages, tools, stream_callback)
                 if callable(_touch):
                     _touch("llm_call_done")
@@ -488,6 +528,25 @@ def run_conversation(
                     response=response,
                     duration_ms=_llm_duration_ms,
                 )
+                # ── v0.3.5：结构化事件 llm_response（耗时 / usage / finish）──
+                try:
+                    from spirit.logging_setup import log_event
+                    _u = getattr(response, "usage", None)
+                    _ch0 = (getattr(response, "choices", None) or [None])[0]
+                    log_event(
+                        "llm_response",
+                        level=logging.DEBUG,
+                        session_id=getattr(agent, "session_id", ""),
+                        iteration=api_call_count,
+                        provider=getattr(agent, "provider", ""),
+                        model=getattr(agent, "model", ""),
+                        duration_ms=round(_llm_duration_ms, 1),
+                        prompt_tokens=getattr(_u, "prompt_tokens", None) if _u else None,
+                        completion_tokens=getattr(_u, "completion_tokens", None) if _u else None,
+                        finish_reason=getattr(_ch0, "finish_reason", None) if _ch0 else None,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 # ── 累计会话级 token 用量（状态栏 / 计费 / debug）──
                 # 每次成功 API 调用都累加到 agent.session_* 字段；状态栏会取这些
                 # 字段显示「用量是多少」。response.usage 缺失 / 字段异常不主路径中断
@@ -520,11 +579,34 @@ def run_conversation(
                 )
                 plan = ErrorRecoveryPlan.from_classification(classified, retry_count)
 
+                # v0.3.5：WARNING 里补上异常原文（之前只打 reason+plan，排查时
+                # 看不到服务端到底说了什么），并落一条结构化 api_error 事件。
                 logger.warning(
-                    "API 调用失败 (#%d/%d): %s — %s",
+                    "API 调用失败 (#%d/%d): %s — %s | %s",
                     retry_count, max_retries,
                     classified.reason.value, plan.message,
+                    str(exc)[:300],
                 )
+                try:
+                    from spirit.logging_setup import log_event
+                    log_event(
+                        "api_error",
+                        level=logging.ERROR,
+                        session_id=getattr(agent, "session_id", ""),
+                        iteration=api_call_count,
+                        retry=retry_count,
+                        max_retries=max_retries,
+                        provider=agent.provider,
+                        model=agent.model,
+                        reason=classified.reason.value,
+                        status_code=classified.status_code,
+                        action=plan.action,
+                        should_retry=plan.should_retry,
+                        message=classified.message,
+                        exc=exc,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
                 # 额度耗尽型失败（月配额重置以天计）且当前还跑在主 provider 上：
                 # 标记冷却，冷却期内新一轮直接走 fallback，不再"每轮给主家一次机会"
@@ -558,6 +640,57 @@ def run_conversation(
                             )
                         continue
 
+                # ── v0.3.5：请求体非法（tool 配对断裂等）→ 先自愈一次，再不行就 abort ──
+                # 这是"payload 本身坏了"，不是 provider 故障：重试/换家/退避都救不了。
+                # 对 agent 内存消息做一次配对修复（修好后重发）；仍失败说明修复无效，
+                # 立即中止，绝不再把同一个坏 payload 空转重试 3 次（旧行为会把坏列表
+                # 留在内存里，此后每一轮都 400，只能重启进程）。
+                if (
+                    classified.reason == FailoverReason.invalid_request
+                    and not invalid_request_repaired
+                ):
+                    invalid_request_repaired = True
+                    try:
+                        from spirit.agent.message_pairing import repair_tool_pairing
+
+                        _repaired, _after = repair_tool_pairing(agent.messages)
+                        if not _after.ok:
+                            logger.error(
+                                "请求体非法且配对修复后仍有 %d 处违规，中止本轮",
+                                _after.issue_count,
+                            )
+                            return ConversationResult(
+                                response=(
+                                    "[API 错误: 请求体非法且无法自动修复 "
+                                    f"（{_after.issue_count} 处 tool 配对违规），"
+                                    "请 /new 新开会话或 /resume 上一条]"
+                                ),
+                                messages=agent.messages,
+                                iterations=api_call_count,
+                                tool_calls=tool_calls_in_turn,
+                            )
+                        agent._messages = _repaired
+                        logger.warning(
+                            "请求体非法 → 已自动修复 tool 配对（%s），重发一次",
+                            _after.summary(),
+                        )
+                        api_messages = _prepare_api_messages_safe(agent)
+                        if use_cache:
+                            api_messages = apply_cache_control(
+                                api_messages,
+                                cache_ttl=getattr(agent, "_cache_ttl", "5m"),
+                                native_anthropic=native_layout,
+                            )
+                        continue
+                    except Exception as repair_exc:  # noqa: BLE001 - 修复器本身失败不能崩主流程
+                        logger.error("tool 配对修复异常，直接中止: %s", repair_exc)
+                        return ConversationResult(
+                            response=f"[API 错误: 请求体非法且自动修复异常: {repair_exc}]",
+                            messages=agent.messages,
+                            iterations=api_call_count,
+                            tool_calls=tool_calls_in_turn,
+                        )
+
                 if plan.should_abort or not plan.should_retry:
                     return ConversationResult(
                         response=f"[API 错误: {classified.message}]",
@@ -568,13 +701,32 @@ def run_conversation(
 
                 if plan.should_compress and compressor:
                     approx_tokens = estimate_messages_tokens(agent.messages)
+                    _msgs_before = len(agent.messages)
                     agent._messages = compressor.compress(agent.messages, approx_tokens)
+                    _tokens_after = estimate_messages_tokens(agent._messages)
                     _emit_hook(
                         agent, "on_context_compress",
                         before_tokens=approx_tokens,
-                        after_tokens=estimate_messages_tokens(agent._messages),
+                        after_tokens=_tokens_after,
                         trigger="error_recovery",
                     )
+                    try:
+                        from spirit.logging_setup import log_event
+                        from spirit.agent.message_pairing import validate_tool_pairing
+                        log_event(
+                            "compression",
+                            level=logging.WARNING,
+                            session_id=getattr(agent, "session_id", ""),
+                            trigger="error_recovery",
+                            reason=classified.reason.value,
+                            before_msgs=_msgs_before,
+                            after_msgs=len(agent.messages),
+                            before_tokens=approx_tokens,
+                            after_tokens=_tokens_after,
+                            pairing=validate_tool_pairing(agent.messages).to_dict(),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
                     # ── v0.4.0 compaction_observer hook ────────────
                     try:
                         _observer = getattr(agent, "compaction_observer", None)
@@ -666,7 +818,12 @@ def run_conversation(
             # 统一 tool_calls 格式：如果是文本解析结果，转换为 dict 列表
             if hasattr(tool_calls[0], 'function'):
                 # OpenAI 原生 tool_calls
-                tool_calls_dicts = [serialize_tool_call(tc) for tc in tool_calls]
+                # v0.3.5：provider 未给 id 时补占位 id（否则 tool 结果会带上
+                # tool_call_id=None，provider 直接 400）
+                tool_calls_dicts = [
+                    serialize_tool_call(tc, fallback_id=f"call_{api_call_count}_{i}")
+                    for i, tc in enumerate(tool_calls)
+                ]
             else:
                 # 文本解析的 tool_calls（已经是 dict 列表）
                 tool_calls_dicts = tool_calls
@@ -1146,6 +1303,38 @@ def _prepare_api_messages_safe(agent):
     切换提示（system 消息）的 ``role + content`` 不被剥离，LLM 能看到。
     """
     current_route = snapshot_agent_route(agent)
+
+    # ── v0.3.5：发请求前最后一道配对防线 ──────────────────────
+    # 压缩 / provider 切换 / 历史回放等任何环节都可能留下孤儿 tool 消息或
+    # 无应答的 tool_calls，provider 必返回 400。这里统一校验：发现违规先
+    # 记录 payload_invalid 事件并就地修复（修复结果写回 agent 内存），
+    # 保证发出去的 payload 恒合法。
+    try:
+        from spirit.agent.message_pairing import (
+            repair_tool_pairing,
+            validate_tool_pairing,
+        )
+        report = validate_tool_pairing(agent.messages)
+        if not report.ok:
+            try:
+                from spirit.logging_setup import log_event
+                log_event(
+                    "payload_invalid",
+                    level=logging.WARNING,
+                    session_id=getattr(agent, "session_id", ""),
+                    provider=getattr(agent, "provider", ""),
+                    model=getattr(agent, "model", ""),
+                    detail=report.summary(),
+                    orphan_tool_results=report.orphan_tool_results[:20],
+                    unanswered_tool_calls=report.unanswered_tool_calls[:20],
+                )
+            except Exception:  # noqa: BLE001 - 埋点失败不影响主路径
+                pass
+            logger.warning("发请求前检测到非法 tool 配对，自动修复: %s", report.summary())
+            agent._messages, _final = repair_tool_pairing(agent.messages)
+    except Exception:  # noqa: BLE001 - 校验器本身异常绝不阻断请求
+        logger.debug("payload 配对预检异常（非致命）", exc_info=True)
+
     labeled = apply_provider_labels(agent.messages, current_route)
     return prepare_api_messages(labeled)
 
@@ -1272,6 +1461,21 @@ def _try_activate_fallback(agent, reason=None, stream_callback: Optional[Callabl
             f"（模型 {fb_model}）\n"
         )
         logger.warning("[fallback] %s", notice.strip())
+        try:
+            from spirit.logging_setup import log_event
+            log_event(
+                "provider_switch",
+                level=logging.WARNING,
+                session_id=getattr(agent, "session_id", ""),
+                reason=reason_txt,
+                from_provider=route_from.provider,
+                from_model=route_from.model,
+                to_provider=agent.provider,
+                to_model=agent.model,
+                fallback_name=fb.get("name"),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         if stream_callback:
             try:
                 stream_callback(notice)

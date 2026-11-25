@@ -273,6 +273,19 @@ class SpiritAgent:
         except Exception as e:
             logger.warning("会话数据库初始化失败 (非致命): %s", e)
             self._session_db = None
+            # v0.3.5：存储层初始化失败此前只一条 warning 且 agent 继续"裸奔"
+            # （会话/消息全不落库，用户毫无感知）。落一条结构化事件便于排查。
+            try:
+                from spirit.logging_setup import log_event
+                log_event(
+                    "storage_error",
+                    level=logging.ERROR,
+                    component="session_db_init",
+                    error=str(e),
+                    exc_type=type(e).__name__,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         # v0.4.0 (Hermes-aligned) — storage middleware wiring.
         # Build the turn-facade / lifecycle / event-bridge stack so
@@ -521,6 +534,23 @@ class SpiritAgent:
             )
             raise
         finally:
+            # v0.3.5：结构化 session_end 事件（含结束原因 / 消息数 / 用量）
+            try:
+                from spirit.logging_setup import log_event
+                log_event(
+                    "session_end",
+                    level=logging.INFO if _close_reason == "task_complete" else logging.WARNING,
+                    session_id=getattr(self, "session_id", ""),
+                    provider=getattr(self, "provider", ""),
+                    model=getattr(self, "model", ""),
+                    reason=_close_reason,
+                    message_count=len(getattr(self, "_messages", []) or []),
+                    api_calls=getattr(self, "session_api_calls", 0),
+                    input_tokens=getattr(self, "session_input_tokens", 0),
+                    output_tokens=getattr(self, "session_output_tokens", 0),
+                )
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 self.close_session(reason=_close_reason)
             except Exception:  # noqa: BLE001

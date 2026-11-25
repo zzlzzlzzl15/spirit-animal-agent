@@ -55,6 +55,36 @@ def load_config(
     return AgentConfig.from_dict(raw_config)
 
 
+def build_agent_config(
+    raw: Optional[Dict[str, Any]] = None,
+    **overrides: Any,
+) -> AgentConfig:
+    """从 ``load_config()`` 的原始 dict 构建 AgentConfig，并应用显式覆盖。
+
+    v0.3.5：统一各入口（CLI / 桌宠 / API / gateway / 子代理）的接线方式 ——
+    之前它们各自手搓 ``AgentConfig(model=..., api_key=..., base_url=...)``，
+    只传了 3 个字段，导致 YAML 里的 ``context_length`` / ``max_iterations`` /
+    ``compression.*`` / ``streaming.*`` 等全部静默失效。这里统一走
+    :meth:`AgentConfig.from_dict`，再用非 None 的关键字参数覆盖（用于
+    ``--model`` 命令行参数、``session_id``、``platform`` 等）。
+
+    Args:
+        raw: ``spirit.config.load_config()`` 的返回；None 时现加载
+        **overrides: 仅当值非 None 时覆盖对应 AgentConfig 字段
+
+    Returns:
+        配置好的 AgentConfig
+    """
+    if raw is None:
+        from spirit.config import load_config as _load_config
+        raw = _load_config()
+    config = AgentConfig.from_dict(raw)
+    for key, value in overrides.items():
+        if value is not None and hasattr(config, key):
+            setattr(config, key, value)
+    return config
+
+
 # ---------------------------------------------------------------------------
 # Agent 初始化
 # ---------------------------------------------------------------------------
@@ -250,6 +280,7 @@ def quick_init(
 
 __all__ = [
     "load_config",
+    "build_agent_config",
     "initialize_agent",
     "quick_init",
 ]

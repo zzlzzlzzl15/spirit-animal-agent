@@ -55,6 +55,7 @@ class FailoverReason(enum.Enum):
     model_not_found = "model_not_found"  # 404 或无效模型 — 切换模型
     content_policy_blocked = "content_policy_blocked"  # 安全过滤拒绝 — 不重试
     format_error = "format_error"        # 400 错误请求 — 中止或修复重试
+    invalid_request = "invalid_request"  # 400 请求体非法（tool 配对断裂等）— 修复后重试一次
 
     # 兜底
     unknown = "unknown"                  # 无法分类 — 退避重试
@@ -149,6 +150,24 @@ _SSL_PATTERNS = [
     "certificate verify failed", "ssl certificate problem",
     "self signed certificate", "unable to get local issuer certificate",
     "certificate has expired", "ssl/tls",
+]
+
+# v0.3.5：请求体非法（provider 拒绝整个 payload）。这类失败**重发同一个
+# payload 毫无意义** —— 之前它被兜底成 unknown（可重试），导致同一个非法
+# payload 被重发 3 次还照样 400，且坏列表留在 agent 内存里每轮复现。
+_INVALID_REQUEST_PATTERNS = [
+    "invalid params",
+    "invalid_request_error",
+    "invalid parameter",
+    "tool result's tool id",
+    "tool id not found",
+    "tool call result does not follow tool call",
+    "must be a response to a preceding message",
+    "tool_calls must be followed by",
+    "expected `tool_call_id`",
+    "missing tool_call_id",
+    "duplicate tool_call_id",
+    "function call is not valid",
 ]
 
 
@@ -298,6 +317,26 @@ def classify_api_error(
             status_code=status, provider=provider, model=model,
             message="载荷过大",
             retryable=True, should_compress=True,
+        )
+
+    if status == 400:
+        # v0.3.5：请求体非法（如 tool 配对断裂）。重发同一个坏 payload
+        # 毫无意义 —— 之前这类错误兜底成 unknown 被重发 3 次，且坏列表留在
+        # agent 内存里每轮复现，只能重启进程。命中明确"请求体问题"指纹时
+        # 判 invalid_request（不可重试、不换 provider）；其余 400 判
+        # format_error（同样不重试，由上层决定是否修复 payload）。
+        if _has_pattern(text, _INVALID_REQUEST_PATTERNS):
+            return ClassifiedError(
+                reason=FailoverReason.invalid_request,
+                status_code=status, provider=provider, model=model,
+                message=f"请求体非法 (400): {str(error)[:200]}",
+                retryable=False,
+            )
+        return ClassifiedError(
+            reason=FailoverReason.format_error,
+            status_code=status, provider=provider, model=model,
+            message=f"错误请求 (400): {str(error)[:200]}",
+            retryable=False,
         )
 
     if status == 429:

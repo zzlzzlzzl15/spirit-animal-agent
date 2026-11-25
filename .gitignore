@@ -50,6 +50,13 @@ coverage/
 htmlcov/
 .pytest_cache/
 
+# 统一日志系统产物（~/.spirit/logs，本地不应入库）
+logs/
+events.jsonl
+
+# ZCode 工作区
+.zcode/
+
 # Temporary files
 tmp/
 temp/

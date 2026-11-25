@@ -263,6 +263,18 @@ def execute_single_tool(
     except Exception as exc:
         logger.error("工具 %s 执行异常: %s", tool_name, exc, exc_info=True)
         _emit_hook(agent, "on_tool_error", tool_name=tool_name, error=exc, tool_args=args)
+        try:
+            from spirit.logging_setup import log_event
+            log_event(
+                "tool_error",
+                level=logging.ERROR,
+                session_id=getattr(agent, "session_id", ""),
+                tool=tool_name,
+                exc_type=type(exc).__name__,
+                error=str(exc)[:500],
+            )
+        except Exception:  # noqa: BLE001
+            pass
         result = json.dumps({
             "error": f"工具执行异常: {type(exc).__name__}: {str(exc)[:500]}",
             "status": "error",
@@ -716,7 +728,13 @@ def _resolve_timeout(timeout_s: float) -> Optional[float]:
 # =========================================================================
 
 def prepare_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """将内部消息格式转为 OpenAI API 格式。"""
+    """将内部消息格式转为 OpenAI API 格式。
+
+    v0.3.5：``tool_calls`` 数组按**条**过滤，而不是"第一个没有 id 就整组丢弃"。
+    旧实现只要第一个 tool_call 缺 ``id`` 就把整组 tool_calls 丢掉，留下的
+    ``role:"tool"`` 消息就失去了父 assistant → provider 报
+    ``tool result's tool id not found``（400，整轮请求被拒）。
+    """
     api_messages = []
 
     for msg in messages:
@@ -726,8 +744,11 @@ def prepare_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         api_msg: Dict[str, Any] = {"role": role}
 
         if "tool_calls" in msg and msg["tool_calls"]:
-            tool_calls = msg["tool_calls"]
-            if tool_calls and isinstance(tool_calls[0], dict) and "id" in tool_calls[0]:
+            tool_calls = [
+                tc for tc in msg["tool_calls"]
+                if isinstance(tc, dict) and tc.get("id")
+            ]
+            if tool_calls:
                 api_msg["tool_calls"] = tool_calls
             api_msg["content"] = content or None
         elif role == "tool":
@@ -741,10 +762,18 @@ def prepare_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return api_messages
 
 
-def serialize_tool_call(tool_call) -> Dict[str, Any]:
-    """将 OpenAI SDK 的 tool_call 对象序列化为 dict。"""
+def serialize_tool_call(tool_call, *, fallback_id: str = "") -> Dict[str, Any]:
+    """将 OpenAI SDK 的 tool_call 对象序列化为 dict。
+
+    v0.3.5：``tool_call.id`` 可能为 ``None``（provider 未给 id）——直接透传会
+    让 tool 结果带上 ``tool_call_id: None``，provider 必然拒绝。缺失时补一个
+    稳定的占位 id，保证 tool_calls 与 tool 结果始终能配上对。
+    """
+    call_id = getattr(tool_call, "id", None)
+    if not call_id:
+        call_id = fallback_id or "call_unknown"
     return {
-        "id": tool_call.id,
+        "id": call_id,
         "type": "function",
         "function": {
             "name": tool_call.function.name,

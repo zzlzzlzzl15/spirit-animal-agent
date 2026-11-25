@@ -241,16 +241,17 @@ class AgentManager:
         session_id = session_id or str(uuid.uuid4())
 
         if session_id not in self._agents:
-            from spirit.agent.agent import AgentConfig, SpiritAgent
+            from spirit.agent.agent import SpiritAgent
+            from spirit.agent.agent_init import build_agent_config
             from spirit.config import load_config
 
             raw = load_config()
-            llm_cfg = raw.get("llm", {})
 
-            config = AgentConfig(
-                model=model or llm_cfg.get("model", ""),
-                api_key=llm_cfg.get("api_key", ""),
-                base_url=llm_cfg.get("base_url", ""),
+            # v0.3.5：统一走 AgentConfig.from_dict（此前只传 model/api_key/base_url，
+            # context_length / max_iterations / compression 等全部静默失效）
+            config = build_agent_config(
+                raw,
+                model=model or None,
                 session_id=session_id,
                 platform=platform,
             )
@@ -698,6 +699,12 @@ app = create_app()
 
 def run_server(host: str = "127.0.0.1", port: int = 8765, reload: bool = False):
     """启动 API 服务。"""
+    # 统一日志（v0.3.5）：终端交给 uvicorn 自己的 handler，spirit.* 落文件，
+    # 避免与 uvicorn 的 root handler 重复打印。
+    from spirit.logging_setup import setup_logging, install_excepthook
+
+    setup_logging(console=False, file_level=logging.INFO)
+    install_excepthook()
     import uvicorn
     logger.info("Spirit Agent 服务启动: http://%s:%d", host, port)
     uvicorn.run(

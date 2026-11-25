@@ -37,10 +37,11 @@ def _clean_state():
 
 
 class TestProgressPhase:
-    """ProgressPhase 7 阶段枚举（str enum）。"""
+    """ProgressPhase 阶段枚举（str enum）。"""
 
-    def test_has_seven_phases(self):
-        assert len(ProgressPhase) == 7
+    def test_has_all_phases(self):
+        # v0.3.5：枚举从 7 阶段扩展到 15 阶段后本测试一直没更新（已落后多个版本）
+        assert len(ProgressPhase) == 15
 
     def test_task_start_value(self):
         assert ProgressPhase.TASK_START.value == "task_start"

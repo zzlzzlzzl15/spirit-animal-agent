@@ -68,13 +68,14 @@ class TestFailoverReason:
             "ssl_cert_verification",
             "context_overflow", "payload_too_large", "image_too_large",
             "model_not_found", "content_policy_blocked", "format_error",
+            "invalid_request",
             "unknown",
         }
         assert values == expected
 
     def test_member_count(self):
-        # 16 个值
-        assert len(list(FailoverReason)) == 16
+        # 17 个值（v0.3.5 新增 invalid_request）
+        assert len(list(FailoverReason)) == 17
 
     def test_each_member_is_unique_string(self):
         seen = set()
@@ -1057,3 +1058,45 @@ class TestEndToEnd:
         plan = ErrorRecoveryPlan.from_classification(classified)
         # SSL retryable=False → abort
         assert plan.action == "abort"
+
+
+# ───────────────── v0.3.5：400 请求体非法分类 ─────────────────
+
+
+class TestInvalidRequestClassification:
+    """tool 配对断裂等 400 必须判为 invalid_request（不可重试），而不是 unknown。"""
+
+    def test_orphan_tool_result_400(self):
+        err = make_provider_error(
+            "Error code: 400 - invalid params, tool result's tool id(call_3) not found (2013)",
+            status_code=400,
+        )
+        c = classify_api_error(err, provider="minimax", model="M3")
+        assert c.reason is FailoverReason.invalid_request
+        assert c.retryable is False
+        plan = ErrorRecoveryPlan.from_classification(c)
+        assert plan.action == "abort"
+
+    def test_tool_result_not_following_400(self):
+        err = make_provider_error(
+            "400 invalid params, tool call result does not follow tool call (2013)",
+            status_code=400,
+        )
+        c = classify_api_error(err)
+        assert c.reason is FailoverReason.invalid_request
+        assert c.retryable is False
+
+    def test_invalid_request_error_code_400(self):
+        err = make_provider_error(
+            "400 invalid_request_error: malformed messages",
+            status_code=400,
+        )
+        c = classify_api_error(err)
+        assert c.reason is FailoverReason.invalid_request
+
+    def test_generic_400_is_format_error(self):
+        """不含非法请求体指纹的 400 → format_error（同样不可重试）。"""
+        err = make_provider_error("some unrelated bad request", status_code=400)
+        c = classify_api_error(err)
+        assert c.reason is FailoverReason.format_error
+        assert c.retryable is False

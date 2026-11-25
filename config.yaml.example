@@ -91,6 +91,25 @@ streaming:
   enabled: false
 
 # =============================================================================
+# 统一日志（v0.3.5）
+#   终端级别由命令行 -v 控制（默认只显示 ERROR）；文件始终更详细。
+#   产物（$SPIRIT_HOME/logs/）：
+#     agent.log     全量滚动日志（默认 INFO，10MB×5）
+#     errors.log    仅 ERROR 及以上，便于 tail 排错
+#     events.jsonl  结构化业务事件（api_error / compression / provider_switch ...）
+#   查询：spirit logs errors | spirit logs events | spirit logs doctor
+#         交互内输入 /logs（/logs doctor 一键诊断）
+# =============================================================================
+logging:
+  enabled: true
+  level: INFO             # agent.log 级别：DEBUG / INFO / WARNING / ERROR
+  max_bytes: 10485760     # 单文件 10MB
+  backup_count: 5         # 保留滚动文件数
+  events: true            # 是否写 events.jsonl
+  traceback: true         # api_error 等是否带 traceback
+  event_preview_chars: 500  # 事件正文字段截断长度
+
+# =============================================================================
 # 工具循环护栏（防止工具调用死循环）
 # =============================================================================
 tool_loop_guardrails:

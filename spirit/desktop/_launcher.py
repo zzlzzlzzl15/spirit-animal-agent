@@ -11,11 +11,6 @@ import os
 import signal
 import sys
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(name)s %(levelname)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
 logger = logging.getLogger("spirit.desktop.launcher")
 
 
@@ -32,9 +27,14 @@ def main():
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
+    # 统一日志系统（v0.3.5）：桌宠进程的运行日志落到 ~/.spirit/logs/
+    from spirit.logging_setup import setup_logging, install_excepthook
+    setup_logging(verbose=False, console=True, file_level=logging.INFO)
+    install_excepthook()
+
     from spirit.desktop.pet_engine import PetEngine
     from spirit.desktop.ws_server import WSServer
-    from spirit.agent.agent import AgentConfig, SpiritAgent
+    from spirit.agent.agent import SpiritAgent
     from spirit.config import load_config
 
     # 创建引擎
@@ -64,20 +64,16 @@ def main():
     agent = None
     try:
         raw = load_config()
-        llm_cfg = raw.get("llm", {})
-        config = AgentConfig(
-            model=llm_cfg.get("model", ""),
-            api_key=llm_cfg.get("api_key", ""),
-            base_url=llm_cfg.get("base_url", ""),
-            provider=llm_cfg.get("provider", "auto"),
-            platform="cli",
-        )
-        # 流式开关：从配置文件 streaming.enabled 读取（与 CLI 保持一致）
+        from spirit.agent.agent_init import build_agent_config
+
+        # v0.3.5：统一走 AgentConfig.from_dict（context_length / max_iterations /
+        # compression / streaming / prompt_caching 等全部生效）
+        config = build_agent_config(raw, platform="cli")
+
+        # ── 桌宠特有兜底（from_dict 已处理 streaming / tool_search，这里幂等）──
         streaming_cfg = raw.get("streaming", {})
         if isinstance(streaming_cfg, dict) and "enabled" in streaming_cfg:
             config.streaming_enabled = bool(streaming_cfg["enabled"])
-        # Tool Search（agent.tool_search.*）：桌宠主链路 — launcher 手动传 dict 给 AgentConfig，
-        # 不会走 AgentConfig.from_dict，所以这里需要单独从 raw 挑出来设上。
         ts_cfg = raw.get("agent", {}).get("tool_search", {})
         if isinstance(ts_cfg, dict):
             if "enabled" in ts_cfg:

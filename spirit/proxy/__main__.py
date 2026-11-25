@@ -16,7 +16,11 @@ from spirit.proxy.server import ProxyServer
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    # 统一日志系统（v0.3.5）：终端 INFO + ~/.spirit/logs 文件日志
+    from spirit.logging_setup import setup_logging, install_excepthook
+
+    setup_logging(verbose=False, console=True, file_level=logging.INFO)
+    install_excepthook()
     cfg = load_proxy_config()
     server = ProxyServer(config=cfg)
     print(f"Spirit OpenAI 兼容代理: {server.url}/v1  (model={cfg.model})")
