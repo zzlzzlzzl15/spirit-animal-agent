@@ -56,7 +56,15 @@ API / gateway / 子代理统一走 `build_agent_config()`。
 
 ## 注意
 
-本次发现当前两个已配置后端均不可用（账户/套餐问题，非代码问题）：
-- `api.minimaxi.com` → `402 已达到 Token Plan 用量上限`；
-- 火山 ark `.../api/plan/v3` + `minimax-m3` → `404 该模型不支持 agent plan`。
-请充值/升级套餐，或在 `~/.spirit/config.yaml` 改用可用模型后再跑长任务。
+排查过程中发现两个后端的现象（**与本次代码修复无关**，请勿混淆）：
+
+- `api.minimaxi.com` 曾短暂返回 `402 已达到 Token Plan 用量上限`。这是 Token Plan
+  的**滚动用量窗口**被压测打满所致（诊断时发送过 80 万 token 的超大请求），
+  与账户积分余额无关；窗口滚动后即恢复 200。可用模型：
+  `MiniMax-M3` / `MiniMax-M3.1-Flash` / `MiniMax-M2.7` / `MiniMax-M2.5` / `MiniMax-M2.1`。
+- 火山 ark 的 `.../api/plan/v3` 端点对所有模型返回
+  `404 该模型不支持 agent plan 功能` —— 该 key 鉴权正常（报 404 而非 401），
+  但 `minimax-m3` 不在其 plan 覆盖的模型列表里，需要换成 ark 控制台该 plan
+  实际支持的模型 ID。
+
+（排查细节见提交信息与 `docs/`；本节只记录结论。）
